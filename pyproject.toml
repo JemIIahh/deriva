@@ -9,7 +9,7 @@ description = "Multilingual safety drift: does safety fine-tuning in English hol
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
-    "matplotlib",
+    "matplotlib>=3.10",
     "safetensors",
     "python-dotenv",
 ]

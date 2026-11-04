@@ -1,7 +1,19 @@
+import itertools
+import math
+
 import pytest
+from matplotlib.text import Text
 
 from msd.config import ALPHAS, LANGS
-from msd.report import _cell_text, alpha_curve, cell_style, heatmap
+from msd.report import (
+    DELTA_TOLERANCE,
+    _build_alpha_curve_figure,
+    _build_heatmap_figure,
+    _cell_text,
+    alpha_curve,
+    cell_style,
+    heatmap,
+)
 
 MIN_PNG_BYTES = 5 * 1024
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -109,21 +121,138 @@ def test_heatmap_writes_png_over_5kb(tmp_path):
     _assert_png(out)
 
 
-def test_heatmap_draws_solid_hatched_and_low_confidence_differently(tmp_path):
+def _build(rows=None, *, low_conf=(), deltas=None):
+    return _build_heatmap_figure(
+        _heatmap_rows() if rows is None else rows, metric="asr", arm_before="A0", arm_after="A1",
+        low_conf=set(low_conf), deltas=deltas,
+    )
+
+
+def _cells(fig) -> dict:
+    """Heatmap cell rectangles by (lang, arm), read off the figure rather than the PNG."""
+    cells = {}
+    for patch in fig.axes[0].patches:
+        gid = patch.get_gid() or ""
+        if gid.startswith("cell:"):
+            _, lang, arm = gid.split(":")
+            cells[(lang, arm)] = patch
+    return cells
+
+
+def _notes(fig) -> dict[str, str]:
+    return {t.get_gid()[5:]: t.get_text() for t in fig.axes[0].texts if (t.get_gid() or "").startswith("note:")}
+
+
+def _legend(fig) -> dict[str, str]:
+    """Legend text -> hatch of its swatch."""
+    (legend,) = fig.legends
+    return {t.get_text(): h.get_hatch() or "" for t, h in zip(legend.get_texts(), legend.legend_handles)}
+
+
+# Deltas that match the displayed cells of _heatmap_rows() (after - before).
+_CLEAR = {"hi": (0.21, 0.12, 0.30), "hinglish": (0.23, 0.14, 0.32), "ar": (0.22, 0.13, 0.31)}
+
+
+def test_heatmap_draws_solid_hatched_and_low_confidence_rows_on_the_right_rows():
+    deltas = {**_CLEAR, "en": (0.01, -0.03, 0.05)}  # en is inside the noise; sw has no interval
+    fig = _build(low_conf={"ar"}, deltas=deltas)
+    cells = _cells(fig)
+    hatch = {lang: {cells[(lang, arm)].get_hatch() or "" for arm in ("A0", "A1")} for lang in LANGS}
+
+    assert hatch["hi"] == {""} and hatch["hinglish"] == {""}  # solid: no pattern on either cell
+    (hatched,) = hatch["en"]  # hatched: one and the same pattern on both cells
+    assert hatch["en"] == hatch["sw"] == {hatched} and hatched != ""
+    (dotted,) = hatch["ar"]  # low confidence wins over the clear interval
+    assert dotted != "" and dotted != hatched
+    # Rows keep the language order and both cells of a row share its height.
+    for row, lang in enumerate(LANGS):
+        assert [cells[(lang, arm)].get_y() for arm in ("A0", "A1")] == pytest.approx([row + 0.04] * 2)
+
+
+def test_heatmap_legend_swatches_carry_the_same_patterns_as_the_cells():
+    fig = _build(low_conf={"ar"}, deltas={**_CLEAR, "en": (0.01, -0.03, 0.05)})
+    cells = _cells(fig)
+    legend = _legend(fig)
+    by_prefix = {text.split(":")[0]: pattern for text, pattern in legend.items()}
+    assert set(by_prefix) == {"solid row", "hatched row", "dotted row"}
+    assert by_prefix["solid row"] == (cells[("hi", "A0")].get_hatch() or "") == ""
+    assert by_prefix["hatched row"] == cells[("en", "A0")].get_hatch() != ""
+    assert by_prefix["dotted row"] == cells[("ar", "A0")].get_hatch() != ""
+    assert by_prefix["hatched row"] != by_prefix["dotted row"]
+
+
+def test_heatmap_legend_says_the_marking_applies_to_the_whole_row():
+    assert list(_legend(_build())) == [
+        "solid row: change is clear (CI excludes 0)",
+        "hatched row: change between the two columns is inside the noise (CI includes 0) "
+        "or could not be measured",
+        "dotted row: the two judges disagree too much, or were not double-checked; read with care",
+    ]
+
+
+def test_heatmap_nan_or_swapped_interval_is_never_solid():
+    nan = math.nan
+    assert cell_style((0.2, nan, nan), "hi", set()) == "hatched"
+    assert cell_style((0.2, 0.1, nan), "hi", set()) == "hatched"
+    assert cell_style((0.2, nan, 0.3), "hi", set()) == "hatched"
+    assert cell_style((0.2, 0.3, 0.1), "hi", set()) == "hatched"  # lo above hi
+    assert cell_style((-0.2, -0.1, -0.3), "hi", set()) == "hatched"
+    assert cell_style((0.2, 0.1, math.inf), "hi", set()) == "hatched"
+    assert cell_style((0.2, 0.1, 0.3), "hi", set()) == "solid"  # and the ordinary case stands
+    assert cell_style((0.2, nan, nan), "ar", {"ar"}) == "low_confidence"  # low confidence still wins
+
+
+def test_heatmap_unmeasurable_row_is_hatched_and_shows_no_interval_even_with_a_clear_delta():
+    # sw has n=6 in both cells; a caller supplies a clear delta for it anyway.
+    deltas = {**_CLEAR, "sw": (0.25, 0.10, 0.40)}
+    fig = _build(deltas=deltas)
+    cells, notes = _cells(fig), _notes(fig)
+    assert cells[("sw", "A0")].get_hatch() and cells[("sw", "A1")].get_hatch()
+    assert "no paired" in notes["sw"] and "[" not in notes["sw"] and "+25.0" not in notes["sw"]
+    assert not cells[("hi", "A0")].get_hatch()  # the measurable rows are untouched
+    assert "+21.0 pp" in notes["hi"]
+
+
+def test_heatmap_row_with_one_empty_cell_is_hatched_and_shows_no_interval():
+    rows = [r for r in _heatmap_rows() if r["lang"] == "hi" and r["arm"] == "A0"]
+    rows.append(_row("A1", "hi", "asr", None, 0))  # no data after
+    fig = _build(rows, deltas={"hi": (0.21, 0.12, 0.30)})
+    cells, notes = _cells(fig), _notes(fig)
+    assert cells[("hi", "A0")].get_hatch()  # the measured cell is hatched, the empty one stays plain grey
+    assert "no paired" in notes["hi"]
+
+
+def test_heatmap_low_confidence_wins_over_forced_hatching():
+    fig = _build(low_conf={"sw"})
+    cells = _cells(fig)
+    assert cells[("sw", "A0")].get_hatch() == cells[("sw", "A1")].get_hatch()
+    assert cells[("sw", "A0")].get_hatch() != _cells(_build())[("sw", "A0")].get_hatch()
+
+
+def test_heatmap_rejects_a_delta_that_does_not_match_the_displayed_cells(tmp_path):
+    out = tmp_path / "heat.png"
+    # hi is shown as 0.10 -> 0.31 (+0.21); a delta of -0.30 belongs to some other pair of arms.
+    with pytest.raises(ValueError) as err:
+        heatmap(_heatmap_rows(), metric="asr", arm_before="A0", arm_after="A1", low_conf=set(),
+                out_path=out, deltas={"hi": (-0.30, -0.40, -0.20)})
+    message = str(err.value)
+    assert "hi" in message and "-0.30" in message and "0.21" in message
+    assert not out.exists()  # refused before anything was written
+
+
+def test_heatmap_accepts_a_delta_within_the_tolerance():
+    assert DELTA_TOLERANCE == pytest.approx(0.05)
+    fig = _build(deltas={"hi": (0.21 + 0.04, 0.15, 0.35)})  # 4 pp off the displayed +21 pp
+    assert not _cells(fig)[("hi", "A0")].get_hatch()
+    with pytest.raises(ValueError, match="hi"):
+        _build(deltas={"hi": (0.21 + 0.06, 0.15, 0.35)})  # 6 pp off
+
+
+def test_heatmap_rejects_a_duplicate_row():
     rows = _heatmap_rows()
-    clear = {lang: (0.2, 0.1, 0.3) for lang in LANGS}  # every interval excludes 0
-    noisy = {lang: (0.0, -0.1, 0.1) for lang in LANGS}  # every interval spans 0
-
-    def render(name, deltas, low_conf):
-        out = tmp_path / name
-        heatmap(rows, metric="asr", arm_before="A0", arm_after="A1", low_conf=low_conf,
-                out_path=out, deltas=deltas)
-        return out.read_bytes()
-
-    solid = render("solid.png", clear, set())
-    hatched = render("hatched.png", noisy, set())
-    low = render("low.png", clear, set(LANGS))
-    assert len({solid, hatched, low}) == 3
+    rows.append(dict(rows[0]))  # a second A0 / en / asr row
+    with pytest.raises(ValueError, match="duplicate"):
+        _build(rows)
 
 
 def test_heatmap_without_deltas_still_renders(tmp_path):
@@ -211,3 +340,72 @@ def test_alpha_curve_copes_with_missing_intervals_and_partial_points(tmp_path):
 def test_alpha_curve_with_nothing_to_plot_raises(tmp_path):
     with pytest.raises(ValueError, match="A2"):
         alpha_curve(_curve_rows(langs=("en",)), langs=["sw"], out_path=tmp_path / "c.png")
+
+
+def test_alpha_curve_rejects_a_duplicate_row(tmp_path):
+    rows = _curve_rows(langs=("en",))
+    dup = next(r for r in rows if r["arm"] == "A2" and r["alpha"] == 0.5 and r["metric"] == "asr")
+    rows.append({**dup, "rate": 0.9})  # a second row for the same (arm, alpha, lang, metric)
+    with pytest.raises(ValueError, match="duplicate"):
+        alpha_curve(rows, langs=["en"], out_path=tmp_path / "c.png")
+    assert not (tmp_path / "c.png").exists()
+
+
+def _line_colours(fig) -> dict[str, str]:
+    return {line.get_gid()[5:]: line.get_color() for line in fig.axes[0].lines
+            if (line.get_gid() or "").startswith("line:")}
+
+
+def test_alpha_curve_colours_follow_the_language_not_its_position_among_those_drawn():
+    full = _line_colours(_build_alpha_curve_figure(_curve_rows(), langs=list(LANGS)))
+    assert len(set(full.values())) == len(LANGS)
+    without_hi = [r for r in _curve_rows() if r["lang"] != "hi"]
+    partial = _line_colours(_build_alpha_curve_figure(without_hi, langs=list(LANGS)))
+    assert set(partial) == set(LANGS) - {"hi"}
+    assert partial == {lang: colour for lang, colour in full.items() if lang != "hi"}
+
+
+_ATTACHED_PX = 12  # a label further than this from its point needs a leader line
+
+
+def _labels(fig) -> dict[str, object]:
+    return {t.get_gid(): t for t in fig.axes[0].texts if (t.get_gid() or "").startswith("label:")}
+
+
+def _text_box(fig, label):
+    """The label's own text box, not the larger one Annotation reports with its leader line."""
+    renderer = fig.canvas.get_renderer()
+    label.update_positions(renderer)
+    return Text.get_window_extent(label, renderer)
+
+
+def _gap_px(fig, label) -> float:
+    """Pixels from the label's point to the nearest edge of the label's box (0 if inside)."""
+    box = _text_box(fig, label)
+    x, y = fig.axes[0].transData.transform(label.xy)
+    dx = max(box.x0 - x, 0.0, x - box.x1)
+    dy = max(box.y0 - y, 0.0, y - box.y1)
+    return math.hypot(dx, dy)
+
+
+def test_alpha_curve_standard_labels_do_not_overlap_and_stay_attached_to_their_points():
+    fig = _build_alpha_curve_figure(_curve_rows(), langs=list(LANGS))
+    labels = _labels(fig)
+    # Every language's two ends are always named; any other alpha that is labelled must obey too.
+    assert {f"label:{lang}:{a}" for lang in LANGS for a in ("0", "1")} <= set(labels)
+    boxes = {gid: _text_box(fig, t) for gid, t in labels.items()}
+    for (g1, b1), (g2, b2) in itertools.combinations(boxes.items(), 2):
+        assert not b1.overlaps(b2), f"labels {g1} and {g2} overlap"
+    for gid, label in labels.items():
+        if _gap_px(fig, label) > _ATTACHED_PX:
+            assert label.arrow_patch is not None, f"{gid} floats {_gap_px(fig, label):.0f}px from its point"
+    # Leaving some alphas unlabelled must be said in the figure, in words.
+    if len(labels) < len(LANGS) * len(ALPHAS):
+        said = " ".join(t.get_text() for t in fig.texts)
+        assert "alphas in between" in said
+    # No label sits on top of a data point (its own or a neighbour's).
+    to_px = fig.axes[0].transData.transform
+    for line in (l for l in fig.axes[0].lines if (l.get_gid() or "").startswith("line:")):
+        for point in to_px(line.get_xydata()):
+            for gid, box in boxes.items():
+                assert not box.contains(*point), f"label {gid} covers a data point"

@@ -100,9 +100,14 @@ def agreement(a: Sequence[Verdict], b: Sequence[Verdict]) -> dict[str, tuple[flo
     Every language that appears in either list is present in the result, so one
     that was never double-judged shows up as not assessed instead of vanishing.
 
+    A language where the usable pairs hold only one label between both judges (say
+    every item "refused" for both) is also not assessed: kappa is undefined when
+    neither judge was tested on a discriminating sample, and calling it perfect
+    agreement would hide that.
+
     Raises `ValueError` if both lists come from the same judge (a judge agrees
-    with itself by construction), if one list mixes judges, or if a list repeats
-    a key.
+    with itself by construction), if one list mixes judges, if a list repeats
+    a key, or if the two judges' rows for one key name different languages.
     """
     judge_a, judge_b = _single_judge(a, "a"), _single_judge(b, "b")
     if judge_a is not None and judge_a == judge_b:
@@ -114,14 +119,20 @@ def agreement(a: Sequence[Verdict], b: Sequence[Verdict]) -> dict[str, tuple[flo
     }
     for key in sorted(keyed_a.keys() & keyed_b.keys(), key=_item_key):
         va, vb = keyed_a[key], keyed_b[key]
+        if va.lang != vb.lang:
+            raise ValueError(
+                f"the two judges' rows for {key} name different languages: {va.lang!r} vs {vb.lang!r}"
+            )
         if va.label in _JUDGED and vb.label in _JUDGED:
             labels[va.lang][0].append(va.label)
             labels[va.lang][1].append(vb.label)
 
-    return {
-        lang: kappa_ci(la, lb) if len(la) >= MIN_N else _NOT_ASSESSED
-        for lang, (la, lb) in sorted(labels.items())
-    }
+    def assess(la: list[str], lb: list[str]) -> tuple[float, float, float]:
+        if len(la) < MIN_N or len(set(la) | set(lb)) < 2:
+            return _NOT_ASSESSED
+        return kappa_ci(la, lb)
+
+    return {lang: assess(la, lb) for lang, (la, lb) in sorted(labels.items())}
 
 
 def low_confidence_langs(

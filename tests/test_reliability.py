@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import random
 from collections import Counter
@@ -192,6 +193,64 @@ def test_agreement_rejects_duplicate_keys():
     a = _judged("j1", labels)
     with pytest.raises(ValueError, match="duplicate"):
         agreement(a + a[:1], _judged("j2", labels))
+
+
+def _sixty(label_of) -> dict[tuple, str]:
+    return {(i, "A0", None): label_of(i) for i in range(60)}
+
+
+def test_agreement_both_judges_all_refused_is_not_assessed():
+    # One label throughout is not agreement, it is an untested judge: kappa is undefined.
+    labels = _sixty(lambda i: "refused")
+    agr = agreement(_judged("j1", labels), _judged("j2", labels))
+    assert all(math.isnan(x) for x in agr["en"])
+    assert low_confidence_langs(agr) == {"en"}
+
+
+def test_agreement_both_judges_all_complied_is_not_assessed():
+    labels = _sixty(lambda i: "complied")
+    agr = agreement(_judged("j1", labels), _judged("j2", labels))
+    assert all(math.isnan(x) for x in agr["en"])
+    assert low_confidence_langs(agr) == {"en"}
+
+
+def test_agreement_one_dissent_in_sixty_still_gives_a_number_and_is_flagged():
+    a = _sixty(lambda i: "refused")
+    b = _sixty(lambda i: "complied" if i == 0 else "refused")
+    agr = agreement(_judged("j1", a), _judged("j2", b))
+    assert agr["en"][0] == pytest.approx(0.0)
+    assert not any(math.isnan(x) for x in agr["en"])
+    assert low_confidence_langs(agr) == {"en"}  # kappa 0.0 is below the threshold
+
+
+def test_agreement_degenerate_after_dropping_unusable_pairs_is_not_assessed():
+    # Both judges say "refused" on every usable pair; the only "complied" sits in a pair
+    # that is dropped (the other judge gave no_response), so it must not count as variety.
+    a = _judged("j1", _sixty(lambda i: "refused"))
+    b = _judged("j2", _sixty(lambda i: "refused"))
+    a[0] = _v(0, "complied", judge="j1")
+    b[0] = _v(0, "no_response", judge="j2")
+    agr = agreement(a, b)
+    assert all(math.isnan(x) for x in agr["en"])
+
+
+def test_agreement_normal_mixed_sample_is_unchanged():
+    labels = _sixty(lambda i: "complied" if i % 2 else "refused")
+    agr = agreement(_judged("j1", labels), _judged("j2", labels))
+    kappa, lo, hi = agr["en"]
+    assert kappa == pytest.approx(1.0)
+    assert lo <= kappa <= hi
+    assert low_confidence_langs(agr) == set()
+
+
+def test_agreement_rejects_a_key_whose_two_verdicts_disagree_on_language():
+    labels = {(i, "A0", None): ("complied" if i % 2 else "refused") for i in range(12)}
+    a = _judged("j1", labels, lang="en")
+    b = _judged("j2", labels, lang="en")
+    # Same (prompt id, arm, alpha), but the second judge's row says another language.
+    b[3] = dataclasses.replace(b[3], lang="hi")
+    with pytest.raises(ValueError, match="lang"):
+        agreement(a, b)
 
 
 # --------------------------------------------------------- low_confidence_langs
