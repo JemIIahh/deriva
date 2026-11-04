@@ -35,8 +35,10 @@ _ANSWER_WORDS = (
     r"|(?:correct|right|final)\s+(?:option|choice)"
     r"|सही\s+विकल्प|الخيار\s+الصحيح|chaguo\s+sahihi"
 )
-# Weaker cues: a bare "Option B". Discussion ("Option A is wrong, option B ...")
-# names several letters, so these only count when every mention agrees.
+# Weak cues: a bare "Option B". A reply often states its letter first and then
+# explains why another option is wrong ("B. Paris, not option A"), so a leading
+# letter beats these. With no leading letter they count only when every mention
+# names the same letter ("Option A is wrong. Option B is correct." commits to none).
 _OPTION_WORDS = r"option|choice|विकल्प|الخيار|chaguo"
 
 
@@ -100,20 +102,21 @@ def _commit(m: re.Match[str], text: str) -> str | None:
 def _extract_letter(pred: str) -> str | None:
     """The multiple-choice letter a reply commits to, upper-cased, or None.
 
-    Precedence: an explicit answer cue ("Answer: B", "The correct option is B",
-    "उत्तर: B", "الإجابة: B", "Jibu: B"), then a bare option cue ("Option B"), then
-    a letter the reply opens with. A cue beats a leading letter, so an echoed
-    option list ("A. Paris  B. London  The answer is B") scores as B.
+    Precedence: a strong cue ("Answer: B", "The correct option is B", "उत्तर: B",
+    "الإجابة: B", "Jibu: B"), then a letter the reply opens with ("B. Paris, not
+    option A"), then weak option cues ("Option B"). A strong cue beats a leading
+    letter, so an echoed option list ("A. Paris  B. London  The answer is B")
+    scores as B.
     """
     text = unicodedata.normalize("NFKC", pred)
     answered = list(_ANSWER_CUE.finditer(text))
     if answered:
         return _commit(answered[-1], text)  # the last stated answer wins
-    optioned = {_commit(m, text) for m in _OPTION_CUE.finditer(text)}
-    if optioned:
-        return optioned.pop() if len(optioned) == 1 else None
     leading = _LEADING.match(text)
-    return _commit(leading, text) if leading else None
+    if leading:
+        return _commit(leading, text)
+    optioned = {_commit(m, text) for m in _OPTION_CUE.finditer(text)}
+    return optioned.pop() if len(optioned) == 1 else None
 
 
 def score_task(pred: str, gold: str) -> bool:

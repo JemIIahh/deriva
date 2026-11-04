@@ -161,15 +161,67 @@ def test_answer_cue_beats_an_echoed_option_list():
     assert score_task(inline, "A") is False
 
 
-def test_option_cue_beats_a_leading_letter_but_a_correct_option_cue_beats_option_chatter():
-    assert score_task("A. Paris\nB. London\nOption B", "B") is True
-    assert score_task("A. Paris\nB. London\nOption B", "A") is False
-    # "Option A is wrong" must not override the stated correct option.
-    assert score_task("Option A is wrong. The correct option is B", "B") is True
-    assert score_task("Option A is wrong. The correct option is B", "A") is False
-    # An explicit answer beats later chatter about another option.
-    assert score_task("Answer: B. Option A is wrong.", "B") is True
-    assert score_task("Answer: B. Option A is wrong.", "A") is False
+# Replies that state a letter first and then explain why another option is wrong.
+# (reply, the letter the reply commits to)
+_LETTER_THEN_OPTION_CHATTER = [
+    # English
+    ("B. London, not option A", "B"),
+    ("B. Paris\n\nChoice A is a distractor", "B"),
+    ("(B) Paris. Option A is wrong.", "B"),
+    ("B: Paris. Option C is the capital of Italy.", "B"),
+    ("B. Because option A is wrong.", "B"),
+    ("A. Paris. Option B is a distractor.", "A"),
+    ("A\nOption B is wrong", "A"),
+    ("C - it is not choice B", "C"),
+    ("A. Paris\nB. London\nOption B", "A"),  # an echoed list: the opening letter wins
+    # Hindi
+    ("B। पेरिस सही है, विकल्प A गलत है", "B"),
+    ("B।\nविकल्प A गलत है", "B"),
+    # Arabic
+    ("B. لندن، وليس الخيار A", "B"),
+    ("B.\nالخيار A خاطئ", "B"),
+    # Swahili
+    ("B. London, si chaguo A", "B"),
+    ("B\nChaguo A si sahihi", "B"),
+    ("B. Paris, si chaguo A", "B"),
+]
+
+
+@pytest.mark.parametrize("reply, intended", _LETTER_THEN_OPTION_CHATTER)
+def test_leading_letter_beats_weak_option_cues(reply, intended):
+    assert score_task(reply, intended) is True
+    for other in "ABCDE":
+        if other != intended:
+            assert score_task(reply, other) is False, (reply, other)
+
+
+# Strong cues keep winning over BOTH a leading letter and a weak option cue.
+_STRONG_CUE_OVER_OPTION_CHATTER = [
+    ("Answer: A\nOption B is a distractor", "A"),
+    ("Answer: B. Option A is wrong.", "B"),
+    ("Option A is wrong. The correct option is B", "B"),
+    ("A. Paris\nB. London\nC. Rome\nThe answer is C", "C"),
+    ("B. London is a decoy. The correct option is A", "A"),
+    ("उत्तर: A\nविकल्प B गलत है", "A"),
+    ("الإجابة: A\nالخيار B خاطئ", "A"),
+    ("Jibu: A\nChaguo B si sahihi", "A"),
+]
+
+
+@pytest.mark.parametrize("reply, intended", _STRONG_CUE_OVER_OPTION_CHATTER)
+def test_strong_cues_beat_leading_letters_and_option_chatter(reply, intended):
+    assert score_task(reply, intended) is True
+    for other in "ABCDE":
+        if other != intended:
+            assert score_task(reply, other) is False, (reply, other)
+
+
+@pytest.mark.parametrize(
+    "reply", ["Option B", "option b", "Choice B", "विकल्प B", "الخيار B", "Chaguo B", "Option B."]
+)
+def test_a_bare_option_reply_commits_to_its_letter(reply):
+    assert score_task(reply, "B") is True
+    assert score_task(reply, "A") is False
 
 
 def test_conflicting_bare_option_mentions_are_ambiguous():
