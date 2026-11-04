@@ -1,0 +1,477 @@
+# Public-data source manifest for the multilingual safety drift study.
+#
+# Every license string below was read on 2026-11-05 from the dataset's own card (the
+# Hugging Face README front matter / card text) or, where the data lives on GitHub, from
+# the repo's LICENSE file and README. Nothing here was written from memory.
+#
+# Keys: name, url, license, languages, used_for, verified_on, optional notes.
+#   languages   codes from en / hi / hinglish / ar / sw that the source actually covers.
+#               Other languages appear only in notes. May be empty only for `excluded`.
+#   used_for    harmful_prompts | benign_edgy_prompts | task_qa | task_cross_check
+#               | fine_tune_data | excluded
+#   verified_on quoted YYYY-MM-DD (unquoted, YAML would turn it into a date object).
+#
+# Facts only; no legal conclusions. Entries whose license is non-commercial, share-alike,
+# conflicting, missing, or whose card could not be read are `excluded` with the reason.
+# The released test set and fine-tune data go public on Hugging Face; Tiny Aya's own terms
+# (CC-BY-NC + Cohere AUP) apply to the model, not to these datasets.
+#
+# Gap: no public Hinglish (code-mixed Hindi-English) safety set was found, so `hinglish`
+# appears only on one excluded speech corpus. Hinglish prompts have to be produced by
+# translation (src/msd/translate.py).
+
+# ---------------------------------------------------------------- harmful prompts
+
+- name: "DAMO-NLP-SG/MultiJail"
+  url: "https://huggingface.co/datasets/DAMO-NLP-SG/MultiJail"
+  license: "mit"
+  languages: [en, ar, sw]
+  used_for: "harmful_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    Official release (single file MultiJail.csv). Card: 315 English unsafe prompts
+    annotated into nine languages (zh it vi ar ko th bn sw jv). Only en, ar and sw are
+    ours; there is no Hindi and no Hinglish. Card front matter says license: mit; the
+    Ethics Statement adds that the research is "solely for academic purposes and ethical
+    use" (recorded as a fact, not a license term). The code repo
+    DAMO-NLP-SG/multilingual-safety-for-LLMs has a LICENSE file headed "MIT License". Two
+    mirrors are listed separately and excluded.
+
+- name: "centerforaisafety/HarmBench"
+  url: "https://github.com/centerforaisafety/HarmBench"
+  license: "MIT License"
+  languages: [en]
+  used_for: "harmful_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    License read from the repo LICENSE file ("MIT License / Copyright (c) 2024
+    centerforaisafety"); the repo README only shows the MIT badge and states no extra
+    data terms. The Hugging Face mirror walledai/HarmBench is gated (login and accepted
+    conditions needed; its card text shows License: mit), so use the public GitHub file
+    data/behavior_datasets/harmbench_behaviors_text_all.csv: 400 rows (standard 200,
+    contextual 100, copyright 100). English only; needs translation. Contextual rows have
+    a ContextString; copyright rows ask for copyrighted text.
+
+- name: "llm-attacks/llm-attacks (AdvBench)"
+  url: "https://github.com/llm-attacks/llm-attacks"
+  license: "MIT License"
+  languages: [en]
+  used_for: "harmful_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    AdvBench lives in data/advbench/harmful_behaviors.csv (520 rows in the repo; the
+    walledai/AdvBench card describes 500). License read from the repo LICENSE file ("MIT
+    License / Copyright (c) 2023 Andy Zou") and the README ("llm-attacks is licensed
+    under the terms of the MIT license"). The Hugging Face mirror walledai/AdvBench is
+    gated (card text shows License: mit and credits the llm-attacks repo). English only;
+    needs translation.
+
+- name: "CohereLabs/aya_redteaming"
+  url: "https://huggingface.co/datasets/CohereLabs/aya_redteaming"
+  license: "apache-2.0"
+  languages: [en, hi, ar]
+  used_for: "harmful_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    Human-written red-teaming prompts in Arabic, English, Filipino, French, Hindi,
+    Russian, Serbian and Spanish (card); no Swahili and no Hinglish. Card: "This dataset
+    can be used for any purpose, whether academic or commercial, under the terms of the
+    Apache 2.0 License." Nine harm categories, weighted to hate, harassment,
+    discrimination, graphic material, self-harm and violence rather than weapons or
+    cyber; each prompt has global/local harm labels. Card tag not-for-all-audiences. The
+    card does not say whether the Hindi text is Devanagari or romanized.
+
+- name: "ToxicityPrompts/PolyGuardPrompts"
+  url: "https://huggingface.co/datasets/ToxicityPrompts/PolyGuardPrompts"
+  license: "cc-by-4.0"
+  languages: [en, hi, ar]
+  used_for: "harmful_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    License is the metadata field only; the card body has no license section.
+    Evaluation set of 29,325 prompt/response samples in 17 languages (ours: en, hi, ar;
+    no sw, no Hinglish), built per the card from naturally occurring human-LLM
+    interactions plus human-verified machine translations of WildGuardMix. The upstream
+    allenai/wildguardmix is labelled odc-by and gated, and this card does not restate
+    upstream terms. Attribution required. Prompts carry harmful/unharmful labels, so
+    filter to prompt_harm_label harmful.
+
+- name: "nvidia/Nemotron-Safety-Guard-Dataset-v3"
+  url: "https://huggingface.co/datasets/nvidia/Nemotron-Safety-Guard-Dataset-v3"
+  license: "cc-by-4.0"
+  languages: [en, hi, ar]
+  used_for: "harmful_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    Card: "License/Terms of Use: CC-BY 4.0" and "ready for commercial/non-commercial
+    use". 514,617 samples in 12 languages (ours: en, ar, hi; no sw, no Hinglish).
+    Synthetic: culturally adapted and translated from the English Aegis 2.0 dataset plus
+    synthetic jailbreak prompt/response pairs, built to train guard models. Aegis 2.0
+    prompts come from Anthropic HH-RLHF, Do-Anything-Now and AART per its card; some rows
+    from the Kaggle Suicide Detection dataset are REDACTED in the prompt field. Attribution
+    required.
+
+# ---------------------------------------------------------- benign-but-edgy prompts
+
+- name: "Paul/XSTest"
+  url: "https://huggingface.co/datasets/Paul/XSTest"
+  license: "cc-by-4.0"
+  languages: [en]
+  used_for: "benign_edgy_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    450 English prompts (250 safe, 200 unsafe contrasts) in xstest_prompts.csv. Card
+    front matter license: cc-by-4.0. The GitHub readme (paul-rottger/xstest) says "XSTest
+    prompts are subject to Creative Commons Attribution 4.0 International (CC-BY-4.0)
+    license. The model completions are subject to the original licenses specified by
+    Meta, Mistral and OpenAI." Use the prompts only, not model_completions. Attribution
+    required. English only; hi/ar/sw/Hinglish need translation. The walledai/XSTest
+    mirror is gated and was not used. No hi, ar or sw translation turned up in the top 25
+    Hugging Face results for "xstest"; walledai/HiXSTest is listed separately.
+
+- name: "bench-llm/or-bench"
+  url: "https://huggingface.co/datasets/bench-llm/or-bench"
+  license: "cc-by-4.0"
+  languages: [en]
+  used_for: "benign_edgy_prompts"
+  verified_on: "2026-11-05"
+  notes: >-
+    Over-refusal benchmark, English only; card front matter license: cc-by-4.0 and no
+    other license text. Per the card plots, OR-Bench-Hard-1K holds the seemingly toxic but
+    safe prompts (refusing them counts as over-refusal) and OR-Bench-Toxic holds
+    genuinely toxic prompts, so the two must not be mixed; the card text does not
+    describe the or-bench-80k config beyond its name. Attribution required. Needs
+    translation for hi/ar/sw/Hinglish.
+
+# -------------------------------------------------- capability / task cross-checks
+
+- name: "facebook/belebele"
+  url: "https://huggingface.co/datasets/facebook/belebele"
+  license: "cc-by-sa-4.0"
+  languages: [en, hi, ar, sw]
+  used_for: "task_cross_check"
+  verified_on: "2026-11-05"
+  notes: >-
+    Multiple-choice reading comprehension, test split only. Config names: eng_Latn,
+    hin_Deva, hin_Latn (card table: "Hindi (Romanized)"), arb_Arab, swh_Latn. hin_Latn is
+    romanized Hindi, not code-mixed Hinglish, so hinglish is not listed. SHARE-ALIKE:
+    the GitHub README (facebookresearch/belebele) says the dataset is licensed under
+    LICENSE_CC-BY-SA4.0, and that the separate training set is mostly CC-BY-NC (not used).
+    Items or translations redistributed in our release would carry CC-BY-SA-4.0 terms;
+    whether the release may include Belebele items is a decision for the owner, not made
+    here. GitHub repo license metadata reads NOASSERTION.
+
+- name: "CohereLabs/Global-MMLU"
+  url: "https://huggingface.co/datasets/CohereLabs/Global-MMLU"
+  license: "apache-2.0"
+  languages: [en, hi, ar, sw]
+  used_for: "task_cross_check"
+  verified_on: "2026-11-05"
+  notes: >-
+    Card: "This dataset can be used for any purpose, under the terms of the Apache 2.0
+    License." 42 languages including en, hi, ar and sw (card language table). MMLU
+    questions combining machine translation with professional and crowd-sourced
+    post-edits; general knowledge multiple choice, not public-services QA. Permissive
+    (no share-alike) alternative to Belebele for a capability-retention check.
+
+- name: "openai/MMMLU"
+  url: "https://huggingface.co/datasets/openai/MMMLU"
+  license: "mit"
+  languages: [hi, ar, sw]
+  used_for: "task_cross_check"
+  verified_on: "2026-11-05"
+  notes: >-
+    License is the metadata field only; the card body has no license section. Card:
+    MMLU test set translated into 14 locales by professional human translators (AR_XY,
+    HI_IN, SW_KE among them). No English split in this repo and no Hinglish. General
+    knowledge multiple choice, not public-services QA.
+
+# ------------------------------------------------------------- fine-tune data
+
+- name: "CohereLabs/aya_dataset"
+  url: "https://huggingface.co/datasets/CohereLabs/aya_dataset"
+  license: "apache-2.0"
+  languages: [en, hi, ar, sw]
+  used_for: "fine_tune_data"
+  verified_on: "2026-11-05"
+  notes: >-
+    Human-annotated multilingual instruction data (inputs/targets), crowdsourced and
+    expert-generated. Card: "This dataset can be used for any purpose, whether academic
+    or commercial, under the terms of the Apache 2.0 License." Language codes on the
+    card include eng, hin, swa and arb (plus other Arabic varieties ary, ars, acq, arz,
+    apc). The card does not say whether Hindi is Devanagari or romanized, so hinglish is
+    not listed. General instruction data, free-form answers, not public-services QA and
+    not closed-form; it needs filtering for harmless content before use.
+
+# ------------------------------------------------------------------ excluded
+
+- name: "walledai/MultiJail"
+  url: "https://huggingface.co/datasets/walledai/MultiJail"
+  license: "none stated on the card"
+  languages: [en, ar, sw]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: mirror of MultiJail with no license field (the card has none and the Hugging
+    Face API returns none). Splits ar, zh, sw, ko, en, it, jv, th, vi, bn, 315 rows each.
+    Use the official DAMO-NLP-SG/MultiJail instead.
+
+- name: "ToxicityPrompts/DAMO-MultiJail"
+  url: "https://huggingface.co/datasets/ToxicityPrompts/DAMO-MultiJail"
+  license: "odc-by"
+  languages: []
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: re-upload of MultiJail (3,150 rows) whose card says "The dataset is released
+    under the Open Data Commons Attribution License (ODC-By) v1.0", which conflicts with
+    the original card's mit. The card lists no languages. Use the official
+    DAMO-NLP-SG/MultiJail.
+
+- name: "ToxicityPrompts/PolyGuardMix"
+  url: "https://huggingface.co/datasets/ToxicityPrompts/PolyGuardMix"
+  license: "cc-by-4.0"
+  languages: [en, hi, ar]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded as not needed: the 1.91M-sample training corpus behind PolyGuardPrompts
+    (same family, same provenance and upstream terms as PolyGuardPrompts); the held-out
+    PolyGuardPrompts is the evaluation source. License is the metadata field only.
+
+- name: "nvidia/Aegis-AI-Content-Safety-Dataset-2.0"
+  url: "https://huggingface.co/datasets/nvidia/Aegis-AI-Content-Safety-Dataset-2.0"
+  license: "cc-by-4.0"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded as not needed: English only (HarmBench and AdvBench already cover English)
+    and superseded by the multilingual Nemotron-Safety-Guard-Dataset-v3 built from it.
+    Card lists "License: CC-BY-4.0"; prompts come from Anthropic HH-RLHF, Do-Anything-Now
+    and AART; some Suicide Detection rows are redacted.
+
+- name: "ToxicityPrompts/PolygloToxicityPrompts"
+  url: "https://huggingface.co/datasets/ToxicityPrompts/PolygloToxicityPrompts"
+  license: "conflicting: front matter cc-by-4.0; card body AI2 ImpACT License - Low Risk Artifacts"
+  languages: [en, hi, ar]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: the card contradicts itself. Front matter says license: cc-by-4.0 while the
+    body says it is "made available under the AI2 ImpACT License - Low Risk Artifacts
+    ('LR Agreement')". Also web-text toxicity continuation prompts, not requests. No
+    Swahili in the card's 17 languages.
+
+- name: "microsoft/RTP-LX"
+  url: "https://github.com/microsoft/RTP-LX"
+  license: "MIT License (repo LICENSE); NOTICE lists third-party material, including original RTP under Apache License 2.0"
+  languages: [en, hi, ar, sw]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: toxic text prompts and passages for toxicity detection, not instructions
+    to comply with, and the entries are zipped and password-protected "to avoid
+    crawlers". The Hugging Face page microsoft/RTP-LX returned HTTP 401, so no
+    Hugging Face card could be read; license read from the GitHub LICENSE file and
+    NOTICE. README coverage is 38 languages including English, Hindi, Arabic (Egyptian,
+    Levantine, Saudi) and Swahili.
+
+- name: "Jarviswang94/Multilingual_safety_benchmark (XSafety)"
+  url: "https://github.com/Jarviswang94/Multilingual_safety_benchmark"
+  license: "Apache License 2.0 (repo LICENSE file); README banner marks research use only"
+  languages: [en, hi, ar]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: no dataset card; the only license is the repo-level Apache License 2.0
+    file, and the README carries a banner reading research use only / no misuse (with a
+    check mark and a cross mark), which is not a license term but leaves the data's terms
+    unclear. Ten languages (en zh es fr bn ar hi ru ja de); no Swahili. 14 safety issue
+    types, one CSV or XLSX per type and language.
+
+- name: "felfri/M-ALERT"
+  url: "https://huggingface.co/datasets/felfri/M-ALERT"
+  license: "cc-by-nc-sa-4.0"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: non-commercial and share-alike. Languages are en, fr, de, it, es only, so
+    only English is ours. Card says most prompts derive from Anthropic HH-RLHF (MIT).
+
+- name: "LibrAI/do-not-answer"
+  url: "https://huggingface.co/datasets/LibrAI/do-not-answer"
+  license: "conflicting: front matter apache-2.0; card License section CC BY-NC-SA 4.0 for the data"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: the card contradicts itself. Front matter says license: apache-2.0; the
+    card's License section says the dataset is under the Creative Commons
+    Attribution-NonCommercial-ShareAlike 4.0 International License and only the source
+    files are Apache 2.0. English only. Non-commercial and share-alike if the License
+    section is the one that applies.
+
+- name: "PKU-Alignment/PKU-SafeRLHF"
+  url: "https://huggingface.co/datasets/PKU-Alignment/PKU-SafeRLHF"
+  license: "cc-by-nc-4.0"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: non-commercial license (card front matter). English only.
+
+- name: "lmsys/toxic-chat"
+  url: "https://huggingface.co/datasets/lmsys/toxic-chat"
+  license: "cc-by-nc-4.0"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: card says "Both the user prompts and the model outputs are licensed under
+    CC-BY-NC-4.0." Non-commercial. English only; real user prompts.
+
+- name: "sorry-bench/sorry-bench-202406"
+  url: "https://huggingface.co/datasets/sorry-bench/sorry-bench-202406"
+  license: "other (card: SORRY-Bench Dataset License Agreement)"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: gated (raw card returned HTTP 401; the HTML page showed only part of the
+    card) and the agreement says "You should not distribute, copy, disclose, assign,
+    sublicense, embed, host, or otherwise transfer the dataset", which rules out a public
+    release containing it. Translated variants are fr, zh, ml, mr and ta; none are ours.
+
+- name: "allenai/wildguardmix"
+  url: "https://huggingface.co/datasets/allenai/wildguardmix"
+  license: "odc-by"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: gated (raw card returned HTTP 401). The HTML page shows License: odc-by but
+    the access conditions (AI2 Responsible Use Guidelines) are behind a login and could
+    not be read. English only.
+
+- name: "walledai/HiXSTest"
+  url: "https://huggingface.co/datasets/walledai/HiXSTest"
+  license: "apache-2.0"
+  languages: [hi]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: gated (raw card returned HTTP 401), so the data and full card could not be
+    read; the HTML page shows license apache-2.0, Hindi, fewer than 1K rows, and a Dataset
+    Details section that says only "TBD" (script and construction unknown). Search
+    results describe it as 25 safe/unsafe prompt pairs.
+
+- name: "McGill-NLP/tukabench"
+  url: "https://huggingface.co/datasets/McGill-NLP/tukabench"
+  license: "cc-by-nc-4.0"
+  languages: [en, sw]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: card says "Released under CC-BY-NC 4.0. Non-commercial research use only."
+    African-language jailbreak benchmark (en am ha ig ny sw xh yo). Swahili would
+    otherwise be useful.
+
+- name: "ppattnay/IndicSafe"
+  url: "https://huggingface.co/datasets/ppattnay/IndicSafe"
+  license: "cc-by-nc-4.0"
+  languages: [hi]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: card says "The dataset is released under CC BY-NC 4.0". Twelve Indic
+    languages including Hindi; no English, Arabic or Swahili.
+
+- name: "anna-sarvam/indic-safety-eval"
+  url: "https://huggingface.co/datasets/anna-sarvam/indic-safety-eval"
+  license: "cc-by-nc-4.0"
+  languages: [en, hi]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: card front matter license: cc-by-nc-4.0 (non-commercial). IndicSafetyBench,
+    multi-turn jailbreak items in 22 Indic languages plus English.
+
+- name: "Unbabel/Multilingual-Red-Teaming"
+  url: "https://huggingface.co/datasets/Unbabel/Multilingual-Red-Teaming"
+  license: "none stated on the card"
+  languages: [en]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: no license on the card. 169 requests in English and European Portuguese
+    only, partly from a proprietary dataset.
+
+- name: "tiny-aya-translate/hinglish-casual"
+  url: "https://huggingface.co/datasets/tiny-aya-translate/hinglish-casual"
+  license: "other (license_name: see-upstream)"
+  languages: [hinglish]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: the card says "Licence: upstream terms apply and are not restated here
+    - verify before redistribution", so the license is unclear. It is also 31 GB of
+    casual code-switched speech with Latin and Devanagari transcripts (33,275 utterances),
+    not safety or QA data. The only Hinglish text source found.
+
+- name: "google/xquad"
+  url: "https://huggingface.co/datasets/google/xquad"
+  license: "cc-by-sa-4.0"
+  languages: [en, hi, ar]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: share-alike, and the license is the metadata field only (the card's
+    Licensing Information section says "More Information Needed"). Extractive QA with no
+    Swahili; Belebele already provides the capability cross-check.
+
+- name: "facebook/mlqa"
+  url: "https://huggingface.co/datasets/facebook/mlqa"
+  license: "cc-by-sa-3.0"
+  languages: [en, hi, ar]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: share-alike, and the license is the metadata field only (the card's
+    Licensing Information section says "More Information Needed"). Extractive QA with no
+    Swahili.
+
+- name: "google-research-datasets/tydiqa"
+  url: "https://huggingface.co/datasets/google-research-datasets/tydiqa"
+  license: "apache-2.0"
+  languages: [en, ar, sw]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: license unclear. Front matter says apache-2.0, but the card's Licensing
+    Information section says "More Information Needed" and the card lists
+    source_datasets "extended|wikipedia" (Wikipedia text), so the label is unverified.
+    Extractive QA; no Hindi.
+
+- name: "masakhane/afriqa"
+  url: "https://huggingface.co/datasets/masakhane/afriqa"
+  license: "conflicting: front matter cc-by-sa-4.0; card text CC 4.0 Non-Commercial"
+  languages: [sw]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded: the card contradicts itself. Front matter says license: cc-by-sa-4.0 while
+    the Licensing Information section says "The licensing status of the data is CC 4.0
+    Non-Commercial". Swahili only (among ten African languages).
+
+- name: "CohereLabs/include-base-44"
+  url: "https://huggingface.co/datasets/CohereLabs/include-base-44"
+  license: "apache-2.0"
+  languages: [hi, ar]
+  used_for: "excluded"
+  verified_on: "2026-11-05"
+  notes: >-
+    Excluded as not needed: regional exam questions in 44 languages with hi and ar but no
+    Swahili and no English subset; Belebele and Global-MMLU already cover the capability
+    cross-check. Card front matter license: apache-2.0.

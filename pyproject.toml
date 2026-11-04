@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.10",
     "safetensors",
     "python-dotenv",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
