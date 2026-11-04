@@ -1,0 +1,12 @@
+envs/
+.env
+data/testset/
+data/ft/
+results/
+export/
+.superpowers/
+*.safetensors
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
