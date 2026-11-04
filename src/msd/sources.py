@@ -1,4 +1,9 @@
-"""Validation and loading for the public-data source manifest (data/sources.yaml)."""
+"""Validation and loading for the public-data source manifest (data/sources.yaml).
+
+Optional key `redistribute` (bool, default true): false means the source is evaluation only,
+the model is scored on it and only scores are published; its items are not copied into our
+released datasets. Required for any usable entry whose license is share-alike.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ from msd.config import LANGS
 
 LANG_CODES: tuple[str, ...] = LANGS
 REQUIRED_KEYS: tuple[str, ...] = ("name", "url", "license", "languages", "used_for", "verified_on")
-OPTIONAL_KEYS: tuple[str, ...] = ("notes",)
+OPTIONAL_KEYS: tuple[str, ...] = ("notes", "redistribute")
 USED_FOR: frozenset[str] = frozenset(
     {
         "harmful_prompts",
@@ -27,6 +32,59 @@ USED_FOR: frozenset[str] = frozenset(
 
 _TEXT_KEYS = ("name", "url", "license", "used_for", "verified_on")
 _DATE_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# --- the license rule -------------------------------------------------------------------------
+#
+# A usable (non-`excluded`) entry must carry a clean, recognised license. The matcher works on
+# the license string lower-cased, trimmed, with runs of whitespace/underscores turned into "-",
+# so "CC BY-SA 4.0" and "cc_by_sa_4.0" both become "cc-by-sa-4.0". Checks, in order:
+#   1. DENY non-commercial: the token "nc" or "non-commercial"/"noncommercial" (cc-by-nc-4.0).
+#   2. DENY unclear: contains "conflict", or the tokens none/other/unknown/unclear/missing/
+#      unspecified/unstated, or "not-stated", "no-license", "see-upstream", "n/a".
+#   3. SHARE-ALIKE: contains "-sa" (not followed by a letter) or "share". An error unless the
+#      entry says `redistribute: false` (evaluation only: scores are published, items are not
+#      copied into our released datasets, so the share-alike condition is never triggered).
+#   4. ALLOW: whatever is left must start with a recognised family (mit, apache, bsd, isc,
+#      unlicense, cc0, any cc-by version, odc-by, "creative commons attribution", public domain).
+# Anything that fails 1 or 2, or matches nothing in 4, is an error for a usable entry; such
+# sources belong under `used_for: excluded` with the reason in notes. This is a convention check,
+# not legal advice: it cannot prove that a recognised license is the right one for the data.
+_NON_COMMERCIAL = re.compile(r"(?<![a-z0-9])nc(?![a-z0-9])|non-?commercial")
+_UNCLEAR = re.compile(
+    r"conflict|(?<![a-z])(?:none|other|unknown|unclear|missing|unspecified|unstated)(?![a-z])"
+    r"|not-stated|no-licen[cs]e|see-upstream|n/a"
+)
+_SHARE_ALIKE = re.compile(r"-sa(?![a-z])|share")
+_PERMISSIVE = re.compile(
+    r"^(?:(?:mit|apache|bsd|isc)(?![a-z])|unlicense|cc0|cc-by(?![a-z])|odc-by"
+    r"|open-data-commons-attribution|creative-commons-attribution|public-domain)"
+)
+
+
+def _normalise_license(text: str) -> str:
+    return re.sub(r"[\s_]+", "-", text.strip().casefold())
+
+
+def _license_problems(text: str, redistribute: object) -> list[str]:
+    """Problems with the license of a usable (non-excluded) entry."""
+    norm = _normalise_license(text)
+    if _NON_COMMERCIAL.search(norm):
+        return [f"license {text!r} is non-commercial; only an excluded entry may use it"]
+    if _UNCLEAR.search(norm):
+        return [f"license {text!r} is conflicting, missing, other or unknown; exclude the entry"]
+    if _SHARE_ALIKE.search(norm):
+        if redistribute is False:
+            return []
+        return [
+            f"license {text!r} is share-alike; set redistribute: false (evaluation only) "
+            "or exclude the entry"
+        ]
+    if not _PERMISSIVE.search(norm):
+        return [
+            f"license {text!r} is not a recognised permissive license; read the card, then "
+            "extend _PERMISSIVE in src/msd/sources.py or exclude the entry"
+        ]
+    return []
 
 
 def _is_text(value: object) -> bool:
@@ -87,10 +145,16 @@ def validate_entry(entry: Any) -> list[str]:
             if not languages and used_for != "excluded":
                 problems.append("languages may only be empty for an excluded entry")
 
+    if "redistribute" in entry and not isinstance(entry["redistribute"], bool):
+        problems.append(f"redistribute must be true or false, got {entry['redistribute']!r}")
+
     if "notes" in entry and not _is_text(entry["notes"]):
         problems.append(f"notes, when present, must be a non-empty string, got {entry['notes']!r}")
     if used_for == "excluded" and not _is_text(entry.get("notes")):
         problems.append("an excluded entry needs its reason in notes")
+
+    if used_for != "excluded" and _is_text(entry.get("license")):
+        problems.extend(_license_problems(entry["license"], entry.get("redistribute", True)))
 
     return problems
 
@@ -104,9 +168,10 @@ def validate_sources(entries: Sequence[Any]) -> list[str]:
         label = name if _is_text(name) else f"#{index}"
         problems.extend(f"{label}: {p}" for p in validate_entry(entry))
         if _is_text(name):
-            if name in seen:
+            key = name.strip().casefold()
+            if key in seen:
                 problems.append(f"{label}: duplicate name")
-            seen.add(name)
+            seen.add(key)
     return problems
 
 

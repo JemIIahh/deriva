@@ -257,3 +257,46 @@ def test_duplicate_source_ids_are_rejected():
     items = [_item("dup", "one"), _item("dup", "two")]
     with pytest.raises(ValueError, match="dup"):
         translate_with_qc(items, "hi", identity, identity, same)
+
+
+# --- fix round 1: stricter output and input checks ------------------------------------------------
+
+
+@pytest.mark.parametrize("which", ["a", "b"])
+@pytest.mark.parametrize("bad", ["abc", ("a", "b", "c"), None, 3])
+def test_translator_output_must_be_a_list(which, bad):
+    # a bare string of the batch size (3 chars for 3 items) must not pass as three texts
+    items = [_item("a", "one"), _item("b", "two"), _item("c", "three")]
+    tr_a = (lambda t, s, g: bad) if which == "a" else identity
+    tr_b = (lambda t, s, g: bad) if which == "b" else identity
+    step = "forward" if which == "a" else "back"
+    with pytest.raises(ValueError, match=f"{step} translator.*list"):
+        translate_with_qc(items, "hi", tr_a, tr_b, same)
+
+
+@pytest.mark.parametrize("bad", [None, "no", "yes", 1, 0, [], "False"])
+def test_same_meaning_must_return_a_real_bool(bad):
+    items = [_item("a", "one"), _item("b", "two")]
+    with pytest.raises(ValueError, match="'a'"):  # names the first offending item
+        translate_with_qc(items, "hi", identity, identity, lambda o, b: bad)
+
+
+def test_same_meaning_true_and_false_are_both_accepted():
+    items = [_item("a", "one"), _item("b", "two")]
+    out, report = translate_with_qc(items, "hi", identity, identity, lambda o, b: o == "one")
+    assert [p.text for p in out] == ["one"]
+    assert report == QCReport(kept={"hi": 1}, dropped={"hi": 1})
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
+def test_blank_english_input_blames_the_input_item_not_the_translator(blank):
+    called = []
+
+    def tracking(texts, src, tgt):
+        called.append(1)
+        return list(texts)
+
+    items = [_item("ok", "fine"), _item("empty-one", blank)]
+    with pytest.raises(ValueError, match="input item 'empty-one'"):
+        translate_with_qc(items, "hi", tracking, tracking, same)
+    assert called == []  # rejected before any translator is called

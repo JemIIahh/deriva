@@ -44,11 +44,17 @@ def _translate_checked(
 ) -> list[str]:
     """Call `translator` and refuse any output that is misaligned, non-text or blank.
 
-    A wrong count raises (there is no way to tell which input an output belongs to), and
-    so does a blank or non-string translation (a translator failure must not be quietly
-    folded into the meaning-drop count). Either way the error names the step and item.
+    A non-list result or a wrong count raises (there is no way to tell which input an output
+    belongs to), and so does a blank or non-string translation (a translator failure must not
+    be quietly folded into the meaning-drop count). The error names the step, and the item
+    where one is at fault.
     """
     out = translator(list(texts), src, tgt)
+    if not isinstance(out, list):
+        # a bare string (or tuple, or None) must not be indexed as if it were one text per input
+        raise ValueError(
+            f"{step} translator ({src}->{tgt}) must return a list of texts, got {type(out).__name__}"
+        )
     if len(out) != len(texts):
         raise ValueError(
             f"{step} translator ({src}->{tgt}) returned {len(out)} texts for {len(texts)} inputs"
@@ -80,9 +86,11 @@ def translate_with_qc(
     translation inherits the split its English item was given before translation.
 
     Raises ValueError for a target that is not one of the non-English study languages
-    (English included), for an input item that is not English or repeats an id, and for a
-    translator that returns the wrong number of texts or a blank/non-string translation.
-    Items are dropped only when `same_meaning` says no. Output order follows the input.
+    (English included), for an input item that is not English, repeats an id or has blank text
+    (the message names the item), for a translator that returns a non-list, the wrong number of
+    texts or a blank/non-string translation, and for a `same_meaning` that does not return a
+    real bool. Items are dropped only when `same_meaning` says False. Output order follows the
+    input.
     """
     if lang not in NON_ENGLISH:
         raise ValueError(f"target language must be one of {list(NON_ENGLISH)}, got {lang!r}")
@@ -93,6 +101,10 @@ def translate_with_qc(
     not_english = [item.id for item in items_en if item.lang != "en"]
     if not_english:
         raise ValueError(f"translate_with_qc takes English items only; not 'en': {not_english[:5]}")
+    for item in items_en:
+        if not isinstance(item.text, str) or not item.text.strip():
+            # the fault is in the input, not in a translator
+            raise ValueError(f"input item {item.id!r} has blank text; fix or drop it before translating")
 
     if not items_en:
         return [], QCReport(kept={lang: 0}, dropped={lang: 0})
@@ -103,7 +115,13 @@ def translate_with_qc(
 
     kept: list[Prompt] = []
     for item, translated, back_text in zip(items_en, forward, back):
-        if same_meaning(item.text, back_text):
+        verdict = same_meaning(item.text, back_text)
+        if not isinstance(verdict, bool):
+            raise ValueError(
+                f"same_meaning must return a bool, got {type(verdict).__name__} "
+                f"for item {item.id!r}"
+            )
+        if verdict:
             kept.append(replace(item, id=translated_id(item.id, lang), lang=lang, text=translated))
     report = QCReport(kept={lang: len(kept)}, dropped={lang: len(items_en) - len(kept)})
     return kept, report

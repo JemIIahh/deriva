@@ -1,4 +1,5 @@
 import copy
+import re
 from datetime import date
 from pathlib import Path
 
@@ -45,13 +46,48 @@ def test_sources_manifest_complete():
         assert set(entry) <= set(REQUIRED_KEYS) | set(OPTIONAL_KEYS)
         assert entry["used_for"] in USED_FOR
         assert set(entry["languages"]) <= set(LANG_CODES)
-        assert entry["verified_on"] == "2026-11-05"
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", entry["verified_on"])
+        assert isinstance(entry.get("redistribute", True), bool)
+
+
+REQUIRED_CANDIDATES = (
+    "DAMO-NLP-SG/MultiJail",  # the MultiJail-style multilingual jailbreak set
+    "Paul/XSTest",
+    "centerforaisafety/HarmBench",
+    "llm-attacks/llm-attacks (AdvBench)",
+    "facebook/belebele",
+    "CohereLabs/aya_dataset",
+)
 
 
 def test_manifest_records_every_required_candidate():
-    names = " ".join(e["name"].casefold() for e in load_sources(MANIFEST))
-    for needle in ("multijail", "xstest", "harmbench", "advbench", "belebele", "aya"):
-        assert needle in names, f"no manifest entry mentions {needle!r}"
+    by_name = {e["name"]: e for e in load_sources(MANIFEST)}
+    for name in REQUIRED_CANDIDATES:
+        assert name in by_name, f"no manifest entry named {name!r}"
+    required = [by_name[n] for n in REQUIRED_CANDIDATES]
+    assert not all(e["used_for"] == "excluded" for e in required)
+    # the manifest has to leave something usable for every role the study needs
+    roles = {e["used_for"] for e in by_name.values()}
+    assert {"harmful_prompts", "benign_edgy_prompts", "task_cross_check", "fine_tune_data"} <= roles
+    # each spec-named source is actually usable, not parked in `excluded`
+    for entry in required:
+        assert entry["used_for"] != "excluded", entry["name"]
+
+
+def test_belebele_is_evaluation_only():
+    belebele = next(e for e in load_sources(MANIFEST) if e["name"] == "facebook/belebele")
+    assert belebele["license"] == "cc-by-sa-4.0"
+    assert belebele["used_for"] == "task_cross_check"
+    assert belebele["redistribute"] is False
+
+
+def test_no_usable_manifest_entry_breaks_the_license_rule():
+    # the same rule validate_entry enforces, asserted on the real file
+    for entry in load_sources(MANIFEST):
+        if entry["used_for"] == "excluded":
+            continue
+        problems = [p for p in validate_entry(entry) if "license" in p]
+        assert problems == [], entry["name"]
 
 
 def test_manifest_names_are_unique():
@@ -78,7 +114,7 @@ def test_constants_match_the_spec():
     assert set(USED_FOR) == {"harmful_prompts", "benign_edgy_prompts", "task_qa",
                              "task_cross_check", "fine_tune_data", "excluded"}
     assert set(REQUIRED_KEYS) == {"name", "url", "license", "languages", "used_for", "verified_on"}
-    assert set(OPTIONAL_KEYS) == {"notes"}
+    assert set(OPTIONAL_KEYS) == {"notes", "redistribute"}
 
 
 @pytest.mark.parametrize("key", sorted(REQUIRED_KEYS))
@@ -159,6 +195,129 @@ def test_url_must_be_http_or_https():
     assert validate_entry(good(url="huggingface.co/datasets/x"))
     assert validate_entry(good(url="ftp://example.com/x"))
     assert validate_entry(good(url="http://example.com/x")) == []
+
+
+# --- the license rule: only clean licenses may be used; share-alike only if evaluation-only -------
+
+NOTES = "reason recorded here"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "cc-by-nc-4.0",
+        "CC BY-NC 4.0",
+        "cc-by-nc-sa-4.0",
+        "CC-BY-NC",
+        "Creative Commons Attribution-NonCommercial 4.0 International",
+        "non-commercial research use only",
+        "noncommercial",
+        "conflicting: front matter apache-2.0; card body CC BY-NC-SA 4.0",
+        "none stated on the card",
+        "none",
+        "No license",
+        "not stated",
+        "other",
+        "other (license_name: see-upstream)",
+        "unknown",
+        "unclear",
+        "missing",
+        "unspecified",
+    ],
+)
+def test_unusable_license_on_a_usable_entry_is_a_problem(bad):
+    problems = validate_entry(good(license=bad))
+    assert problems and any("license" in p for p in problems), bad
+    # the same string is fine on an excluded entry, which is where such sources belong
+    assert validate_entry(good(license=bad, used_for="excluded", notes=NOTES)) == [], bad
+
+
+@pytest.mark.parametrize("bad", ["cc-by-nc-4.0", "cc-by-nc-sa-4.0", "CC BY-NC 4.0"])
+def test_non_commercial_stays_an_error_even_when_evaluation_only(bad):
+    assert validate_entry(good(license=bad, redistribute=False))
+
+
+@pytest.mark.parametrize(
+    "bad", ["conflicting: apache-2.0 vs cc-by-nc", "none stated", "other", "unknown"]
+)
+def test_conflicting_or_unknown_stays_an_error_even_when_evaluation_only(bad):
+    assert validate_entry(good(license=bad, redistribute=False))
+
+
+@pytest.mark.parametrize(
+    "sa",
+    [
+        "cc-by-sa-4.0",
+        "CC BY-SA 4.0",
+        "CC-BY-SA-3.0",
+        "cc by sa 4.0",
+        "Creative Commons Attribution-ShareAlike 4.0 International",
+    ],
+)
+def test_share_alike_needs_redistribute_false(sa):
+    assert any("license" in p for p in validate_entry(good(license=sa)))
+    assert any("license" in p for p in validate_entry(good(license=sa, redistribute=True)))
+    assert validate_entry(good(license=sa, redistribute=False)) == []
+
+
+def test_belebele_shaped_entry_passes_only_with_redistribute_false():
+    belebele = good(
+        name="facebook/belebele",
+        license="cc-by-sa-4.0",
+        languages=["en", "hi", "ar", "sw"],
+        used_for="task_cross_check",
+    )
+    assert validate_entry({**belebele, "redistribute": False}) == []
+    assert validate_entry(belebele)
+    assert validate_entry({**belebele, "redistribute": True})
+
+
+@pytest.mark.parametrize("bad", ["false", "no", 0, 1, None, [], "False"])
+def test_redistribute_must_be_a_bool(bad):
+    problems = validate_entry(good(redistribute=bad))
+    assert problems and any("redistribute" in p for p in problems)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_redistribute_bool_is_accepted(value):
+    assert validate_entry(good(redistribute=value)) == []
+
+
+@pytest.mark.parametrize(
+    "ok",
+    [
+        "mit",
+        "MIT",
+        "MIT License",
+        "apache-2.0",
+        "Apache License 2.0",
+        "cc-by-4.0",
+        "CC BY 4.0",
+        "cc0-1.0",
+        "odc-by",
+        "Open Data Commons Attribution License (ODC-By) v1.0",
+    ],
+)
+def test_clean_licenses_pass(ok):
+    assert validate_entry(good(license=ok)) == []
+
+
+@pytest.mark.parametrize("weird", ["made-up-license-1.0", "proprietary", "see website"])
+def test_unrecognised_license_is_a_problem_on_a_usable_entry(weird):
+    problems = validate_entry(good(license=weird))
+    assert problems and any("license" in p for p in problems)
+
+
+def test_license_matcher_ignores_case_and_spacing():
+    assert validate_entry(good(license="  CC   BY-NC   4.0 "))
+    assert validate_entry(good(license="CC_BY_SA_4.0"))
+    assert validate_entry(good(license="CC_BY_SA_4.0", redistribute=False)) == []
+
+
+def test_duplicate_names_are_matched_ignoring_case_and_surrounding_space():
+    problems = validate_sources([good(name="Org/Data"), good(name="  org/data ")])
+    assert any("duplicate" in p.lower() for p in problems)
+    assert validate_sources([good(name="Org/Data"), good(name="Org/Other")]) == []
 
 
 # --- list-level validation and loading -------------------------------------------------------
