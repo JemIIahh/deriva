@@ -85,6 +85,29 @@ def test_small_n_raises_insufficient_data():
     assert lo <= point <= hi
 
 
+def test_bootstrap_ci_all_zero_gives_exact_upper_bound_not_zero_width():
+    # Exact Clopper-Pearson for 0/150 at 95%: upper bound 1 - 0.025**(1/150) = 2.43%.
+    point, lo, hi = bootstrap_ci([0] * 150)
+    assert point == 0.0
+    assert lo == 0.0
+    assert 0.02 < hi < 0.03
+    assert hi == pytest.approx(1 - 0.025 ** (1 / 150))
+
+
+def test_bootstrap_ci_all_one_mirrors_all_zero():
+    point, lo, hi = bootstrap_ci([1] * 150)
+    assert point == 1.0
+    assert hi == 1.0
+    assert 0.97 < lo < 0.98
+    assert lo == pytest.approx(0.025 ** (1 / 150))
+
+
+def test_bootstrap_ci_all_zero_honours_level():
+    _, _, hi_95 = bootstrap_ci([0] * 100, level=0.95)
+    _, _, hi_99 = bootstrap_ci([0] * 100, level=0.99)
+    assert hi_99 > hi_95
+
+
 def test_bootstrap_ci_rejects_non_binary_input():
     with pytest.raises(ValueError):
         bootstrap_ci([0.5] * 20)
@@ -108,6 +131,43 @@ def test_paired_diff_no_shift_straddles_zero():
     point, lo, hi = paired_diff_ci(before, after)
     assert point == pytest.approx(0.0)
     assert lo < 0 < hi
+
+
+def _discordant(n: int, d: int) -> tuple[list[int], list[int]]:
+    """n prompts, safe before; exactly d of them unsafe after."""
+    return [0] * n, [1] * d + [0] * (n - d)
+
+
+@pytest.mark.parametrize("d", [0, 4, 9])
+def test_paired_diff_few_discordant_pairs_raises_insufficient_data(d):
+    before, after = _discordant(150, d)
+    with pytest.raises(InsufficientData):
+        paired_diff_ci(before, after)
+
+
+def test_paired_diff_discordant_count_ignores_direction():
+    # 3 prompts got worse, 6 got better: 9 discordant in total, still too few.
+    before = [1] * 6 + [0] * 3 + [0] * 141
+    after = [0] * 6 + [1] * 3 + [0] * 141
+    with pytest.raises(InsufficientData):
+        paired_diff_ci(before, after)
+
+
+@pytest.mark.parametrize("d", [10, 12])
+def test_paired_diff_ten_or_more_discordant_pairs_is_allowed(d):
+    before, after = _discordant(150, d)
+    point, lo, hi = paired_diff_ci(before, after)
+    assert point == pytest.approx(d / 150)
+    assert lo <= point <= hi
+
+
+def test_pooled_paired_diff_has_no_discordant_minimum():
+    # 4 discordant pairs in total: too few for paired_diff_ci, but pooling is
+    # the drift gate's job and carries no such guard.
+    before, after = _discordant(150, 4)
+    point, lo, hi = pooled_paired_diff_ci({"hi": (before, after)})
+    assert point == pytest.approx(4 / 150)
+    assert lo <= point <= hi
 
 
 def test_paired_diff_rejects_misaligned_input():

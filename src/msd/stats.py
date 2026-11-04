@@ -10,6 +10,8 @@ import numpy as np
 
 # Below this many items a bootstrap interval says almost nothing.
 MIN_N = 10
+# A paired difference needs at least this many prompts whose outcome changed.
+MIN_DISCORDANT = 10
 
 
 class InsufficientData(ValueError):
@@ -54,11 +56,24 @@ def bootstrap_ci(
     level: float = 0.95,
     min_n: int = MIN_N,
 ) -> tuple[float, float, float]:
-    """Rate of 1s with a percentile bootstrap interval: (point, lo, hi)."""
+    """Rate of 1s with a percentile bootstrap interval: (point, lo, hi).
+
+    When every flag is 0 (or every flag is 1) a bootstrap interval collapses to
+    a single point and would claim false precision. In that case the exact
+    Clopper-Pearson interval is returned instead: for 0 of n, (0, 0, hi) with
+    hi = 1 - (a/2)**(1/n); for n of n, (1, lo, 1) with lo = (a/2)**(1/n);
+    where a = 1 - level.
+    """
     _check_level(level)
     x = _as_flags(flags)
-    if x.size < min_n:
-        raise InsufficientData(f"need at least {min_n} items, got {x.size}")
+    n = x.size
+    if n < min_n:
+        raise InsufficientData(f"need at least {min_n} items, got {n}")
+    ones = int(x.sum())
+    if ones == 0:
+        return 0.0, 0.0, 1.0 - ((1.0 - level) / 2.0) ** (1.0 / n)
+    if ones == n:
+        return 1.0, ((1.0 - level) / 2.0) ** (1.0 / n), 1.0
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, x.size, size=(n_boot, x.size))
     lo, hi = _percentile_ci(x[idx].mean(axis=1), level)
@@ -127,11 +142,22 @@ def paired_diff_ci(
 
     The two 0/1 lists are aligned by prompt. Prompt indices are resampled
     jointly, so the pairing is preserved inside every bootstrap draw.
+
+    Raises `InsufficientData` when fewer than `MIN_DISCORDANT` prompts changed
+    outcome (before != after): with so few discordant pairs the percentile
+    interval is anti-conservative (zero-width if none changed, "significant"
+    at 4 or 5 changes where the exact McNemar test is not), so the caller
+    should report the cell as unresolved rather than print an interval.
     """
     _check_level(level)
     b, a = _as_paired(before, after)
     if b.size < min_n:
         raise InsufficientData(f"need at least {min_n} items, got {b.size}")
+    discordant = int((b != a).sum())
+    if discordant < MIN_DISCORDANT:
+        raise InsufficientData(
+            f"need at least {MIN_DISCORDANT} discordant pairs, got {discordant}"
+        )
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, b.size, size=(n_boot, b.size))
     lo, hi = _percentile_ci((a[idx] - b[idx]).mean(axis=1), level)
@@ -151,6 +177,10 @@ def pooled_paired_diff_ci(
     Each draw resamples prompts within every language (keeping the before/after
     pairing), pools all resampled items, and takes the difference of the pooled
     rates. Languages are therefore weighted by their number of items.
+
+    Unlike `paired_diff_ci`, there is no minimum on discordant pairs: the drift
+    gate pools many pairs across languages, and the gate's own rule (enough
+    languages rising, pooled lower bound above zero) is the guard.
     """
     _check_level(level)
     if not pairs:

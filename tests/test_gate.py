@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 
@@ -98,6 +100,12 @@ def test_gate_ignores_language_with_too_few_items():
     assert not result.passed
     assert "too few" in result.reason
     assert "ar" in result.reason
+    # Not assessed: NaN in rises (not a raw 1.0), assessed languages stay numeric.
+    assert math.isnan(result.rises["ar"])
+    assert result.rises["hi"] == pytest.approx(0.12)
+    # Only "hi" was assessed and rose, so it is the only language in `pooled`.
+    assert result.pooled[0] == pytest.approx(0.12)
+    assert result.pooled_all[0] == pytest.approx(0.12)
 
 
 def test_gate_rejects_bad_input():
