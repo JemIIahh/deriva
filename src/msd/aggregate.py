@@ -1,7 +1,7 @@
 """Per-cell rates with intervals, and the long-form results table."""
 
 import csv
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,13 +81,33 @@ def _group_key(arm: str, alpha: float | None, lang: str) -> tuple:
     return (_rank(arm, ARMS), alpha is not None, alpha or 0.0, _rank(lang, LANGS))
 
 
+def _require_single_judge(verdicts: Sequence[Verdict]) -> None:
+    judges = sorted({v.judge_id for v in verdicts})
+    if len(judges) > 1:
+        raise ValueError(f"verdicts come from more than one judge, never mix them: {judges}")
+
+
+def _reject_duplicates(items: Sequence, key: Callable[..., tuple], what: str) -> None:
+    seen: set = set()
+    for item in items:
+        k = key(item)
+        if k in seen:
+            raise ValueError(f"duplicate {what} would be counted twice: {k}")
+        seen.add(k)
+
+
 def build_table(verdicts: Sequence[Verdict], scores: Sequence[TaskScore]) -> list[dict]:
     """One row per (arm, alpha, lang, metric) that has data.
 
-    Pass one judge's verdicts: each verdict is counted once as given. Order is
-    deterministic: arms in `config.ARMS` order, alpha ascending with None first,
-    languages in `config.LANGS` order, then metric.
+    Raises `ValueError` rather than publish a double-counted rate: verdicts from
+    more than one judge, a repeated verdict `(prompt_id, arm, alpha, lang, kind)`,
+    or a repeated task score `(prompt_id, arm, alpha)`. Order is deterministic:
+    arms in `config.ARMS` order, alpha ascending with None first, languages in
+    `config.LANGS` order, then metric.
     """
+    _require_single_judge(verdicts)
+    _reject_duplicates(verdicts, lambda v: (v.prompt_id, v.arm, v.alpha, v.lang, v.kind), "verdict")
+    _reject_duplicates(scores, lambda t: (t.prompt_id, t.arm, t.alpha), "task score")
     groups: dict[tuple, dict[str, list]] = {}
 
     def bucket(arm: str, alpha: float | None, lang: str, metric: str) -> list:

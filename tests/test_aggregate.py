@@ -24,6 +24,7 @@ def _v(
     alpha: float | None = None,
     lang: str = "en",
     i: int = 0,
+    judge: str = "j",
 ) -> Verdict:
     return Verdict(
         prompt_id=f"{kind}-{lang}-{i}",
@@ -31,7 +32,7 @@ def _v(
         alpha=alpha,
         lang=lang,
         kind=kind,
-        judge_id="j",
+        judge_id=judge,
         label=label,
         excerpt="",
     )
@@ -270,6 +271,53 @@ def test_build_table_carries_excluded_and_missing_interval():
 def test_build_table_rejects_task_kind_verdicts():
     with pytest.raises(ValueError, match="task"):
         build_table(_vs({"complied": 12}, kind="task"), [])
+
+
+# --- build_table: one judge, no duplicates ------------------------------
+
+
+def test_build_table_rejects_verdicts_from_more_than_one_judge():
+    j1 = _vs({"complied": 4, "refused": 8}, judge="j1")
+    j2 = _vs({"refused": 12}, judge="j2")  # the same 12 prompts, judged again
+    with pytest.raises(ValueError, match=r"j1.*j2"):
+        build_table(j1 + j2, [])
+
+
+def test_build_table_rejects_a_duplicated_verdict():
+    verdicts = _vs({"complied": 4, "refused": 8})
+    with pytest.raises(ValueError, match="duplicate verdict"):
+        build_table(verdicts + verdicts[:1], [])
+    with pytest.raises(ValueError, match="duplicate verdict"):
+        build_table(verdicts + verdicts, [])
+
+
+def test_build_table_rejects_a_duplicated_task_score():
+    scores = _ts(correct=8, wrong=4)
+    with pytest.raises(ValueError, match="duplicate task score"):
+        build_table([], scores + scores[:1])
+
+
+def test_build_table_duplicate_error_names_the_first_offending_key():
+    verdicts = _vs({"complied": 6, "refused": 6}, arm="A1", alpha=0.5, lang="hi")
+    with pytest.raises(ValueError) as exc:
+        build_table(verdicts + [verdicts[3]], [])
+    message = str(exc.value)
+    assert verdicts[3].prompt_id in message and "A1" in message
+
+
+def test_build_table_accepts_a_clean_multi_arm_multi_language_input():
+    # The same prompt ids are legitimately re-used across arms, alphas and kinds.
+    verdicts: list[Verdict] = []
+    scores: list[TaskScore] = []
+    for arm in ("BASE", "A1"):
+        for alpha in (None, 0.5):
+            for lang in ("en", "hi", "ar"):
+                verdicts += _vs({"complied": 3, "refused": 9}, kind="harmful", arm=arm, alpha=alpha, lang=lang)
+                verdicts += _vs({"refused": 2, "complied": 10}, kind="benign_edgy", arm=arm, alpha=alpha, lang=lang)
+                scores += _ts(correct=9, wrong=3, arm=arm, alpha=alpha, lang=lang)
+    rows = build_table(verdicts, scores)
+    assert len(rows) == 2 * 2 * 3 * 3  # arms x alphas x langs x metrics
+    assert all(r["n"] == 12 and r["excluded"] == 0 for r in rows)
 
 
 # --- write_table_csv ---------------------------------------------------

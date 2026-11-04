@@ -7,17 +7,64 @@ import unicodedata
 # Multiple-choice gold labels are a single letter A-E (either case).
 _MC_GOLD = re.compile(r"[A-Ea-e]")
 
-# A letter the reply opens with: "B", "B.", "B)", "B:", "(B)", "B) Paris".
-# A word that merely starts with the letter ("Because") or an article ("A man")
-# is not followed by a delimiter or the end of the reply, so it does not match.
-_LEADING_LETTER = re.compile(r"\s*(?:\(([A-E])\)|([A-E])(?:[.):]|\s*$))", re.IGNORECASE)
+# Punctuation a bare letter may be followed by: ASCII, danda, double danda,
+# Arabic question mark / comma / semicolon, Urdu full stop, and markdown stars.
+_FOLLOW = r"[.):;,\]*`!?।॥؟،؛۔]"
+# The rest of the line is empty (an explanation may follow on the next line).
+_LINE_END = r"[ \t]*(?:\n|$)"
 
-# "Answer: B", "The answer is B", "answer is **B**", "Answer: (B)". A capital
-# letter may be followed by more text; a lowercase one only by punctuation or the
-# end of the line, so "answer a question" / "the answer is a number" do not read as A.
-_ANSWER_CUE = re.compile(
-    r"\banswer\b(?:\s+is)?[\s:=*(\[]*"
-    r"(?:(?-i:([A-E]))(?!\w)|([a-e])(?=[.,;:)\]*!]|[ \t]*(?:\n|$)))",
+# A letter right after a cue. A capital may be followed by more text; a lowercase
+# one only by punctuation or the end of the line, so "answer a question" /
+# "the answer is a number" do not read as option A.
+_LETTER_AFTER_CUE = (
+    r"(?:(?-i:([A-E]))(?!\w)|([a-e])(?=" + _FOLLOW + "|" + _LINE_END + "))"
+)
+
+# What may sit between a cue word and its letter: "ni" / "is" / "है" / "هي",
+# a qualifier ("sahihi", "الصحيحة"), and separators or markdown (": ", " - ", "**").
+_CUE_TAIL = (
+    r"(?:\s+(?:sahihi|الصحيحة|الصحيح))?"
+    r"(?:\s+(?:is|ni|है|هي|هو)(?!\w))?"
+    r"[\s:=\-–—*`(\[]*"
+)
+
+# Strong cues: the reply states its answer. Includes "the correct option is B"
+# and its hi / ar / sw equivalents, so echoed option lists do not hide the answer.
+_ANSWER_WORDS = (
+    r"answer|उत्तर|ال[إا]جابة|الجواب|jibu"
+    r"|(?:correct|right|final)\s+(?:option|choice)"
+    r"|सही\s+विकल्प|الخيار\s+الصحيح|chaguo\s+sahihi"
+)
+# Weaker cues: a bare "Option B". Discussion ("Option A is wrong, option B ...")
+# names several letters, so these only count when every mention agrees.
+_OPTION_WORDS = r"option|choice|विकल्प|الخيار|chaguo"
+
+
+def _cue(words: str) -> re.Pattern[str]:
+    return re.compile(
+        r"(?<!\w)(?:" + words + r")(?!\w)" + _CUE_TAIL + _LETTER_AFTER_CUE, re.IGNORECASE
+    )
+
+
+_ANSWER_CUE = _cue(_ANSWER_WORDS)
+_OPTION_CUE = _cue(_OPTION_WORDS)
+
+# A letter the reply opens with, after any markdown: "B", "B.", "B)", "B।", "(B)",
+# "**B**", "B - Paris", "B is correct", "B" then a newline and an explanation.
+# A word that merely starts with the letter ("Because") or an article ("A lot of
+# people say C") is followed by none of these, so it does not match.
+_LEADING = re.compile(
+    r"[\s*_`]*(?:[(\[]([A-E])[)\]]"
+    r"|([A-E])(?=" + _FOLLOW + "|" + _LINE_END + r"|\s+[-–—](?:\s|$)"
+    r"|\s+(?:is|are)\s+(?:the\s+)?(?:correct|right)(?!\w)))",
+    re.IGNORECASE,
+)
+
+# The letter is followed by another capital letter joined by and/or/comma:
+# "B and C", "C or B", "A, B". A hedged reply commits to no single answer.
+_HEDGE = re.compile(
+    r"\s*(?:[,;/&،؛]|(?<!\w)(?:and|or|na|au|ama|और|या|أو|و)(?!\w))"
+    r"\s*[(\[]?(?-i:[A-E])(?!\w)",
     re.IGNORECASE,
 )
 
@@ -43,15 +90,30 @@ def normalize_answer(s: str) -> str:
     return " ".join("".join(out).split())
 
 
+def _commit(m: re.Match[str], text: str) -> str | None:
+    """The matched letter, upper-cased, or None when the reply hedges ("B and C")."""
+    if _HEDGE.match(text, m.end()):
+        return None
+    return next(g for g in m.groups() if g).upper()
+
+
 def _extract_letter(pred: str) -> str | None:
-    """The multiple-choice letter a reply commits to, upper-cased, or None."""
-    leading = _LEADING_LETTER.match(pred)
-    if leading:
-        return (leading.group(1) or leading.group(2)).upper()
-    cued = [m.group(1) or m.group(2) for m in _ANSWER_CUE.finditer(pred)]
-    if cued:
-        return cued[-1].upper()  # the last stated answer wins
-    return None
+    """The multiple-choice letter a reply commits to, upper-cased, or None.
+
+    Precedence: an explicit answer cue ("Answer: B", "The correct option is B",
+    "उत्तर: B", "الإجابة: B", "Jibu: B"), then a bare option cue ("Option B"), then
+    a letter the reply opens with. A cue beats a leading letter, so an echoed
+    option list ("A. Paris  B. London  The answer is B") scores as B.
+    """
+    text = unicodedata.normalize("NFKC", pred)
+    answered = list(_ANSWER_CUE.finditer(text))
+    if answered:
+        return _commit(answered[-1], text)  # the last stated answer wins
+    optioned = {_commit(m, text) for m in _OPTION_CUE.finditer(text)}
+    if optioned:
+        return optioned.pop() if len(optioned) == 1 else None
+    leading = _LEADING.match(text)
+    return _commit(leading, text) if leading else None
 
 
 def score_task(pred: str, gold: str) -> bool:

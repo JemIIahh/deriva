@@ -147,3 +147,169 @@ def test_gold_letter_outside_a_to_e_is_free_form():
     # "F" is not a multiple-choice letter here, so it is compared as text.
     assert score_task("f.", "F") is True
     assert score_task("Answer: F", "F") is False
+
+
+# --- score_task: cue beats a leading letter ------------------------------
+
+
+def test_answer_cue_beats_an_echoed_option_list():
+    echoed = "A. Paris\nB. London\nC. Rome\nThe answer is C"
+    assert score_task(echoed, "C") is True
+    assert score_task(echoed, "A") is False  # the leading "A." must not earn false credit
+    inline = "A) Paris B) London. Answer: B"
+    assert score_task(inline, "B") is True
+    assert score_task(inline, "A") is False
+
+
+def test_option_cue_beats_a_leading_letter_but_a_correct_option_cue_beats_option_chatter():
+    assert score_task("A. Paris\nB. London\nOption B", "B") is True
+    assert score_task("A. Paris\nB. London\nOption B", "A") is False
+    # "Option A is wrong" must not override the stated correct option.
+    assert score_task("Option A is wrong. The correct option is B", "B") is True
+    assert score_task("Option A is wrong. The correct option is B", "A") is False
+    # An explicit answer beats later chatter about another option.
+    assert score_task("Answer: B. Option A is wrong.", "B") is True
+    assert score_task("Answer: B. Option A is wrong.", "A") is False
+
+
+def test_conflicting_bare_option_mentions_are_ambiguous():
+    reply = "Option A is wrong. Option B is correct."
+    assert score_task(reply, "A") is False
+    assert score_task(reply, "B") is False
+
+
+# --- score_task: format robustness (English) -----------------------------
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "B\nBecause Paris is the capital.",  # explanation on the next line
+        "B\n\nParis is the capital.",
+        "\n\nB",
+        "Ｂ",  # fullwidth, via NFKC
+        "**B**",
+        "**B.** Paris",
+        "`B`",
+        "Option B",
+        "option b",
+        "The correct option is B",
+        "The correct answer is B",
+        "The right choice: B",
+        "B is correct",
+        "B is the correct answer",
+        "B - Paris",
+        "Answer - B",
+        "Answer is: B",
+    ],
+)
+def test_mc_format_variants_commit_to_b(pred):
+    assert score_task(pred, "B") is True
+    assert score_task(pred, "C") is False
+
+
+def test_mc_guards_still_hold_for_every_gold_letter():
+    for gold in "ABCDE":
+        for pred in (
+            "Because",
+            "Banana",
+            "A lot of people say C",
+            "To answer a question about Paris, think.",
+            "The answer is a number.",
+        ):
+            assert score_task(pred, gold) is False, (pred, gold)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "Answer: B and C",
+        "Answer: C or B",
+        "Answer: B, C",
+        "The answer is B or C",
+        "A and B",
+        "A, B",
+        "B and C",
+        "Option B or option C",
+    ],
+)
+def test_hedged_multi_letter_replies_score_false_for_every_named_letter(pred):
+    for gold in "ABCDE":
+        assert score_task(pred, gold) is False, (pred, gold)
+
+
+def test_a_comma_that_continues_into_prose_is_not_a_hedge():
+    assert score_task("Answer: B, since Paris is the capital", "B") is True
+    assert score_task("The answer is B and the reason is geography.", "B") is True
+
+
+# --- score_task: Hindi, Arabic, Swahili ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "B।",  # bare letter + danda
+        "B॥",
+        "उत्तर: B",
+        "उत्तर है B",
+        "सही उत्तर B है",
+        "विकल्प B",
+        "सही विकल्प B है",
+        "उत्तर: B\nक्योंकि पेरिस राजधानी है।",
+    ],
+)
+def test_hindi_mc_replies(pred):
+    assert score_task(pred, "B") is True
+    assert score_task(pred, "C") is False
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "B؟",  # bare letter + Arabic question mark
+        "B،",  # Arabic comma
+        "الإجابة: B",
+        "الاجابة: B",  # without the hamza
+        "الإجابة الصحيحة هي B",
+        "الجواب: B",
+        "الخيار B",
+        "الخيار الصحيح هو B",
+    ],
+)
+def test_arabic_mc_replies(pred):
+    assert score_task(pred, "B") is True
+    assert score_task(pred, "C") is False
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "B.",  # bare letter, Latin punctuation
+        "Jibu: B",
+        "jibu: b",
+        "Jibu ni B",
+        "Jibu sahihi ni B",
+        "Chaguo B",
+        "Chaguo sahihi ni B",
+    ],
+)
+def test_swahili_mc_replies(pred):
+    assert score_task(pred, "B") is True
+    assert score_task(pred, "C") is False
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        "उत्तर: B और C",
+        "उत्तर: B या C",
+        "الإجابة: B أو C",
+        "الإجابة: B و C",
+        "Jibu: B au C",
+        "Jibu: B na C",
+    ],
+)
+def test_hedged_native_replies_score_false(pred):
+    assert score_task(pred, "B") is False
+    assert score_task(pred, "C") is False
