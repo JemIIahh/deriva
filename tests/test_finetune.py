@@ -158,7 +158,9 @@ class FakeApi:
         self.calls.append(("repo_info", repo_id, repo_type))
         if self.info_error is not None:
             raise self.info_error
-        return types.SimpleNamespace(private=self.private)
+        answers = self.private if isinstance(self.private, list) else [self.private]  # one per call, the last repeats
+        seen = sum(1 for c in self.calls if c[0] == "repo_info")
+        return types.SimpleNamespace(private=answers[min(seen, len(answers)) - 1])
 
     def upload_folder(self, *, folder_path, repo_id, repo_type="model", **kwargs):
         self.calls.append(("upload_folder", str(folder_path), repo_id, repo_type))
@@ -1584,6 +1586,90 @@ def test_start_check_that_cannot_see_the_labels_says_why_and_does_not_refuse(loa
     check = finetune.StartCheck(rows=2, minimum=1, maximum=16)
     check.observe(train_dataloader=loader, args=None)
     assert check.label_counts is None and why in check.label_note
+
+
+# --- review round 1: smaller findings -----------------------------------------------------------------------------
+
+
+def test_a_real_run_with_a_tokenizer_that_cannot_be_loaded_is_refused(world, capsys):
+    def broken(name):
+        raise OSError("offline")
+
+    assert world.run(tokenizer_loader=broken) == 1
+    err = capsys.readouterr().err
+    assert "cannot load the tokenizer" in err and "offline" in err
+    assert world.factory.calls == [] and not world.out.exists() and not (world.root / "work").exists()
+
+
+def test_an_out_inside_the_data_folder_that_does_not_exist_yet_is_refused_and_not_created(world, capsys):
+    assert world.run("--out", str(world.root / "data" / "ft" / "new" / "sub")) == 2
+    assert not (world.root / "data" / "ft" / "new").exists()
+    assert world.factory.calls == [] and "data" in capsys.readouterr().err
+
+
+def test_privacy_is_checked_again_just_before_the_upload(world, token, capsys):
+    api = FakeApi(private=[True, False])  # private when training starts, public by the time it ends
+    assert world.run("--push-to", "my-org/a1", api_factory=ApiFactory(api)) == 1
+    err = capsys.readouterr().err
+    assert "not private" in err and "my-org/a1" in err
+    assert [c[0] for c in api.calls] == ["repo_info", "repo_info"]  # no upload_folder
+    assert (world.out / "finetune_summary.json").is_file() and (world.out / "merged").is_dir()  # the result is kept
+
+
+def test_default_merge_saves_without_a_safe_serialization_argument(tmp_path, monkeypatch):
+    saved = {}
+
+    class Merged:
+        def save_pretrained(self, path, **kwargs):
+            saved["model"] = kwargs
+
+    class Peft:
+        def merge_and_unload(self):
+            return Merged()
+
+    class Tokenizer:
+        def save_pretrained(self, path, **kwargs):
+            saved["tokenizer"] = kwargs
+
+    torch = types.ModuleType("torch")
+    torch.float16 = "the float16 dtype"
+    transformers = types.ModuleType("transformers")
+    transformers.AutoModelForCausalLM = types.SimpleNamespace(from_pretrained=lambda name, dtype=None: saved.setdefault("dtype", dtype) or object())
+    transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda name: Tokenizer())
+    peft = types.ModuleType("peft")
+    peft.PeftModel = types.SimpleNamespace(from_pretrained=lambda model, path: Peft())
+    for name, module in (("torch", torch), ("transformers", transformers), ("peft", peft)):
+        monkeypatch.setitem(sys.modules, name, module)
+    finetune.default_merge("base", tmp_path / "adapter", tmp_path / "merged", dtype="float16")
+    assert saved["model"] == {}  # transformers 5 saves safetensors by default; the keyword is not needed
+    assert saved["dtype"] == "the float16 dtype"
+
+
+def test_a_smoke_merge_is_marked_inside_the_merged_folder(world):
+    assert world.run("--max-steps", "3", "--merge") == 0
+    marker = world.root / "results" / "finetune" / "ft_lora-smoke" / "merged" / "SMOKE.txt"
+    assert marker.is_file() and "not A1" in marker.read_text(encoding="utf-8") and "3 steps" in marker.read_text(encoding="utf-8")
+
+
+def test_a_full_run_has_no_smoke_marker(world):
+    assert world.run() == 0
+    assert not (world.out / "merged" / "SMOKE.txt").exists()
+
+
+def test_a_smoke_run_cannot_write_into_the_real_runs_default_folder(world, capsys):
+    assert world.run("--max-steps", "3", "--out", str(world.out)) == 2
+    assert "smoke" in capsys.readouterr().err and world.factory.calls == [] and not world.out.exists()
+
+
+def test_a_smoke_run_may_use_any_other_folder(world, tmp_path):
+    assert world.run("--max-steps", "3", "--out", str(tmp_path / "elsewhere")) == 0
+
+
+def test_help_says_which_imports_a_dry_run_makes(capsys):
+    assert finetune.main(["--help"]) == 0
+    flat = " ".join(capsys.readouterr().out.split())
+    assert "import no GPU library" not in flat  # the default tokenizer loader imports transformers, the template check trl
+    assert "transformers" in flat and "trl" in flat and "loads no model" in flat
 
 
 # --- the real AlignTune wrapper, against a fake aligntune module ---------------------------------------------------

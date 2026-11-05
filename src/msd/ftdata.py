@@ -349,6 +349,7 @@ class Problem:
     where: str  # "train", "heldout", "safety" or "set"
     id: str | None
     message: str
+    lang: str | None = None  # the language a "missing_lang" problem is about; None for every other rule
 
 
 @dataclass
@@ -743,7 +744,7 @@ def validate(
             problems.append(Problem("imbalance", "taskdev", None, message))
         missing_taskdev = [lang for lang in expected if counts["taskdev"].get(lang, 0) == 0]
         for lang in missing_taskdev:
-            problems.append(Problem("missing_lang", "taskdev", None, f"expected language {lang} has no taskdev rows"))
+            problems.append(Problem("missing_lang", "taskdev", None, f"expected language {lang} has no taskdev rows", lang))
         warnings += _taskdev_item_warnings(dev_ok, expected)
 
     missing = [
@@ -751,7 +752,7 @@ def validate(
     ]
     for lang in missing:
         have = f"train {counts['train'].get(lang, 0)}, heldout {counts['heldout'].get(lang, 0)}"
-        problems.append(Problem("missing_lang", "set", None, f"expected language {lang} has too few rows ({have})"))
+        problems.append(Problem("missing_lang", "set", None, f"expected language {lang} has too few rows ({have})", lang))
     present = set(counts["train"]) | set(counts["heldout"])
     not_covered = [lang for lang in LANGS if lang not in expected and lang not in present]
 

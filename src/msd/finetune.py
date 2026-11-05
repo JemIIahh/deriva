@@ -17,7 +17,9 @@ checked otherwise). The sha256 of the training file goes into the summary. Every
 the model's chat template and the run is refused if any is longer than `train.max_seq_length`.
 
 `--dry-run` does all of that, prints the plan (rows per language, steps = rows x epochs / effective batch,
-token lengths when a tokenizer can be loaded) and writes nothing; it needs no GPU and no AlignTune. A real run
+token lengths and the chat-template check when a tokenizer can be loaded) and writes nothing; it loads no model
+and needs no GPU and no AlignTune. It does import transformers (the default tokenizer loader) and, for the
+template check, trl, each only if installed: without them the plan says what was not checked. A real run
 builds the trainer through AlignTune's `create_sft_trainer`, trains, checks that the adapter on disk is the
 configured one, that the trainer saw every row and that the loss is finite and fell, merges the adapter into a
 fresh fp16 copy of the base model, and writes `finetune_summary.json` (config and data hashes, library versions,
@@ -83,6 +85,7 @@ ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")
 SMOKE_SUFFIX = "-smoke"
 TEMPLATE_FILE = "default_chat_template.jinja"  # not chat_template.jinja: the trainer saves its own under that name
+SMOKE_MARKER = "SMOKE.txt"
 NOT_PUBLISHED = ("lexsi_provenance.json",)  # AlignTune's provenance file records absolute paths
 DEFAULT_TEMPLATE = "default"
 IGNORE_INDEX = -100  # PyTorch's cross-entropy ignore index: a label with this value takes no part in the loss
@@ -692,7 +695,7 @@ def default_merge(base_model: str, adapter_dir: Path, out_dir: Path, *, dtype: s
     model = transformers.AutoModelForCausalLM.from_pretrained(base_model, dtype=getattr(torch, dtype))
     model = PeftModel.from_pretrained(model, str(adapter_dir)).merge_and_unload()
     out_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(out_dir, safe_serialization=True)
+    model.save_pretrained(out_dir)  # transformers 5 writes safetensors by default
     transformers.AutoTokenizer.from_pretrained(base_model).save_pretrained(out_dir)
 
 
@@ -823,7 +826,7 @@ def check_data(cfg: SimpleNamespace, train_path: Path, root: Path) -> DataCheck:
         in_train = {lang for lang, n in report.counts["train"].items() if n}
         report.problems = [
             p for p in report.problems
-            if not (p.rule == "missing_lang" and p.where == "set" and p.message.split()[2] in in_train)
+            if not (p.rule == "missing_lang" and p.where == "set" and p.lang in in_train)
         ]
     if not report.ok:
         raise FinetuneError(
@@ -918,7 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--config", required=True, type=Path, help="YAML config, e.g. configs/ft_lora.yaml (every training value is in it)")
     ap.add_argument("--data", type=Path, help="training jsonl (default: data.train of the config)")
     ap.add_argument("--out", type=Path, help="output folder; must not exist or be empty (default: results/finetune/<config stem>)")
-    ap.add_argument("--dry-run", action="store_true", help="check the config and the data and print the plan; write nothing, import no GPU library")
+    ap.add_argument("--dry-run", action="store_true", help="check the config and the data and print the plan; writes nothing and loads no model (the tokenizer is read with transformers and the chat template checked with trl, each only if installed)")
     ap.add_argument("--max-steps", type=_positive_int, help="smoke run: train this many steps only; output goes to <config stem>-smoke, no merge unless --merge")
     ap.add_argument("--merge", action=argparse.BooleanOptionalAction, default=None,
                     help="merge the adapter into fp16 weights (default: yes, except in a smoke run)")
@@ -1215,6 +1218,10 @@ def _prepare_template(tokenizer: Any) -> tuple[str | None, str | None, str]:
     return text, digest, f"chat template: {len(text)} characters, sha256 {digest}; {_template_verdict(text)}"
 
 
+def _default_out(root: Path, stem: str, smoke: bool) -> Path:
+    return Path(root) / "results" / "finetune" / (stem + (SMOKE_SUFFIX if smoke else ""))
+
+
 def _work_dir(root: Path, stem: str, smoke: bool) -> Path:
     return Path(root) / "work" / "finetune" / (stem + (SMOKE_SUFFIX if smoke else ""))
 
@@ -1270,12 +1277,16 @@ def _write_atomically(path: Path, text: str) -> None:
         raise
 
 
-def _merge(hooks: Hooks, cfg: SimpleNamespace, adapter_dir: Path, merged_out: Path) -> None:
-    """Merge into a hidden partial folder that becomes `merged_out` only when the merge finished."""
+def _merge(hooks: Hooks, cfg: SimpleNamespace, adapter_dir: Path, merged_out: Path, marker: str | None = None) -> None:
+    """Merge into a hidden partial folder that becomes `merged_out` only when the merge finished.
+
+    `marker` (a smoke run) is written beside the weights, so that a smoke model cannot pass for A1."""
     with atomic_output_dir(merged_out) as folder:
         hooks.merge_fn(cfg.base_model, adapter_dir, folder, dtype=cfg.output.merge_dtype)
         if not any(folder.iterdir()):
             raise FinetuneError(f"the merge wrote nothing into {cfg.output.merged_dir}")
+        if marker is not None:
+            (folder / SMOKE_MARKER).write_text(marker + "\n", encoding="utf-8")
 
 
 def _loss_text(value: float | None) -> str:
@@ -1342,7 +1353,12 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     cfg = load_config(args.config)
     seed = args.seed if args.seed is not None else cfg.train.seed
     stem = args.config.stem
-    out = args.out if args.out else Path(root) / "results" / "finetune" / (stem + (SMOKE_SUFFIX if args.smoke else ""))
+    out = args.out if args.out else _default_out(root, stem, args.smoke)
+    if args.smoke and args.out and Path(args.out).resolve() == _default_out(root, stem, False).resolve():
+        raise UsageError(
+            f"a smoke run cannot write into {shown(args.out, root)}, the folder of the real run; leave --out out (the "
+            f"default is {shown(_default_out(root, stem, True), root)}) or choose another folder"
+        )
     train_path = args.data if args.data else _resolve(cfg.data.train, root)
     try:
         check_out_dir(out, sources=_data_folders(cfg, train_path, root))
@@ -1381,7 +1397,11 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
         published = True
         merged = False
         if args.merge_effective:
-            _merge(hooks, cfg, adapter_out, out / cfg.output.merged_dir)
+            marker = (
+                f"smoke run of {args.max_steps} steps: this model is not A1 and must not be used for the study"
+                if args.smoke else None
+            )
+            _merge(hooks, cfg, adapter_out, out / cfg.output.merged_dir, marker)
             merged = True
         seconds = hooks.clock() - started
         summary = _summary(cfg, args, args.config, check, seed, trained, merged, seconds, hooks, root, template_sha256)
@@ -1400,6 +1420,10 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     if args.smoke:
         print("smoke run only: this model is not A1; run without --max-steps for the real fine-tune", file=sys.stderr)
     if api is not None:
+        try:
+            check_push_target(api, args.push_to)  # again: the repo may have been made public during the hours of training
+        except FinetuneError as exc:
+            raise FinetuneError(f"{exc}; the training result is kept in {shown(out, root)}") from None
         try:
             api.upload_folder(
                 folder_path=str(out / cfg.output.merged_dir), repo_id=args.push_to, repo_type="model",

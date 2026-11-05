@@ -582,6 +582,18 @@ def test_an_expected_language_with_no_rows_is_reported_missing():
     assert "imbalance" not in classes(report)  # the zero must not distort the mean of the others
 
 
+def test_a_missing_language_problem_carries_the_language_as_a_field():
+    train, held = sets()
+    report = ftdata.validate(train, held, expected_langs=LANGS)
+    (problem,) = [p for p in report.problems if p.rule == "missing_lang"]
+    assert problem.lang == "hinglish"  # callers must not have to parse the message
+    train, held = sets()
+    other = ftdata.validate(train, held, expected_langs=("en", "hi", "ar", "sw"), taskdev=devs(("en", "hi", "ar")))
+    (dev_problem,) = [p for p in other.problems if p.rule == "missing_lang"]
+    assert dev_problem.where == "taskdev" and dev_problem.lang == "sw"
+    assert all(p.lang is None for p in report.problems if p.rule != "missing_lang")
+
+
 def test_a_language_with_train_but_no_heldout_rows_is_missing_too():
     train, held = sets()
     held = [r for r in held if r["lang"] != "ar"]

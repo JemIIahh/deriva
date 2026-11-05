@@ -256,7 +256,8 @@ STAGE = "finetune"
 STAGE_ARGS = "--config data/configs/ft_lora.yaml --dry-run"
 
 # 2. Smoke run: 20 steps, every step logged, merges once so the merge path (CPU RAM, tokenizer save) is proven
-#    BEFORE the long run. Output goes to results/finetune/ft_lora-smoke; it is not A1 and is never pushed.
+#    BEFORE the long run. Output goes to results/finetune/ft_lora-smoke, its merged/ holds a SMOKE.txt marker, it is
+#    not A1 and is never pushed; a smoke run refuses --out results/finetune/ft_lora (the real run's folder).
 STAGE_ARGS = "--config data/configs/ft_lora.yaml --max-steps 20 --merge"
 #    Read the printed lines and results/finetune/ft_lora-smoke/finetune_summary.json: rows_seen must be 6000 (a lower
 #    number means AlignTune/CuratorKIT dropped rows), loss_ok true, steps 20, peak memory in the log (UNVERIFIED how it
@@ -266,7 +267,8 @@ STAGE_ARGS = "--config data/configs/ft_lora.yaml --max-steps 20 --merge"
 # 3. The real run: 2 epochs = 750 optimizer steps. Writes results/finetune/ft_lora/{adapter,merged,finetune_summary.json}.
 STAGE_ARGS = "--config data/configs/ft_lora.yaml"
 #    Optional, after a successful run only: add  --push-to <hf-user>/<private-repo>  (the repo must already exist and be
-#    PRIVATE; HF_TOKEN from the environment; nothing is created, nothing is uploaded without the flag).
+#    PRIVATE; HF_TOKEN from the environment; nothing is created, nothing is uploaded without the flag; privacy is
+#    checked before training and again right before the upload).
 
 # 4. Only if step 3's held-out accuracy (below) shows the model barely moved: the strong retry, 3 epochs = 1,125 steps.
 STAGE_ARGS = "--config data/configs/ft_lora_strong.yaml"
@@ -314,8 +316,8 @@ STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out
 (A later notebook run starts from a fresh working folder and the notebook pulls only scripts, pipelines and data,
 so fetch the merged model first in an extra cell, `snapshot_download(WORKSPACE_REPO, repo_type="dataset",
 local_dir=".", token=token, allow_patterns=["results/finetune/ft_lora/merged/*"])`, or pass the `--push-to` repo id
-as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `task` block has `n`, `correct` and
-`accuracy` per language. Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
+as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
+`accuracy` (one file per language). Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
 heldout split). What A1 must show is that it answers the bare letter more often than A0 does (the point of the
 task); how much is a result, not a gate here.
 
