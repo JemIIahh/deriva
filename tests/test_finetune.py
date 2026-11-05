@@ -1174,14 +1174,21 @@ def test_importing_the_module_loads_no_heavy_library():
     assert result.returncode == 0, result.stderr
 
 
-def test_the_script_runs_a_dry_run_end_to_end_without_any_heavy_library(world):
+def test_the_script_runs_a_dry_run_end_to_end_without_any_heavy_library(world, tmp_path):
+    # the script resolves relative config paths against the repository it lives in, so the fixture's paths are absolute
+    def absolute(data):
+        for key in ("train", "heldout", "taskdev", "pipeline", "testset"):
+            data["data"][key] = str(world.root / data["data"][key])
+
+    world.write_config(absolute)
     result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--config", str(world.config), "--dry-run"],
+        [sys.executable, str(SCRIPT), "--config", str(world.config), "--dry-run", "--out", str(tmp_path / "scripted-out")],
         capture_output=True, text=True, timeout=120, cwd=world.root,
         env={"PATH": "/usr/bin:/bin", "HOME": str(world.root), "HF_HUB_OFFLINE": "1"},
     )
     assert result.returncode == 0, result.stderr
-    assert "planned optimizer steps" in result.stdout
+    assert "planned optimizer steps: 5" in result.stdout
+    assert not (tmp_path / "scripted-out").exists()
 
 
 # --- the real AlignTune wrapper, against a fake aligntune module ---------------------------------------------------

@@ -74,7 +74,6 @@ from msd.restarun import scrub
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
 
-ROOT = Path(__file__).resolve().parents[2]
 SUMMARY_FILE = "finetune_summary.json"
 ADAPTER_CONFIG = "adapter_config.json"
 SMOKE_SUFFIX = "-smoke"
@@ -1091,7 +1090,10 @@ def main(
     versions: Callable[[], Mapping[str, str | None]] | None = None,
     root: Path | None = None,
 ) -> int:
-    """Run the fine-tune; every keyword is an injection point tests use (fakes for AlignTune, PEFT, the Hub, the clock)."""
+    """Run the fine-tune; every keyword is an injection point tests use (fakes for AlignTune, PEFT, the Hub, the clock).
+
+    `root` is the repository root that the paths inside the config and the default `--out` are relative to; the
+    script passes its own, and the default is the current folder."""
     try:
         args = parse_args(argv)
     except SystemExit as exc:  # argparse: 2 for a usage error, 0 for --help
@@ -1106,7 +1108,7 @@ def main(
         versions=versions or library_versions,
     )
     try:
-        return execute(args, Path(root) if root is not None else ROOT, hooks)
+        return execute(args, Path(root) if root is not None else Path.cwd(), hooks)
     except UsageError as exc:
         print(f"error: {scrub(str(exc))}", file=sys.stderr)
         return EXIT_USAGE

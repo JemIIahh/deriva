@@ -21,7 +21,7 @@ from msd import finetune  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
-    return finetune.main(argv)
+    return finetune.main(argv, root=ROOT)
 
 
 if __name__ == "__main__":
