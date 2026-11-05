@@ -1499,3 +1499,128 @@ def test_the_script_is_a_thin_wrapper():
     assert "evalrun" in text and len(text.splitlines()) < 40
     assert "import json" not in text  # no logic of its own
     assert os.access(SCRIPT, os.R_OK)
+
+
+# --- concrete judges: names, set-up failures, error summary (Task 13) -------------------------------------------
+
+SECRET_IN_MESSAGE = "sk-ant-SENTINEL-IN-AN-EXCEPTION-MESSAGE-0123456789"
+
+
+class ExplodingJudge:
+    """Every call raises a custom exception whose message holds a secret-looking sentinel."""
+
+    def __init__(self, judge_id="X1"):
+        self.id = judge_id
+
+    def classify(self, kind, prompt, response):
+        raise CustomJudgeBoom(SECRET_IN_MESSAGE)
+
+
+class CustomJudgeBoom(Exception):
+    pass
+
+
+def test_the_error_type_summary_names_types_and_counts_never_messages(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, n=4)
+    register(monkeypatch, "boom", ExplodingJudge())
+    code = run_cli(repo, *args_for(scratch, judge_name="boom", model_args=False), "--stages", "generate,judge",
+                   "--backend", "fake")
+    assert code == evalrun.EXIT_QUALITY  # every verdict is a judge_error, so the gate fails after writing
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if "CustomJudgeBoom" in line]
+    assert len(lines) == 1 and "CustomJudgeBoom x12" in lines[0]  # 4 prompts x (1 + 2 retries)
+    assert SECRET_IN_MESSAGE not in captured.err and SECRET_IN_MESSAGE not in captured.out
+    for path in Path(scratch).rglob("*"):
+        if path.is_file():
+            assert SECRET_IN_MESSAGE.encode() not in path.read_bytes(), path
+
+
+def test_no_error_summary_when_no_judge_call_raised(repo, scratch, model, judge, capsys):
+    build_testset(repo)
+    assert run_cli(repo, *args_for(scratch)) == 0
+    assert "judge call errors" not in capsys.readouterr().err
+
+
+def test_an_unknown_judge_name_exits_2_listing_the_registered_names_and_the_accepted_forms(repo, scratch, capsys):
+    build_testset(repo)
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--backend", "fake", "--out", str(scratch),
+                   "--judge", "gpt-4") == 2
+    err = capsys.readouterr().err
+    assert "unknown judge 'gpt-4'" in err and "fake" in err
+    assert "anthropic:<model-id>" in err and "hf:<model-id>" in err
+    assert not scratch.exists()
+
+
+@pytest.mark.parametrize("name", ["anthropic:claude-haiku-5-5", "hf:org/Judge-8B"])
+def test_the_concrete_judge_names_pass_argument_parsing_without_building_anything(repo, scratch, monkeypatch, name):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    args = evalrun.parse_args(
+        ["--arm", "A1", "--split", "dev", "--backend", "fake", "--out", str(scratch), "--judge", name], root=repo)
+    assert args.judge == name  # no key read, no package imported, no model loaded at parse time
+
+
+def test_a_concrete_judge_is_built_only_when_the_judge_stage_runs(repo, scratch, monkeypatch, model):
+    build_testset(repo)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--backend", "fake",
+                   "--judge", "anthropic:claude-x", "--stages", "generate") == 0
+    assert evalrun.verdicts_path(scratch, "dev", "A1", None, "en").exists() is False
+
+
+def test_a_missing_anthropic_key_stops_cleanly_before_any_generation_or_file(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)  # and the repo fixture has no .env
+    code = run_cli(repo, *args_for(scratch, judge_name="anthropic:claude-haiku-5-5"))
+    captured = capsys.readouterr()
+    assert code == evalrun.EXIT_ERROR
+    assert "ANTHROPIC_API_KEY" in captured.err and captured.err.startswith("error:")
+    assert "Traceback" not in captured.err and "Traceback" not in captured.out
+    assert model.built == 0 and model.prompts_seen == 0  # nothing was generated
+    assert not scratch.exists()  # and nothing was written
+
+
+def test_the_env_file_of_the_repo_root_supplies_the_key_and_a_judge_is_built_from_it(repo, scratch, monkeypatch, model):
+    build_testset(repo)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    (repo / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-FROM-REPO-ENV-0123456789\n", encoding="utf-8")
+    built = []
+
+    def fake_make_judge(name, *, env_file=None, environ=None):
+        built.append((name, env_file))
+        return StubJudge("anthropic:claude-x:tabc")
+
+    monkeypatch.setattr(evalrun.judges, "make_judge", fake_make_judge)
+    assert run_cli(repo, *args_for(scratch, judge_name="anthropic:claude-x")) == 0
+    assert built == [("anthropic:claude-x", repo / ".env")]
+    assert {v.judge_id for v in read_jsonl(evalrun.verdicts_path(scratch, "dev", "A1", None, "en"), Verdict)} == {
+        "anthropic:claude-x:tabc"}
+
+
+def test_a_registered_name_wins_over_the_concrete_forms(repo, scratch, monkeypatch, model):
+    build_testset(repo)
+    monkeypatch.setitem(evalrun.JUDGE_REGISTRY, "anthropic:claude-x", lambda: StubJudge("from-registry"))
+    monkeypatch.setattr(evalrun.judges, "make_judge", lambda *a, **k: pytest.fail("the registry must win"))
+    assert run_cli(repo, *args_for(scratch, judge_name="anthropic:claude-x")) == 0
+    assert {v.judge_id for v in read_jsonl(evalrun.verdicts_path(scratch, "dev", "A1", None, "en"), Verdict)} == {
+        "from-registry"}
+
+
+def test_a_judge_that_cannot_run_stops_the_run_with_one_line_instead_of_judge_errors(repo, scratch, monkeypatch, model, capsys):
+    from msd.judge import JudgeSetupError
+
+    class Unusable:
+        id = "U1"
+        calls = 0
+
+        def classify(self, kind, prompt, response):
+            Unusable.calls += 1
+            raise JudgeSetupError("the API key was rejected (HTTP 401)")
+
+    build_testset(repo, n=4)
+    register(monkeypatch, "unusable", Unusable())
+    assert run_cli(repo, *args_for(scratch, judge_name="unusable")) == evalrun.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "error: the API key was rejected (HTTP 401)" in err and "Traceback" not in err
+    assert Unusable.calls == 1  # the first call ended the run; the other items were not tried

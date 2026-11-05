@@ -60,8 +60,16 @@ either single kind (harmful, benign_edgy) fails the run (exit 5) AFTER the verdi
 written, so the errors can be inspected. The rate is judge_error / (verdicts that were put to the judge), so
 empty completions (no_response, never judged) cannot hide a broken judge.
 
+Judges (`--judge NAME`): `fake` (a test stand-in), `anthropic:<model-id>` (Claude through the API, key from
+ANTHROPIC_API_KEY or the repository's `.env`) and `hf:<model-id>` (an open model on a GPU runtime), see `msd.judges`.
+A name is checked when the arguments are parsed; the judge itself is built only when the judge stage runs, and
+before anything is generated or written, so a missing key or package stops the run first (exit 1, one line, no
+traceback). Judge ids carry a fingerprint of the judge templates. If any judge call raised, a one-line summary of
+the exception TYPES and their counts goes to stderr (never a message: it can hold a key or the judged text).
+
 Exit codes: 0 done; 1 any other failure (a refused, corrupt or incomplete file, a backend or model error, a
-failed write); 2 usage error (bad arguments, an unknown judge, a fake backend or judge aimed at results/);
+judge that cannot be set up such as a missing key or package, a failed write); 2 usage error (bad arguments, an
+unknown judge name, a fake backend or judge aimed at results/);
 3 none of the requested languages has a test-set file; 4 JudgeMixError (own file or a sibling arm's file);
 5 judge_error rate above the limit (language or one kind).
 Never 0 on an error. Prompt texts and completions are never printed or written to eval.json.
@@ -80,7 +88,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from msd import gen, genrun
+from msd import gen, genrun, judges
 from msd.config import ARMS, LANGS
 from msd.gen import gens_path
 from msd.judge import JUDGE_TEMPLATES, Judge, JudgeRunner
@@ -217,13 +225,19 @@ class FakeJudge:
         return "complied" if digest[0] % 2 == 0 else "refused"
 
 
-# `--judge NAME` is looked up here. A factory is called once per run, only when the judge stage runs. Concrete
-# judges are registered by the module that defines them (Task 13); only the test judge is registered here.
+# `--judge NAME` is looked up here first. A factory is called once per run, only when the judge stage runs. Only
+# the test judge is registered; the real ones are not in the registry but are built from their names by
+# `msd.judges.make_judge`: `anthropic:<model-id>` and `hf:<model-id>`.
 JUDGE_REGISTRY: dict[str, Callable[[], Judge]] = {"fake": FakeJudge}
 
 
 def _make_judge(name: str, out_root: Path, root: Path) -> Judge:
-    judge = JUDGE_REGISTRY[name]()
+    if name in JUDGE_REGISTRY:
+        judge = JUDGE_REGISTRY[name]()
+    else:
+        # The repository's .env is where the owner keeps ANTHROPIC_API_KEY. A missing key or package is a
+        # JudgeSetupError here, before anything is generated or written.
+        judge = judges.make_judge(name, env_file=Path(root) / ".env")
     if not isinstance(getattr(judge, "id", None), str) or not judge.id:
         raise EvalError(f"judge {name!r} has no usable id")
     if getattr(judge, "is_fake", False) and genrun.is_in_results(out_root, root):
@@ -232,6 +246,14 @@ def _make_judge(name: str, out_root: Path, root: Path) -> Judge:
             f"{out_root} is the real results directory. Use a scratch directory."
         )
     return judge
+
+
+def _report_judge_errors(runner: JudgeRunner | None) -> None:
+    """One line on stderr naming the exception TYPES the judge raised and how often (never a message or a text)."""
+    if runner is None or not runner.error_types:
+        return
+    counts = ", ".join(f"{name} x{count}" for name, count in sorted(runner.error_types.items()))
+    print(f"WARNING: judge calls that raised, by exception type: {counts}", file=sys.stderr)
 
 
 # --- arguments ------------------------------------------------------------------------------------------------
@@ -259,7 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", "--model-path", dest="model_path",
                     help="Hugging Face repo id or local (merged) model directory; needed by the generate stage "
                          "with --backend hf")
-    ap.add_argument("--judge", help="judge name from the registry; needed by the judge stage")
+    ap.add_argument("--judge", help="judge name: 'anthropic:<model-id>' (needs ANTHROPIC_API_KEY), "
+                                    "'hf:<model-id>' (GPU runtime) or a registered name; needed by the judge stage")
     ap.add_argument("--out", "--out-root", dest="out_root", type=Path, default=None,
                     help="default: results/ under the repository root")
     ap.add_argument("--stages", type=_stages_arg, default=list(STAGES),
@@ -297,8 +320,11 @@ def parse_args(argv: Sequence[str] | None, *, root: Path) -> argparse.Namespace:
     if "judge" in args.stages:
         if not args.judge:
             ap.error("--judge is required for the judge stage (use --stages to leave it out)")
-        if args.judge not in JUDGE_REGISTRY:
-            ap.error(f"unknown judge {args.judge!r}; registered judges: {', '.join(sorted(JUDGE_REGISTRY))}")
+        if args.judge not in JUDGE_REGISTRY and not judges.is_known_judge_name(args.judge):
+            ap.error(
+                f"unknown judge {args.judge!r}; registered judges: {', '.join(sorted(JUDGE_REGISTRY))}; "
+                f"other accepted forms: {judges.ACCEPTED_FORMS}"
+            )
     elif args.rejudge:
         ap.error("--rejudge only makes sense with the judge stage")
     if "generate" in args.stages:
@@ -832,39 +858,42 @@ def evaluate(args: argparse.Namespace, *, root: Path) -> RunSummary:
         genrun.run(args, available, root, extra_prompts={plan.lang: plan.tasks for plan in plans})
 
     runner = JudgeRunner(judge, cache_path(args.out_root, args.split, judge.id)) if judge is not None else None
-    for plan in plans:
-        gens, meta = _load_gens(plan, args, root)
-        verdicts: list[Verdict] | None = None
-        scores: list[TaskScore] | None = None
-        ran_judge = ran_task = False
+    try:
+        for plan in plans:
+            gens, meta = _load_gens(plan, args, root)
+            verdicts: list[Verdict] | None = None
+            scores: list[TaskScore] | None = None
+            ran_judge = ran_task = False
 
-        if runner is not None:
-            verdicts = _judge_language(plan, gens, runner)
-            _install_verdicts(plan, args, verdicts, old_labels[plan.lang])
-            ran_judge = True
-        elif plan.verdicts_file.is_file():
-            verdicts = _read_verdicts(plan.verdicts_file)
-        if "task" in stages and plan.tasks:
-            scores = _score_language(plan, gens)
-            _atomic_replace(plan.tasks_file, lambda tmp, rows=scores: write_jsonl(tmp, rows))
-            ran_task = True
-        elif plan.tasks and plan.tasks_file.is_file():
-            scores = read_jsonl(plan.tasks_file, TaskScore)
+            if runner is not None:
+                verdicts = _judge_language(plan, gens, runner)
+                _install_verdicts(plan, args, verdicts, old_labels[plan.lang])
+                ran_judge = True
+            elif plan.verdicts_file.is_file():
+                verdicts = _read_verdicts(plan.verdicts_file)
+            if "task" in stages and plan.tasks:
+                scores = _score_language(plan, gens)
+                _atomic_replace(plan.tasks_file, lambda tmp, rows=scores: write_jsonl(tmp, rows))
+                ran_task = True
+            elif plan.tasks and plan.tasks_file.is_file():
+                scores = read_jsonl(plan.tasks_file, TaskScore)
 
-        ids = {v.judge_id for v in verdicts or []}
-        if len(ids) > 1:
-            raise JudgeMixError(f"{plan.verdicts_file} holds verdicts from {len(ids)} judges {sorted(ids)}")
-        judge_id = runner.judge.id if runner is not None else (next(iter(ids)) if ids else None)
+            ids = {v.judge_id for v in verdicts or []}
+            if len(ids) > 1:
+                raise JudgeMixError(f"{plan.verdicts_file} holds verdicts from {len(ids)} judges {sorted(ids)}")
+            judge_id = runner.judge.id if runner is not None else (next(iter(ids)) if ids else None)
 
-        report = _eval_report(plan, args, gens, meta, verdicts, scores, judge_id)
-        _atomic_replace(plan.eval_file, lambda tmp, text=json.dumps(report, ensure_ascii=False, indent=2) + "\n":
-                        _write_text(tmp, text))
-        summary.languages[plan.lang] = report
-        breaches = _gate_breaches(report) if ran_judge else []
-        if breaches:
-            summary.gate_failures.append(plan.lang)
-        summary.warnings.extend(f"{plan.lang}: {warning}" for warning in report["warnings"])
-        _announce(plan, args, report, ran_judge=ran_judge, ran_task=ran_task, breaches=breaches)
+            report = _eval_report(plan, args, gens, meta, verdicts, scores, judge_id)
+            _atomic_replace(plan.eval_file, lambda tmp, text=json.dumps(report, ensure_ascii=False, indent=2) + "\n":
+                            _write_text(tmp, text))
+            summary.languages[plan.lang] = report
+            breaches = _gate_breaches(report) if ran_judge else []
+            if breaches:
+                summary.gate_failures.append(plan.lang)
+            summary.warnings.extend(f"{plan.lang}: {warning}" for warning in report["warnings"])
+            _announce(plan, args, report, ran_judge=ran_judge, ran_task=ran_task, breaches=breaches)
+    finally:
+        _report_judge_errors(runner)
 
     if summary.gate_failures:
         raise QualityGateError(
@@ -926,7 +955,7 @@ def _announce(
         print(f"WARNING [{lang} {args.arm}/{gen.format_alpha(args.alpha)} {args.split}]: {warning}", file=sys.stderr)
 
 
-PLAIN_ERRORS = (*genrun.PLAIN_ERRORS, EvalError)
+PLAIN_ERRORS = (*genrun.PLAIN_ERRORS, EvalError, judges.JudgeSetupError)
 
 
 def main(argv: Sequence[str] | None = None, *, root: Path | None = None) -> int:

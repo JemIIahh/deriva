@@ -143,3 +143,19 @@ def freeze_kwargs(tmp_path, fixture_sources):
         sizes=TEST_SIZES,
         sources=fixture_sources,
     )
+
+
+# --- live tests ------------------------------------------------------------------------------------------------
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tests marked `live` spend money on a real API, so they run only when asked for: `pytest -m live`.
+
+    A key in the shell (or an exported ANTHROPIC_API_KEY in a CI job) must never make a plain `pytest` pay.
+    """
+    if "live" in (config.getoption("-m") or ""):
+        return
+    skip = pytest.mark.skip(reason="live test: spends money on a real API; run it with `pytest -m live`")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip)

@@ -17,9 +17,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+judge = ["anthropic"]  # the anthropic: judge; the hf: judge needs torch and transformers, which only the GPU runtime has
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live: calls a paid external API (needs ANTHROPIC_API_KEY); only runs when asked for with `pytest -m live`",
+]
