@@ -1,23 +1,95 @@
-"""Fine-tune A0 into A1 with AlignTune (plan Task 14): the config schema comes first, the run is added below.
+"""Fine-tune A0 into A1 with AlignTune: LoRA on a harmless closed-form task, then merge to fp16 (plan Task 14).
 
-Every training value lives in a YAML file (configs/ft_lora.yaml, configs/ft_lora_strong.yaml). This module holds
-no default for any of them: it checks that each key is present, has the right type and is in range, and that no
-unknown key is there, and it reports every problem at once.
+    python scripts/finetune.py --config configs/ft_lora.yaml --dry-run
+    python scripts/finetune.py --config configs/ft_lora.yaml --max-steps 20 --merge     # smoke run, then
+    python scripts/finetune.py --config configs/ft_lora.yaml                             # the real run
+    python scripts/finetune.py --config configs/ft_lora_strong.yaml                     # the strong retry
+
+Every training value (model, data paths, LoRA, quantisation, learning rate, epochs, batches, sequence length,
+precision, seed, loss masking, saving) is in the YAML config; this program holds no default for any of them and
+refuses unknown or out-of-range keys. `--data` replaces the training file, `--out` the output folder (default
+`results/finetune/<config stem>`, and `<config stem>-smoke` with `--max-steps`), `--seed` the seed.
+
+Before anything is trained the training data goes through the in-process validator of scripts/validate_ft_data.py
+(`msd.ftdata`): schema, bare answers, no refusals, language coverage, the harmless-subject allowlist, and no
+overlap with heldout, taskdev or the safety test set (each checked when its file exists, and said to be NOT
+checked otherwise). The sha256 of the training file goes into the summary. Every example is also measured with
+the model's chat template and the run is refused if any is longer than `train.max_seq_length`.
+
+`--dry-run` does all of that, prints the plan (rows per language, steps = rows x epochs / effective batch,
+token lengths when a tokenizer can be loaded) and writes nothing; it needs no GPU and no AlignTune. A real run
+builds the trainer through AlignTune's `create_sft_trainer`, trains, checks that the adapter on disk is the
+configured one, that the trainer saw every row and that the loss is finite and fell, merges the adapter into a
+fresh fp16 copy of the base model, and writes `finetune_summary.json` (config and data hashes, library versions,
+steps, sampled loss history, wall-clock seconds, seed, `smoke`, device, `loss_ok`; never a token or an absolute
+path). Everything goes into a hidden partial folder that is renamed to `--out` only when the run succeeded.
+`--max-steps N` is a smoke run: N steps, every step logged, merge only with `--merge`, never pushed.
+
+`--push-to ORG/NAME` uploads the merged folder after a successful full run, but only to a repo that already
+exists and for which `HfApi.repo_info(...).private is True` (checked before training starts). The token is read
+from HF_TOKEN only (there is no token flag), is never printed, and no repo is ever created. Without the flag
+the Hub is not contacted. A gated base model needs the same token in the environment to download.
+
+The call into AlignTune and the merge were written from the source of aligntune 0.1.31 (docs/toolkit-notes.md,
+"AlignTune SFT (read from source)") and have not been run against it. UNVERIFIED until the first GPU-runtime
+smoke run (docs/runtime.md, section 5): the keyword names, the CuratorKIT data path, TRL's assistant-only mask
+for Tiny Aya's template, fp16 stability on a T4 and the memory use.
+
+Exit codes:
+  0  done: a full or smoke run finished and passed its checks, or a dry run found nothing wrong
+  1  a data or config problem, a failed quality check (validation, overlap, a loss that is NaN or did not fall,
+     rows missing, an adapter that is not the configured one), a failure while training, merging or uploading,
+     or a Hub repo that is missing or not private
+  2  usage error: bad or missing arguments, --push-to without HF_TOKEN or with --max-steps or --no-merge,
+     a non-empty --out, or an --out that is, or is inside, a data folder
 """
 
 from __future__ import annotations
 
+import argparse
 import difflib
+import gc
+import hashlib
+import importlib.metadata
+import json
 import math
+import os
 import re
-from collections.abc import Callable, Mapping
+import shutil
+import sys
+import time
+import traceback
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import yaml
 
+from msd import ftdata
+from msd.atomicdir import atomic_output_dir, check_out_dir, note_stale_partials
 from msd.config import LANGS
+from msd.restarun import scrub
+
+EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
+
+ROOT = Path(__file__).resolve().parents[2]
+SUMMARY_FILE = "finetune_summary.json"
+ADAPTER_CONFIG = "adapter_config.json"
+SMOKE_SUFFIX = "-smoke"
+ALIGNTUNE_VERSION = "0.1.31"
+LIBRARIES = (
+    "aligntune", "trl", "transformers", "peft", "torch", "bitsandbytes", "datasets", "accelerate", "curatorkit", "huggingface_hub",
+)
+REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
+_FLOAT = ".8g"
+_ONE_DECIMAL = ".1f"
+NOTE = (
+    "UNVERIFIED: the call into AlignTune and the merge were written from the source of aligntune "
+    f"{ALIGNTUNE_VERSION} and had not been run when this was written; they count as checked only after the first "
+    "GPU-runtime smoke run (docs/runtime.md, section 5)."
+)
 
 
 class FinetuneError(RuntimeError):
@@ -299,3 +371,748 @@ def check_strong_relation(base: Mapping[str, Any], strong: Mapping[str, Any]) ->
         if flat_base.get(key) != flat_strong.get(key):
             problems.append(f"{key} differs from the base config ({flat_base.get(key)!r} vs {flat_strong.get(key)!r}): not a documented difference")
     return problems
+
+
+# --- plan arithmetic and the quality checks ---------------------------------------------------------------------
+
+
+def plan_steps(rows: int, epochs: int, per_device_batch: int, accumulation: int) -> int:
+    """Optimizer steps for `rows` rows: rows x epochs over the effective batch, rounded up."""
+    return math.ceil(rows * epochs / (per_device_batch * accumulation))
+
+
+def loss_check(history: Sequence[Sequence[float]]) -> tuple[bool, str]:
+    """(ok, why) for a logged loss history of `[step, loss]` pairs.
+
+    Fails when nothing was logged, when a loss is NaN or infinite, when only one loss was logged (a decrease
+    cannot be seen), or when the mean of the second half of the logged losses is not below the mean of the
+    first half."""
+    values = [float(loss) for _step, loss in history]
+    if not values:
+        return False, "no loss was logged, so the run cannot be called successful"
+    if not all(math.isfinite(v) for v in values):
+        return False, "a logged loss is not finite (NaN or inf): fp16 overflow or a diverged run"
+    if len(values) < 2:
+        return False, "need at least two logged losses to see a decrease, got one (use --max-steps 2 or more)"
+    half = len(values) // 2
+    first, last = sum(values[:half]) / half, sum(values[half:]) / (len(values) - half)
+    if not last < first:
+        return False, f"the loss did not decrease (mean of the first half {first:{_FLOAT}}, of the second half {last:{_FLOAT}})"
+    return True, f"the loss fell from {first:{_FLOAT}} to {last:{_FLOAT}} (mean of the first and second half of {len(values)} logged points)"
+
+
+def sample_history(history: Sequence[Sequence[float]], points: int) -> list[list[float]]:
+    """At most `points` entries of the history, evenly spaced, the first and the last always among them."""
+    entries = [list(h) for h in history]
+    n = len(entries)
+    if n <= points:
+        return entries
+    return [entries[i * (n - 1) // (points - 1)] for i in range(points)]
+
+
+def _tidy(history: Sequence[Sequence[float]]) -> list[list[float]]:
+    return [[step, float(format(loss, _FLOAT))] for step, loss in history]
+
+
+def _show_history(history: Sequence[Sequence[float]], points: int) -> str:
+    return " ".join(f"{step}:{loss:{_FLOAT}}" for step, loss in sample_history(history, points))
+
+
+# --- the call into AlignTune -------------------------------------------------------------------------------------
+
+
+def _compute_dtype(train: SimpleNamespace) -> str:
+    if train.fp16:
+        return "float16"
+    return "bfloat16" if train.bf16 else "float32"
+
+
+def _precision(train: SimpleNamespace) -> str:
+    if train.fp16:
+        return "fp16"
+    return "bf16" if train.bf16 else "fp32"
+
+
+def _quantization(cfg: SimpleNamespace) -> dict[str, Any] | None:
+    q = cfg.quantization
+    if q.mode == "none":
+        return None
+    if q.mode == "8bit":
+        return {"load_in_8bit": True}
+    return {
+        "load_in_4bit": True,
+        "bnb_4bit_compute_dtype": _compute_dtype(cfg.train),  # AlignTune's own default is bfloat16, absent on a T4
+        "bnb_4bit_quant_type": q.quant_type,
+        "bnb_4bit_use_double_quant": q.double_quant,
+    }
+
+
+def build_trainer_params(
+    cfg: SimpleNamespace, *, data_path: Path, adapter_dir: Path, seed: int, max_steps: int | None
+) -> dict[str, Any]:
+    """The keyword arguments of AlignTune's `create_sft_trainer`, all taken from the config.
+
+    The names are the ones read from the source of aligntune 0.1.31 (docs/toolkit-notes.md, "AlignTune SFT (read
+    from source)"). A misspelled keyword is NOT an error in AlignTune: it is dropped silently, which is why every
+    name here is pinned by tests/test_finetune.py. A smoke run (`max_steps` set) logs every step, so that a
+    decrease of the loss can be seen after a few steps."""
+    t, lora, tune = cfg.train, cfg.lora, cfg.aligntune
+    params: dict[str, Any] = {
+        "model_name": cfg.base_model,
+        "dataset_name": str(data_path),
+        "backend": tune.backend,
+        "output_dir": str(adapter_dir),
+        "num_epochs": t.epochs,
+        "batch_size": t.per_device_batch_size,
+        "learning_rate": t.learning_rate,
+        "max_seq_length": t.max_seq_length,
+        "use_peft": True,
+        "lora_r": lora.rank,
+        "lora_alpha": lora.alpha,
+        "lora_dropout": lora.dropout,
+        "lora_target_modules": list(lora.target_modules),
+        "lora_bias": lora.bias,
+        "precision": _precision(t),  # explicit: AlignTune's AUTO can pick bf16 on a T4
+        "fp16": t.fp16,
+        "bf16": t.bf16,
+        "gradient_checkpointing": t.gradient_checkpointing,
+        "gradient_accumulation_steps": t.gradient_accumulation_steps,
+        "warmup_ratio": t.warmup_ratio,
+        "lr_scheduler": t.lr_scheduler,
+        "weight_decay": t.weight_decay,
+        "max_grad_norm": t.max_grad_norm,
+        "assistant_only_loss": t.assistant_only_loss,
+        "seed": seed,
+        "data_seed": seed,
+        "logging_steps": 1 if max_steps is not None else t.logging_steps,
+        "save_steps": t.save_steps,
+        "save_total_limit": t.save_total_limit,
+        "device_map": tune.device_map,
+        "group_by_length": tune.group_by_length,
+        "load_best_model_at_end": tune.load_best_model_at_end,
+        "eval_strategy": tune.eval_strategy,
+        "loggers": list(tune.loggers),
+    }
+    quantization = _quantization(cfg)
+    if quantization is not None:
+        params["quantization"] = quantization
+    if max_steps is not None:
+        params["max_steps"] = max_steps
+    return params
+
+
+class _AlignTuneRun:
+    """The real AlignTune trainer behind the small interface `run` uses: `train()` returns plain numbers.
+
+    `train()` returns `{final_loss, steps, loss_history: [[step, loss]...], rows_seen}`. The numbers come from
+    the dict `TRLSFTTrainer.train()` returns (`final_loss`, `steps`) and from the Hugging Face trainer inside it
+    (`state.log_history`, `train_dataset`); each is None or empty when the installed version does not offer it,
+    and `run` then refuses or notes it. Read from the source of aligntune 0.1.31, never run."""
+
+    def __init__(self, inner: Any):
+        self.inner = inner
+
+    def train(self) -> dict[str, Any]:
+        result = self.inner.train() or {}
+        hf = getattr(self.inner, "trainer", None)
+        state = getattr(hf, "state", None)
+        log = getattr(state, "log_history", None) or []
+        logged = [entry for entry in log if isinstance(entry, Mapping) and "loss" in entry]
+        history = [[entry.get("step", index + 1), float(entry["loss"])] for index, entry in enumerate(logged)]
+        steps = result.get("steps")
+        if steps is None:
+            steps = getattr(state, "global_step", None)
+        dataset = getattr(hf, "train_dataset", None)
+        rows_seen = len(dataset) if dataset is not None and hasattr(dataset, "__len__") else None
+        return {"final_loss": result.get("final_loss"), "steps": steps, "loss_history": history, "rows_seen": rows_seen}
+
+
+def aligntune_factory(params: Mapping[str, Any]) -> _AlignTuneRun:
+    """Build AlignTune's SFT trainer from `params` (nothing is loaded until `train()`); the only AlignTune import."""
+    try:
+        from aligntune.core.backend_factory import create_sft_trainer
+    except ImportError as exc:
+        raise FinetuneError(
+            f"AlignTune could not be imported ({exc}). Install it with `pip install aligntune=={ALIGNTUNE_VERSION}` on "
+            "the runtime that trains (it needs Python 3.11 or newer; docs/runtime.md, section 5)."
+        ) from exc
+    return _AlignTuneRun(create_sft_trainer(**params))
+
+
+def default_merge(base_model: str, adapter_dir: Path, out_dir: Path, *, dtype: str) -> None:
+    """Merge the LoRA adapter into a fresh, unquantised copy of the base model and save it with the tokenizer.
+
+    The same PEFT calls as AlignTune's merger (`PeftModel.from_pretrained`, `merge_and_unload`, `save_pretrained`),
+    without its provenance file (absolute paths) and its transformers-4 legacy fields. Loaded on the CPU."""
+    try:
+        import torch
+        import transformers
+        from peft import PeftModel
+    except ImportError as exc:
+        raise FinetuneError(
+            f"merging needs torch, transformers and peft ({exc}); they come with `pip install aligntune=={ALIGNTUNE_VERSION}`"
+        ) from exc
+    model = transformers.AutoModelForCausalLM.from_pretrained(base_model, dtype=getattr(torch, dtype))
+    model = PeftModel.from_pretrained(model, str(adapter_dir)).merge_and_unload()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(out_dir, safe_serialization=True)
+    transformers.AutoTokenizer.from_pretrained(base_model).save_pretrained(out_dir)
+
+
+def default_tokenizer_loader(name: str) -> Any:
+    import transformers
+
+    return transformers.AutoTokenizer.from_pretrained(name)
+
+
+def default_hf_api_factory(token: str) -> Any:
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise FinetuneError(f"--push-to needs huggingface_hub ({exc}); pip install huggingface_hub") from exc
+    return HfApi(token=token)
+
+
+def default_device_info() -> str:
+    try:
+        import torch
+
+        return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    except Exception:  # torch missing, no driver, anything: the name is a note, never a reason to fail
+        return "unknown"
+
+
+def library_versions() -> dict[str, str | None]:
+    """Installed versions of the libraries that matter, read from package metadata (nothing is imported)."""
+    found: dict[str, str | None] = {}
+    for name in LIBRARIES:
+        try:
+            found[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            found[name] = None
+    return found
+
+
+# --- the data ---------------------------------------------------------------------------------------------------
+
+
+def shown(path: str | Path, root: Path) -> str:
+    """`path` relative to the repository root when it is inside it, else only its name: never an absolute path."""
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(Path(root).resolve()).as_posix()
+    except ValueError:
+        return p.name
+
+
+def _resolve(path: str | Path, root: Path) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else Path(root) / p
+
+
+@dataclass
+class DataCheck:
+    path: Path
+    sha256: str
+    records: list[dict[str, Any]]
+    per_language: dict[str, int]
+    heldout_checked: bool
+    taskdev_checked: bool
+    safety_checked: bool
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def rows(self) -> int:
+        return len(self.records)
+
+
+def _read(path: Path, where: str, root: Path) -> tuple[list[Any], list[ftdata.Problem]]:
+    try:
+        return ftdata.read_jsonl_records(path, where)
+    except (OSError, ValueError) as exc:
+        raise FinetuneError(f"cannot read the {where} data {shown(path, root)}: {getattr(exc, 'strerror', None) or exc}") from None
+
+
+def check_data(cfg: SimpleNamespace, train_path: Path, root: Path) -> DataCheck:
+    """Run the `msd.ftdata` validator in-process; raise `FinetuneError` (with its report) when any rule fails.
+
+    Same rules as scripts/validate_ft_data.py: schema, bare answers, no refusals, script per language, language
+    coverage and balance, the harmless-subject allowlist (always checked, from `data.pipeline`), no overlap
+    between train and heldout or taskdev, none with the safety dev/report splits. Heldout, taskdev and the safety
+    test set are checked when their files exist; a missing one is said to be NOT checked and recorded."""
+    data = cfg.data
+    pipeline = _resolve(data.pipeline, root)
+    try:
+        subjects = ftdata.load_allowed_subjects(pipeline)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise FinetuneError(f"the subject allowlist cannot be read from {shown(pipeline, root)}: {getattr(exc, 'strerror', None) or exc}") from None
+    train, problems = _read(train_path, "train", root)
+    notes: list[str] = []
+    heldout_path, taskdev_path, testset_dir = (_resolve(data.heldout, root), _resolve(data.taskdev, root), _resolve(data.testset, root))
+    heldout: list[Any] | None = None
+    taskdev: list[Any] | None = None
+    if heldout_path.is_file():
+        heldout, more = _read(heldout_path, "heldout", root)
+        problems += more
+    else:
+        notes.append(f"note: {shown(heldout_path, root)} not found, so overlap with the held-out items is NOT checked")
+    if taskdev_path.is_file():
+        taskdev, more = _read(taskdev_path, "taskdev", root)
+        problems += more
+    else:
+        notes.append(f"note: {shown(taskdev_path, root)} not found, so overlap with the dev task items is NOT checked")
+    dev_texts: list[str] = []
+    report_texts: list[str] = []
+    safety_counts = None
+    if testset_dir.is_dir():
+        try:
+            dev_texts, report_texts, safety_counts = ftdata.load_safety_texts(testset_dir)
+        except (OSError, ValueError) as exc:
+            raise FinetuneError(f"the safety test set {shown(testset_dir, root)} cannot be read: {getattr(exc, 'strerror', None) or exc}") from None
+    else:
+        notes.append(f"note: {shown(testset_dir, root)} not found, so overlap with the safety dev/report splits is NOT checked")
+    report = ftdata.validate(
+        train,
+        heldout if heldout is not None else [],
+        expected_langs=data.langs,
+        safety_dev=dev_texts,
+        safety_report=report_texts,
+        allowed_subjects=subjects,
+        safety_counts=safety_counts,
+        taskdev=taskdev,
+        read_problems=problems,
+    )
+    if heldout is None:  # an absent heldout file leaves every language "too few rows" there; that is not the train data's fault
+        in_train = {lang for lang, n in report.counts["train"].items() if n}
+        report.problems = [
+            p for p in report.problems
+            if not (p.rule == "missing_lang" and p.where == "set" and p.message.split()[2] in in_train)
+        ]
+    if not report.ok:
+        raise FinetuneError(
+            f"refusing to train: the data failed validation (rules: {', '.join(report.failed_rules())})\n{ftdata.render(report)}"
+        )
+    counts = report.counts["train"]
+    return DataCheck(
+        path=train_path,
+        sha256=hashlib.sha256(train_path.read_bytes()).hexdigest(),
+        records=train,
+        per_language={lang: counts.get(lang, 0) for lang in data.langs},
+        heldout_checked=heldout is not None,
+        taskdev_checked=taskdev is not None,
+        safety_checked=safety_counts is not None,
+        notes=notes,
+    )
+
+
+def token_lengths(tokenizer: Any, records: Sequence[Mapping[str, Any]]) -> list[int]:
+    """Tokens per example with the model's chat template, as TRL will count them (the template adds the special tokens)."""
+    lengths = []
+    for record in records:
+        rendered = tokenizer.apply_chat_template(record["messages"], tokenize=False)
+        lengths.append(len(tokenizer(rendered, add_special_tokens=False)["input_ids"]))
+    return lengths
+
+
+def _length_line(lengths: Sequence[int], limit: int) -> tuple[str, int]:
+    ordered = sorted(lengths)
+    over = sum(1 for n in ordered if n > limit)
+    mean = sum(ordered) / len(ordered)
+    line = (
+        f"token lengths: min {ordered[0]}, median {ordered[len(ordered) // 2]}, mean {mean:{_ONE_DECIMAL}}, max {ordered[-1]}; "
+        f"{over} over max_seq_length {limit}"
+    )
+    return line, over
+
+
+# --- push guard -------------------------------------------------------------------------------------------------
+
+
+def check_push_target(api: Any, repo_id: str) -> None:
+    """Refuse unless the Hub repo exists and `repo_info(...).private is True`. Nothing is ever created."""
+    try:
+        info = api.repo_info(repo_id, repo_type="model")
+    except Exception as exc:
+        raise FinetuneError(
+            f"cannot read the Hub repo {repo_id} ({type(exc).__name__}: {exc}); create it by hand as a PRIVATE "
+            "model repo first: this script never creates one"
+        ) from None
+    private = getattr(info, "private", None)
+    if private is not True:
+        raise FinetuneError(f"the Hub repo {repo_id} is not private (private={private!r}); refusing to upload the model there")
+
+
+# --- arguments --------------------------------------------------------------------------------------------------
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # argparse repeats unrecognised arguments, and one may be a token
+        super().error(scrub(message))
+
+
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive whole number, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive whole number, got {text!r}")
+    return value
+
+
+def _seed(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"the seed must be a non-negative whole number, got {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"the seed must be a non-negative whole number, got {text!r}")
+    return value
+
+
+def _repo_id(text: str) -> str:
+    if not REPO_ID.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"expected ORG/NAME (letters, digits, dot, dash, underscore), got {text!r}")
+    return text
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = _Parser(prog="finetune", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", required=True, type=Path, help="YAML config, e.g. configs/ft_lora.yaml (every training value is in it)")
+    ap.add_argument("--data", type=Path, help="training jsonl (default: data.train of the config)")
+    ap.add_argument("--out", type=Path, help="output folder; must not exist or be empty (default: results/finetune/<config stem>)")
+    ap.add_argument("--dry-run", action="store_true", help="check the config and the data and print the plan; write nothing, import no GPU library")
+    ap.add_argument("--max-steps", type=_positive_int, help="smoke run: train this many steps only; output goes to <config stem>-smoke, no merge unless --merge")
+    ap.add_argument("--merge", action=argparse.BooleanOptionalAction, default=None,
+                    help="merge the adapter into fp16 weights (default: yes, except in a smoke run)")
+    ap.add_argument("--push-to", type=_repo_id, metavar="ORG/NAME",
+                    help="after a successful full run upload the merged folder to this PRIVATE Hub repo (HF_TOKEN from the environment)")
+    ap.add_argument("--seed", type=_seed, help="seed (default: train.seed of the config)")
+    return ap
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    """Parse and cross-check; any usage error prints the usage and exits with code 2 (SystemExit)."""
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    args.smoke = args.max_steps is not None
+    args.merge_effective = args.merge if args.merge is not None else not args.smoke
+    if args.push_to:
+        if args.smoke:
+            ap.error("--push-to cannot be combined with --max-steps: a smoke run is never pushed")
+        if not args.merge_effective:
+            ap.error("--push-to needs the merged model: drop --no-merge")
+        if not args.dry_run and not os.environ.get("HF_TOKEN"):
+            ap.error("--push-to needs the token in the HF_TOKEN environment variable (there is no token flag)")
+    return args
+
+
+# --- the run ----------------------------------------------------------------------------------------------------
+
+
+class UsageError(FinetuneError):
+    """A bad output folder: the same exit code as a bad argument."""
+
+
+@dataclass
+class Hooks:
+    trainer_factory: Callable[[Mapping[str, Any]], Any]
+    merge_fn: Callable[..., None]
+    tokenizer_loader: Callable[[str], Any]
+    hf_api_factory: Callable[[str], Any]
+    clock: Callable[[], float]
+    device_info: Callable[[], str]
+    versions: Callable[[], Mapping[str, str | None]]
+
+
+def _release_memory() -> None:
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None:  # only when a trainer already imported it; never imported here
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _check_adapter(adapter_dir: Path, cfg: SimpleNamespace, name: str) -> None:
+    """The adapter on disk must be the one the config asked for: AlignTune drops a misspelled keyword silently."""
+    path = adapter_dir / ADAPTER_CONFIG
+    if not path.is_file():
+        raise FinetuneError(f"the trainer finished but left no {ADAPTER_CONFIG} in the {name} folder, so there is no adapter to merge")
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FinetuneError(f"{ADAPTER_CONFIG} cannot be read: {exc}") from None
+    modules = saved.get("target_modules")
+    modules = {modules} if isinstance(modules, str) else set(modules or ())
+    wanted = (
+        ("r", "rank", saved.get("r"), cfg.lora.rank),
+        ("lora_alpha", "alpha", saved.get("lora_alpha"), cfg.lora.alpha),
+        ("base_model_name_or_path", "base model", saved.get("base_model_name_or_path"), cfg.base_model),
+        ("target_modules", "target modules", modules, set(cfg.lora.target_modules)),
+    )
+    problems = [
+        f"{key} is {have!r} in the adapter but the config asks for {want!r} ({label})"
+        for key, label, have, want in wanted
+        if have != want
+    ]
+    if problems:
+        raise FinetuneError(
+            "the adapter the trainer saved does not match the config: " + "; ".join(problems)
+            + ". AlignTune ignores keywords it does not know, so check the names in docs/toolkit-notes.md."
+        )
+
+
+def _train_and_check(
+    hooks: Hooks, cfg: SimpleNamespace, args: argparse.Namespace, check: DataCheck, seed: int, folder: Path
+) -> dict[str, Any]:
+    adapter_dir = folder / cfg.output.adapter_dir
+    params = build_trainer_params(cfg, data_path=check.path, adapter_dir=adapter_dir, seed=seed, max_steps=args.max_steps)
+    trainer = hooks.trainer_factory(params)
+    result = trainer.train()
+    del trainer
+    _release_memory()
+
+    _check_adapter(adapter_dir, cfg, cfg.output.adapter_dir)
+    rows_seen = result.get("rows_seen")
+    if rows_seen is not None and rows_seen != check.rows:
+        raise FinetuneError(
+            f"the trainer reports training on {rows_seen} rows but {check.rows} are in the file: AlignTune or CuratorKIT "
+            "dropped rows; look at the smoke run's data step before a full run"
+        )
+    t = cfg.train
+    planned = plan_steps(check.rows, t.epochs, t.per_device_batch_size, t.gradient_accumulation_steps)
+    if args.max_steps is not None:
+        planned = min(planned, args.max_steps)
+    steps = result.get("steps")
+    if steps is None:
+        raise FinetuneError("the trainer did not report how many steps it ran")
+    if abs(steps - planned) > t.epochs:  # the step count may differ by one per epoch with the last partial batch
+        raise FinetuneError(
+            f"the trainer ran {steps} steps but the plan is {planned} ({check.rows} rows x {t.epochs} epochs / effective batch "
+            f"{t.per_device_batch_size * t.gradient_accumulation_steps}); it probably saw other data than the file"
+        )
+    history = [[step, float(loss)] for step, loss in result.get("loss_history") or []]
+    ok, reason = loss_check(history)
+    final = result.get("final_loss")
+    if ok and final is not None and not math.isfinite(float(final)):
+        ok, reason = False, "the final loss is not finite (NaN or inf)"
+    if not ok:
+        raise FinetuneError(f"{reason}; logged losses (step:loss) {_show_history(history, cfg.checks.history_points)}")
+    if final is None:
+        final = history[-1][1]
+    if not cfg.output.keep_checkpoints:
+        for checkpoint in adapter_dir.glob("checkpoint-*"):
+            shutil.rmtree(checkpoint, ignore_errors=True)
+    return {
+        "adapter_dir": adapter_dir,
+        "rows_seen": rows_seen,
+        "planned": planned,
+        "steps": steps,
+        "final_loss": float(format(float(final), _FLOAT)),
+        "history": history,
+        "loss_reason": reason,
+    }
+
+
+def _summary(
+    cfg: SimpleNamespace, args: argparse.Namespace, config_path: Path, check: DataCheck, seed: int, trained: dict[str, Any],
+    merged: bool, seconds: float, hooks: Hooks, root: Path,
+) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "smoke": args.smoke,
+        "max_steps": args.max_steps,
+        "config": {"path": shown(config_path, root), "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()},
+        "overrides": {
+            "data": shown(args.data, root) if args.data else None,
+            "max_steps": args.max_steps,
+            "seed": args.seed,
+        },
+        "base_model": cfg.base_model,
+        "data": {
+            "train": {
+                "path": shown(check.path, root),
+                "sha256": check.sha256,
+                "rows": check.rows,
+                "rows_per_language": check.per_language,
+            },
+            "heldout_checked": check.heldout_checked,
+            "taskdev_checked": check.taskdev_checked,
+            "safety_checked": check.safety_checked,
+            "validation": "ok",
+        },
+        "seed": seed,
+        "planned_steps": trained["planned"],
+        "steps": trained["steps"],
+        "rows_seen": trained["rows_seen"],
+        "final_loss": trained["final_loss"],
+        "loss_history": _tidy(sample_history(trained["history"], cfg.checks.history_points)),
+        "loss_ok": True,
+        "loss_reason": trained["loss_reason"],
+        "wall_clock_seconds": float(format(seconds, _FLOAT)),
+        "device": hooks.device_info(),
+        "libraries": dict(hooks.versions()),
+        "merged": merged,
+        "merge_dtype": cfg.output.merge_dtype,
+        "push_to": args.push_to,
+        "note": NOTE,
+    }
+
+
+def _plan_lines(
+    cfg: SimpleNamespace, args: argparse.Namespace, config_path: Path, check: DataCheck, seed: int, out: Path, root: Path,
+    length_line: str,
+) -> list[str]:
+    t = cfg.train
+    effective = t.per_device_batch_size * t.gradient_accumulation_steps
+    steps = plan_steps(check.rows, t.epochs, t.per_device_batch_size, t.gradient_accumulation_steps)
+    where = f"{shown(out, root)} (folders {cfg.output.adapter_dir}/ and {cfg.output.merged_dir}/, {SUMMARY_FILE})"
+    lines = [
+        "fine-tune plan" + (" (dry run: nothing is written, nothing is trained)" if args.dry_run else ""),
+        f"config: {shown(config_path, root)} (sha256 {hashlib.sha256(config_path.read_bytes()).hexdigest()})",
+        f"base model: {cfg.base_model}",
+        f"training data: {shown(check.path, root)}, {check.rows} rows, sha256 {check.sha256}",
+        "rows per language: " + ", ".join(f"{lang} {n}" for lang, n in check.per_language.items()),
+        "validation: ok ("
+        + f"heldout {'checked' if check.heldout_checked else 'NOT checked'}, "
+        + f"taskdev {'checked' if check.taskdev_checked else 'NOT checked'}, "
+        + f"safety splits {'checked' if check.safety_checked else 'NOT checked'})",
+        f"lora: rank {cfg.lora.rank}, alpha {cfg.lora.alpha}, dropout {cfg.lora.dropout}, targets {', '.join(cfg.lora.target_modules)}; "
+        f"quantization {cfg.quantization.mode}; precision {_precision(t)}",
+        f"effective batch: {t.per_device_batch_size} x {t.gradient_accumulation_steps} = {effective}",
+        f"planned optimizer steps: {steps} ({check.rows} rows x {t.epochs} epochs / effective batch {effective})",
+    ]
+    if args.smoke:
+        lines.append(f"smoke run: stops after {args.max_steps} steps, logs every step, output {where}")
+    else:
+        lines.append(f"output: {where}")
+    lines.append(length_line)
+    lines.append(f"seed: {seed}; merge: {'yes' if args.merge_effective else 'no'} ({cfg.output.merge_dtype})")
+    if args.push_to:
+        lines.append(
+            f"push: {args.push_to} after a successful run, only if it exists and is private"
+            + (" (not checked in a dry run)" if args.dry_run else "")
+        )
+    return lines
+
+
+def _measure(hooks: Hooks, cfg: SimpleNamespace, check: DataCheck, *, required: bool) -> str:
+    """The token-length line; refuses when an example is longer than `train.max_seq_length`.
+
+    A dry run does without a tokenizer (the line says so); a real run needs one."""
+    limit = cfg.train.max_seq_length
+    try:
+        tokenizer = hooks.tokenizer_loader(cfg.base_model)
+    except Exception as exc:
+        if required:
+            raise FinetuneError(f"cannot load the tokenizer of {cfg.base_model} ({type(exc).__name__}: {exc})") from None
+        return f"token lengths: not estimated (no tokenizer: {type(exc).__name__}: {scrub(str(exc))})"
+    lengths = token_lengths(tokenizer, check.records)
+    line, over = _length_line(lengths, limit)
+    if over:
+        raise FinetuneError(
+            f"{over} of {check.rows} training examples are longer than train.max_seq_length {limit} tokens (longest "
+            f"{max(lengths)}); TRL would cut the end of each, so the answer would be missing and the example would train on "
+            "nothing. Raise train.max_seq_length or drop those rows."
+        )
+    return line
+
+
+def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
+    cfg = load_config(args.config)
+    seed = args.seed if args.seed is not None else cfg.train.seed
+    stem = args.config.stem
+    out = args.out if args.out else Path(root) / "results" / "finetune" / (stem + (SMOKE_SUFFIX if args.smoke else ""))
+    train_path = args.data if args.data else _resolve(cfg.data.train, root)
+    data_dirs = {_resolve(p, root).parent for p in (cfg.data.train, cfg.data.heldout, cfg.data.taskdev)} | {train_path.parent}
+    try:
+        check_out_dir(out, sources=[("data", d) for d in sorted(data_dirs)])
+    except (FileExistsError, ValueError) as exc:
+        raise UsageError(str(exc)) from None
+    note_stale_partials(out)
+
+    check = check_data(cfg, train_path, root)
+    for note in check.notes:
+        print(note, file=sys.stderr)
+    length_line = _measure(hooks, cfg, check, required=not args.dry_run)
+    for line in _plan_lines(cfg, args, args.config, check, seed, out, root, length_line):
+        print(line)
+    if args.dry_run:
+        return EXIT_OK
+
+    api = None
+    if args.push_to:
+        api = hooks.hf_api_factory(os.environ["HF_TOKEN"])
+        check_push_target(api, args.push_to)  # before the hours of training, not after
+
+    started = hooks.clock()
+    with atomic_output_dir(out) as folder:
+        trained = _train_and_check(hooks, cfg, args, check, seed, folder)
+        merged = False
+        if args.merge_effective:
+            merged_dir = folder / cfg.output.merged_dir
+            hooks.merge_fn(cfg.base_model, trained["adapter_dir"], merged_dir, dtype=cfg.output.merge_dtype)
+            if not merged_dir.is_dir():
+                raise FinetuneError(f"the merge left no {cfg.output.merged_dir} folder")
+            merged = True
+        seconds = hooks.clock() - started
+        summary = _summary(cfg, args, args.config, check, seed, trained, merged, seconds, hooks, root)
+        text = scrub(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        (folder / SUMMARY_FILE).write_text(text, encoding="utf-8")
+
+    print(f"wrote {shown(out, root)} ({'smoke run, ' if args.smoke else ''}{trained['steps']} steps, final loss {trained['final_loss']:{_FLOAT}}; {trained['loss_reason']})")
+    if args.smoke:
+        print("smoke run only: this model is not A1; run without --max-steps for the real fine-tune", file=sys.stderr)
+    if api is not None:
+        try:
+            api.upload_folder(
+                folder_path=str(out / cfg.output.merged_dir), repo_id=args.push_to, repo_type="model",
+                commit_message=f"A1 fine-tune ({stem}); training data sha256 {check.sha256}",
+            )
+        except Exception as exc:
+            raise FinetuneError(
+                f"the upload to {args.push_to} failed ({type(exc).__name__}: {exc}); the training result is kept in {shown(out, root)}"
+            ) from None
+        print(f"uploaded {shown(out / cfg.output.merged_dir, root)} to the private repo {args.push_to}")
+    return EXIT_OK
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    trainer_factory: Callable[[Mapping[str, Any]], Any] | None = None,
+    merge_fn: Callable[..., None] | None = None,
+    tokenizer_loader: Callable[[str], Any] | None = None,
+    hf_api_factory: Callable[[str], Any] | None = None,
+    clock: Callable[[], float] | None = None,
+    device_info: Callable[[], str] | None = None,
+    versions: Callable[[], Mapping[str, str | None]] | None = None,
+    root: Path | None = None,
+) -> int:
+    """Run the fine-tune; every keyword is an injection point tests use (fakes for AlignTune, PEFT, the Hub, the clock)."""
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:  # argparse: 2 for a usage error, 0 for --help
+        return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+    hooks = Hooks(
+        trainer_factory=trainer_factory or aligntune_factory,
+        merge_fn=merge_fn or default_merge,
+        tokenizer_loader=tokenizer_loader or default_tokenizer_loader,
+        hf_api_factory=hf_api_factory or default_hf_api_factory,
+        clock=clock or time.monotonic,
+        device_info=device_info or default_device_info,
+        versions=versions or library_versions,
+    )
+    try:
+        return execute(args, Path(root) if root is not None else ROOT, hooks)
+    except UsageError as exc:
+        print(f"error: {scrub(str(exc))}", file=sys.stderr)
+        return EXIT_USAGE
+    except (FinetuneError, OSError, ValueError, ImportError) as exc:
+        print(f"error: {scrub(str(exc))}", file=sys.stderr)
+        return EXIT_ERROR
+    except Exception:
+        print(scrub(traceback.format_exc()), file=sys.stderr)
+        return EXIT_ERROR
