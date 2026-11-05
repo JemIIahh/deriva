@@ -8,7 +8,11 @@ settings ask for it).
 
 `taskdev.jsonl` holds the task items the dev split's alpha is chosen on. It is drawn from the items
 that neither train nor heldout took: a third pass over the same seeded ranking, so the train and
-heldout assignment (and their bytes) cannot move when it is switched on.
+heldout assignment (and their bytes) cannot move when it is switched on. In the code that holds
+only up to CuratorKIT: after that it relies on CuratorKIT 0.1.22 keeping the first sample of a
+MinHash duplicate group and passing unlisted strata through its samplers, which the unit tests do
+not exercise (they stand in for CuratorKIT). The guard is the sha256 of the real train.jsonl and
+heldout.jsonl, to be re-checked after any CuratorKIT upgrade.
 
 CuratorKIT's exporters write only the `messages` of a sample, never its id, language or gold, and
 its gates cannot build a prompt, so the two thin steps around it live here, in pure Python with

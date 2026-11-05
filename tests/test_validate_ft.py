@@ -1193,3 +1193,49 @@ def test_cli_a_taskdev_path_that_was_named_but_does_not_exist_is_an_error_not_a_
     result = cli(ft_dir, *FOUR_LANGS, "--taskdev", str(ft_dir / "ft" / "typo.jsonl"))
     assert result.returncode == 2
     assert "typo.jsonl" in result.stderr and "--taskdev" in result.stderr
+
+
+# --- the id prefix names the record's language -------------------------------------------------
+
+
+@pytest.mark.parametrize("where", ["train", "heldout", "taskdev"])
+def test_an_id_whose_prefix_is_not_the_records_lang_is_a_format_failure_in_every_file(where):
+    train, held = sets()
+    dev = devs()
+    bad = rec("sw", 5000, rid="en:history/test/5000")  # a Swahili record whose id says English
+    {"train": train, "heldout": held, "taskdev": dev}[where][-1] = bad
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"format"}
+    (problem,) = report.problems
+    assert problem.where == where and problem.id == bad["id"]
+    assert where in problem.message and bad["id"] in problem.message  # names the file and the id
+    assert "sw" in problem.message
+
+
+@pytest.mark.parametrize("where", ["train", "heldout", "taskdev"])
+def test_an_id_with_no_language_prefix_at_all_is_a_format_failure_in_every_file(where):
+    train, held = sets()
+    dev = devs()
+    {"train": train, "heldout": held, "taskdev": dev}[where][-1] = rec("sw", 5000, rid="history-test-5000")
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"format"} and report.problems[0].where == where
+
+
+def test_ids_that_start_with_their_own_lang_are_clean_in_all_five_languages():
+    train, held = sets(langs=LANGS)
+    dev = devs(langs=LANGS)
+    assert ftdata.validate(train, held, taskdev=dev, expected_langs=LANGS).ok
+
+
+def test_cli_a_mislabelled_id_fails_with_the_format_exit_code(ft_dir):
+    train, _ = sets()
+    train[-1] = rec("sw", 5000, rid="en:history/test/5000")
+    write_ft(ft_dir / "ft" / "train.jsonl", train)
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert result.returncode == ftdata.EXIT_CODES["format"], result.stdout + result.stderr
+    assert "en:history/test/5000" in result.stdout
+
+
+def test_the_help_description_mentions_the_taskdev_file():
+    result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, encoding="utf-8")
+    assert "taskdev.jsonl" in result.stdout.split("options:")[0]

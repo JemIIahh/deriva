@@ -634,3 +634,89 @@ def test_load_settings_reads_the_optional_taskdev_keys_together_or_not_at_all(tm
         ftprep.load_settings(write(taskdev_cap=6))
     with pytest.raises(ValueError, match="taskdev"):
         ftprep.load_settings(write(taskdev_pool=3, taskdev_cap=6))  # the pool cannot be smaller than the cap
+
+
+# --- the seeded selection is pinned, not just self-consistent ------------------------------------
+#
+# The tests above compare the pipeline with itself (disjoint, deterministic, parallel). These compute
+# the expected selection from the documented ranking, so a different seed, a re-salted or reversed
+# leftover order, or a different tie-break changes the files and fails here.
+
+
+def test_global_ranking_is_the_sha256_of_seed_and_item_ascending():
+    import hashlib
+
+    ids = [f"s/test/{i}" for i in range(30)]
+    by_hand = sorted(ids, key=lambda i: hashlib.sha256(f"7|{i}".encode()).hexdigest())
+    assert ftprep.global_ranking(ids, 7) == by_hand
+    assert ftprep.global_ranking(ids, 8) != by_hand
+
+
+def test_assign_splits_takes_heldout_then_train_then_taskdev_as_consecutive_stretches_of_the_ranking():
+    ids = [f"s/test/{i:03d}" for i in range(120)]
+    ranking = ftprep.global_ranking(ids, 11)
+    split = ftprep.assign_splits(ids, seed=11, heldout_pool=10, train_pool=50, taskdev_pool=12)
+    assert [i for i in ranking if split.get(i) == "heldout"] == ranking[:10]
+    assert [i for i in ranking if split.get(i) == "train"] == ranking[10:60]
+    assert [i for i in ranking if split.get(i) == "taskdev"] == ranking[60:72]  # the next ones, in order
+    assert not {split.get(i) for i in ranking[72:]} - {None}  # everything after is unused
+
+
+def test_assign_splits_taskdev_is_the_first_leftover_groups_in_ranking_order_skipping_ones_that_do_not_fit():
+    ids = [f"s/test/{i:03d}" for i in range(100)]
+    group_of = {i: f"g{start}" for start in range(0, 60, 5) for i in ids[start : start + 5]}  # twelve groups of five
+    seed = 2
+    base = ftprep.assign_splits(ids, seed=seed, heldout_pool=10, train_pool=30, group_of=group_of)
+    with_dev = ftprep.assign_splits(ids, seed=seed, heldout_pool=10, train_pool=30, group_of=group_of, taskdev_pool=12)
+    members: dict[str, list[str]] = {}
+    for i in ids:
+        members.setdefault(group_of.get(i, i), []).append(i)
+    ranking = ftprep.global_ranking(members, seed)
+    leftover = [g for g in ranking if not any(m in base for m in members[g])]
+    expected, room, skipped = [], 12, 0
+    for g in leftover:  # the rule, written out: take a group if it fits the room left, else pass it by
+        if len(members[g]) <= room:
+            expected.append(g)
+            room -= len(members[g])
+        elif expected:
+            skipped += 1
+    assert skipped >= 1, "pick a seed where a too-large group is passed over, or this test pins nothing about skipping"
+    taken = [g for g in ranking if any(with_dev.get(m) == "taskdev" for m in members[g])]
+    assert taken == expected
+
+
+def test_prepare_selects_heldout_train_and_taskdev_by_the_ranking_of_the_item_ids(tmp_path):
+    make_raw(tmp_path, n=60)
+    cands, _ = ftprep.prepare(tmp_path, ("en", "hi"), ALLOWED, seed=3, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    ranking = ftprep.global_ranking([f"high_school_geography/test/{i}" for i in range(60)], 3)
+    chosen = {s: {c["item"] for c in cands if c["split"] == s} for s in ("heldout", "train", "taskdev")}
+    assert chosen["heldout"] == set(ranking[:6])
+    assert chosen["train"] == set(ranking[6:26])
+    assert chosen["taskdev"] == set(ranking[26:34])
+    other, _ = ftprep.prepare(tmp_path, ("en", "hi"), ALLOWED, seed=4, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    assert {c["item"] for c in other if c["split"] == "taskdev"} != chosen["taskdev"]  # the seed is what decides
+
+
+def test_cap_taskdev_keeps_the_best_ranked_items_even_when_rank_runs_against_the_id_order():
+    # item 9 has the best rank (0) and item 0 the worst (9): rank and id order are opposite
+    survivors = [cand(lang, i, split="taskdev", rank=9 - i) for lang in ("en", "hi") for i in range(10)]
+    kept = ftprep.cap_taskdev(survivors, cap=4)
+    for lang in ("en", "hi"):
+        rows = [c for c in kept if c["lang"] == lang]
+        assert [c["item"] for c in rows] == [f"high_school_geography/test/{i}" for i in (9, 8, 7, 6)]  # in rank order
+
+
+def test_cap_taskdev_fills_from_the_languages_own_best_ranked_rows_by_rank_not_by_id():
+    survivors = [cand("en", i, split="taskdev", rank=9 - i) for i in range(10)]
+    survivors += [cand("hi", i, split="taskdev", rank=9 - i) for i in (0, 1, 8, 9)]
+    kept = ftprep.cap_taskdev(survivors, cap=6)
+    en = {c["item"].rsplit("/", 1)[1] for c in kept if c["lang"] == "en"}
+    assert en == {"0", "1", "8", "9", "7", "6"}  # the four shared, then its two best-ranked others (7 and 6)
+    hi = {c["item"].rsplit("/", 1)[1] for c in kept if c["lang"] == "hi"}
+    assert hi == {"0", "1", "8", "9"}
+
+
+def test_cap_taskdev_breaks_a_rank_tie_by_id():
+    survivors = [cand("en", i, split="taskdev", rank=5) for i in (3, 1, 2, 0)]
+    kept = ftprep.cap_taskdev(survivors, cap=2)
+    assert [c["item"].rsplit("/", 1)[1] for c in kept] == ["0", "1"]

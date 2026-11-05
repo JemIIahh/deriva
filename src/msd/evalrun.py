@@ -31,7 +31,8 @@ Stages (`--stages generate,judge,task`, default all three; they always run in th
 
 Task items (model-evaluated, closed form): the report split uses `<ft-dir>/heldout.jsonl`, the dev split uses
 `<ft-dir>/taskdev.jsonl`. A record is `{id, lang, messages: [user, assistant], gold}`; the user turn becomes a
-`Prompt(kind="task", gold=...)`. A missing task file (taskdev.jsonl is built by a later task) or a language with
+`Prompt(kind="task", gold=...)`. A missing task file (taskdev.jsonl is built by scripts/build_ft_data.py, prepare then finalize, once
+`taskdev_pool` and `taskdev_cap` are set in pipelines/ft_data.yaml) or a language with
 no rows in it is skipped loudly ("task: skipped (no <file>)", `task_skipped` in the summary and in eval.json),
 never silently and never as an error. `--limit` applies to task items as well.
 
@@ -107,7 +108,8 @@ JUDGE_ERROR_MAX = 0.10  # a language whose judge_error rate is above this fails 
 TRUNCATION_WARN = 0.05  # a truncation rate above this is warned about (overall, and for safety items alone)
 EMPTY_ERROR_WARN = 0.05  # so is a share of empty or finish_reason=error generations above this
 
-# The fine-tune held-out file that holds the task items of each split. The dev one is built by a later task.
+# The fine-tune file that holds the task items of each split. The dev one is built by scripts/build_ft_data.py
+# (prepare, then finalize) when pipelines/ft_data.yaml sets taskdev_pool and taskdev_cap.
 TASK_FILES: dict[str, str] = {"report": "heldout.jsonl", "dev": "taskdev.jsonl"}
 
 JUDGED_KINDS: tuple[str, ...] = tuple(JUDGE_TEMPLATES)  # harmful, benign_edgy

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Validate the fine-tuning data (train.jsonl and heldout.jsonl).
+"""Validate the fine-tuning data (train.jsonl and heldout.jsonl, and the dev task file taskdev.jsonl when it exists).
 
 A thin command-line wrapper over `msd.ftdata`; see that module for every rule.
 

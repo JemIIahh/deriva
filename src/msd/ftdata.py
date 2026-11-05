@@ -13,7 +13,8 @@ line (`scripts/validate_ft_data.py`) maps a single failing class to its own exit
 
 Rules, by class:
   format        exact keys, roles user then assistant only, non-empty text, valid language code,
-                gold present, no duplicate ids (inside a split or across the two)
+                gold present, the id starts with `<lang>:` (its own language code), no duplicate
+                ids (inside a split or across the two)
   refusal       no refusal-style assistant turn (REFUSAL_PATTERNS, every list applied to every turn)
   answer        the assistant turn is the bare gold answer and equals gold under score_task;
                 multiple-choice gold is an upper-case letter that the prompt lists; free-form gold
@@ -535,6 +536,8 @@ def _check_split(
             continue
         usable.append(rec)
         rid = rec["id"]
+        if rid.split(":", 1)[0] != rec["lang"] or ":" not in rid:  # ids are `<lang>:<item>`; the lang is what item_key strips
+            problems.append(Problem("format", where, rid, f"{where} id {rid!r} must start with '{rec['lang']}:' (the record's lang)"))
         hit = refusal_match(_assistant(rec))
         if hit:
             problems.append(Problem("refusal", where, rid, f"assistant turn {clip(_assistant(rec))!r} looks like a refusal ({hit[0]} pattern)"))

@@ -144,6 +144,19 @@ file loads through `evalrun.read_task_records` and `task_prompts(..., split="dev
   with `train.jsonl` or `heldout.jsonl`, and also 0 with the whole train and heldout pools
   (including the rows capped off); 0 shared normalised prompts; the 30 distinct (language,
   passage) pairs in taskdev (12% of rows carry a passage) appear in neither file.
+- What that does and does not rule out: every overlap check (the validator's and the independent
+  one) is an exact match after normalisation (`norm_text`: NFKC, case, whitespace, Arabic marks),
+  on the source item id, the whole prompt, and the passage. "0 shared normalised prompts" therefore
+  does not mean "no repeated questions": the whole prompt includes the options, so the same
+  question asked with a different option set is a different prompt. There is one such source-dataset
+  twin, found by comparing the question text above the options: `astronomy/test/9` (taskdev) and
+  `astronomy/test/116` (train) have the same question stem and the same correct answer (the comet
+  nuclei option, letter D in both) in en, ar and sw (the Hindi stems are translated differently
+  and do not match), because Global-MMLU itself repeats the question with a slightly different set
+  of options. It is 1 of the 200 items; it is a different item id, so no rule can call it a leak,
+  and CuratorKIT's MinHash (0.85) did not drop it, most likely because the option sets differ (not
+  checked further). An exact-stem scan of
+  all four languages against train and heldout found no other.
 - Composition: 14 subjects, psychology 30, biology 22, human aging 19, nutrition 18, prehistory
   16, physics 15, astronomy 14, geography 13, government, world history, anatomy and US history
   11 each, global facts 7, European history 2 (the pool is a random draw, so the mix is whatever
