@@ -166,24 +166,128 @@ def test_verify_freeze_script_exit_codes_for_missing_and_extra(tmp_path, build):
 # --- freezing ----------------------------------------------------------------------------
 
 
-def test_freeze_refuses_a_partial_set_unless_allowed(tmp_path, build):
-    build(langs=("en",))  # English only, no freeze
+def test_real_freeze_refuses_a_partial_set(tmp_path, build, freeze_kwargs):
+    summary = build(langs=("en",))  # English only, no freeze
     out = tmp_path / "testset"
     with pytest.raises(ValueError, match="hinglish"):
-        testset.freeze(out)
+        testset.freeze(out, summary=summary, **freeze_kwargs)
     assert not (out / "MANIFEST.json").exists()
-    manifest = testset.freeze(out, require_langs=("en",))  # explicit partial freeze for a dry check
-    assert sorted(manifest) == ["en/dev.jsonl", "en/report.jsonl"]
+    assert not (out / "MANIFEST.dry.json").exists()
 
 
 def test_freeze_is_deterministic_and_rebuild_is_byte_identical(tmp_path, build):
     build(freeze=True)
     out = tmp_path / "testset"
     first = (out / "MANIFEST.json").read_bytes()
-    build(freeze=True)
+    build(freeze=True, refreeze=True)  # an explicit re-freeze of the same inputs
     assert (out / "MANIFEST.json").read_bytes() == first
 
 
 def test_build_freeze_flag_with_partial_langs_is_refused(tmp_path, build):
     with pytest.raises(ValueError, match="partial"):
         build(langs=("en",), freeze=True)
+
+
+# --- fix round 1, I1: the real freeze is complete or it is not a freeze ---------------------------------
+
+
+def _write_manifest(out, name, files):
+    manifest = {
+        rel: {"sha256": hashlib.sha256((out / rel).read_bytes()).hexdigest(), "n": _line_count(out / rel)}
+        for rel in files
+    }
+    (out / name).write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def test_verify_freeze_fails_for_a_partial_manifest_under_the_real_name(tmp_path, build):
+    build(langs=("en",))
+    out = tmp_path / "testset"
+    _write_manifest(out, "MANIFEST.json", ["en/dev.jsonl", "en/report.jsonl"])  # self-consistent but partial
+    problems = testset.verify_freeze(out)
+    assert any("hi/dev.jsonl" in p and "not listed" in p for p in problems)
+    assert any("sw/report.jsonl" in p and "not listed" in p for p in problems)
+    script = [sys.executable, str(SCRIPTS / "verify_freeze.py"), "--dir", str(out)]
+    assert subprocess.run(script, capture_output=True, text=True).returncode != 0
+
+
+def test_verify_freeze_fails_for_an_empty_manifest(tmp_path, build):
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    (empty_dir / "MANIFEST.json").write_text("{}", encoding="utf-8")
+    assert testset.verify_freeze(empty_dir)
+    build()  # a complete set on disk, but an empty manifest
+    full = tmp_path / "testset"
+    (full / "MANIFEST.json").write_text("{}", encoding="utf-8")
+    problems = testset.verify_freeze(full)
+    assert any("not listed" in p for p in problems) and any("not in MANIFEST" in p for p in problems)
+
+
+def test_verify_freeze_fails_when_a_language_file_and_its_entry_are_both_dropped(tmp_path, build):
+    build(freeze=True)
+    out = tmp_path / "testset"
+    manifest = json.loads((out / "MANIFEST.json").read_text(encoding="utf-8"))
+    del manifest["sw/report.jsonl"]
+    (out / "sw" / "report.jsonl").unlink()
+    (out / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+    problems = testset.verify_freeze(out)
+    assert any("sw/report.jsonl" in p and "not listed" in p for p in problems)
+
+
+def test_verify_freeze_fails_for_a_manifest_entry_that_is_not_a_test_set_file(tmp_path, build):
+    build(freeze=True)
+    out = tmp_path / "testset"
+    (out / "en" / "extra.jsonl").write_text('{"x": 1}\n', encoding="utf-8")
+    manifest = json.loads((out / "MANIFEST.json").read_text(encoding="utf-8"))
+    manifest["en/extra.jsonl"] = {"sha256": hashlib.sha256((out / "en" / "extra.jsonl").read_bytes()).hexdigest(), "n": 1}
+    (out / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert any("en/extra.jsonl" in p and "not a test-set file" in p for p in testset.verify_freeze(out))
+
+
+def test_verify_freeze_fails_for_empty_test_set_files(tmp_path):
+    out = tmp_path / "t"
+    for lang in LANGS:
+        (out / lang).mkdir(parents=True)
+        for split in ("dev", "report"):
+            (out / lang / f"{split}.jsonl").write_bytes(b"")
+    _write_manifest(out, "MANIFEST.json", EXPECTED_FILES)
+    problems = testset.verify_freeze(out)
+    assert any("n is 0" in p for p in problems)
+
+
+def test_dry_freeze_writes_the_dry_manifest_and_never_the_real_name(tmp_path, build):
+    build(langs=("en",))
+    out = tmp_path / "testset"
+    result = testset.freeze(out, dry=True)
+    assert (out / "MANIFEST.dry.json").is_file() and not (out / "MANIFEST.json").exists()
+    assert sorted(result.manifest) == ["en/dev.jsonl", "en/report.jsonl"]
+    assert testset.verify_freeze(out, dry=True) == []
+    assert any("MANIFEST.json" in p for p in testset.verify_freeze(out))  # not a real freeze
+
+
+def test_dry_verify_still_catches_changed_missing_and_extra_files(tmp_path, build):
+    build(langs=("en",))
+    out = tmp_path / "testset"
+    testset.freeze(out, dry=True)
+    script = [sys.executable, str(SCRIPTS / "verify_freeze.py"), "--dry", "--dir", str(out)]
+    assert subprocess.run(script, capture_output=True, text=True).returncode == 0
+
+    target = out / "en" / "dev.jsonl"
+    original = target.read_bytes()
+    target.write_bytes(original.replace(b"harm", b"hurm", 1))
+    changed = subprocess.run(script, capture_output=True, text=True)
+    assert changed.returncode != 0 and "en/dev.jsonl" in changed.stdout
+    target.write_bytes(original)
+
+    (out / "hi").mkdir()
+    (out / "hi" / "dev.jsonl").write_text("{}\n", encoding="utf-8")  # built after the dry freeze
+    assert any("hi/dev.jsonl" in p and "not in" in p for p in testset.verify_freeze(out, dry=True))
+    (out / "hi" / "dev.jsonl").unlink()
+    target.unlink()
+    assert any("en/dev.jsonl" in p and "missing" in p for p in testset.verify_freeze(out, dry=True))
+
+
+def test_a_dry_manifest_next_to_a_real_freeze_is_not_an_extra_file(tmp_path, build):
+    build(langs=("en",))
+    testset.freeze(tmp_path / "testset", dry=True)
+    build(freeze=True)  # a dry manifest never blocks the real build and freeze
+    assert testset.verify_freeze(tmp_path / "testset") == []

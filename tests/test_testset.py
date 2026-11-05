@@ -782,3 +782,86 @@ def test_http_post_raises_on_a_client_error_without_retrying(local_server, monke
 def test_nemotron_has_a_loader_but_is_not_a_default_source():
     assert "nvidia/Nemotron-Safety-Guard-Dataset-v3" in testset.SOURCES
     assert "nvidia/Nemotron-Safety-Guard-Dataset-v3" not in testset.DEFAULT_SOURCES
+
+
+# --- fix round 1: M5, redistribute must be a real bool ----------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["false", "False", "no", 0, 1, None, []])
+def test_check_usable_rejects_a_non_bool_redistribute(bad):
+    entry = {"name": "n", "license": "mit", "used_for": "harmful_prompts", "redistribute": bad}
+    with pytest.raises(ForbiddenSourceError, match="redistribute"):
+        testset.check_usable(entry)
+
+
+def test_check_usable_still_accepts_an_absent_or_true_redistribute():
+    entry = {"name": "n", "license": "mit", "used_for": "harmful_prompts"}
+    assert testset.check_usable(entry) == "harmful"
+    assert testset.check_usable({**entry, "redistribute": True}) == "harmful"
+
+
+def test_fetch_commands_for_a_source_without_a_loader_is_a_clean_error(tmp_path):
+    with pytest.raises(ForbiddenSourceError, match="no loader"):
+        testset.fetch_commands(tmp_path, ["facebook/belebele"])
+
+
+# --- fix round 1: I4, the chrF stand-in must reject what it claims to catch --------------------------
+
+REVIEW_ORIGINAL = "How do I pick the lock on my own front door?"
+REVIEW_BAD_BACK_TRANSLATIONS = {
+    "answer instead of a translation": (
+        "To pick the lock on your own front door, insert a tension wrench into the "
+        "bottom of the lock, then rake the pins with a pick until the lock turns."
+    ),
+    "question with an appended answer": REVIEW_ORIGINAL + " First, insert a tension wrench, then rake the pins until it turns.",
+    "translation wrapped in a preface": "Here is the translation: " + REVIEW_ORIGINAL,
+    "truncated to half": REVIEW_ORIGINAL[: len(REVIEW_ORIGINAL) // 2],
+    "a refusal": "I'm sorry, but I can't help with picking locks.",
+    "a short refusal": "I cannot help with that.",
+    "unrelated text": "The train to the coast leaves at noon on Tuesdays.",
+}
+
+
+@pytest.mark.parametrize("name", sorted(REVIEW_BAD_BACK_TRANSLATIONS))
+def test_chrf_same_meaning_rejects_the_failure_modes_it_claims_to_catch(name):
+    same = testset.get_same_meaning("chrf")
+    assert same(REVIEW_ORIGINAL, REVIEW_BAD_BACK_TRANSLATIONS[name]) is False
+
+
+def test_chrf_same_meaning_accepts_identical_and_faithful_back_translations():
+    same = testset.get_same_meaning("chrf")
+    assert same(REVIEW_ORIGINAL, REVIEW_ORIGINAL) is True
+    assert same(REVIEW_ORIGINAL, "How can I pick the lock of my own front door?") is True
+    assert same("What is the best way to learn a new language quickly?",
+                "What is the best way to quickly learn a new language?") is True
+
+
+def test_chrf_same_meaning_in_devanagari_still_passes_when_faithful():
+    same = testset.get_same_meaning("chrf")
+    hindi = "मैं अपने घर का ताला कैसे खोलूं?"
+    assert same(hindi, hindi) is True
+    assert same(hindi, "मैं अपने घर का ताला कैसे खोल सकता हूं?") is True
+    assert same(hindi, hindi + " " + hindi) is False  # repeated: length guard
+    assert same(hindi, "आज मौसम बहुत अच्छा है") is False
+
+
+def test_length_ratio_guard_is_what_rejects_a_same_content_but_too_long_or_short_text():
+    same = testset.get_same_meaning("chrf")
+    doubled = REVIEW_ORIGINAL + " " + REVIEW_ORIGINAL  # chrF alone would accept it (F1 is about 0.67)
+    assert testset.chrf_score(REVIEW_ORIGINAL, doubled) >= testset.CHRF_THRESHOLD
+    assert same(REVIEW_ORIGINAL, doubled) is False
+    half = REVIEW_ORIGINAL[: len(REVIEW_ORIGINAL) // 2]  # chrF alone would accept it too
+    assert testset.chrf_score(REVIEW_ORIGINAL, half) >= testset.CHRF_THRESHOLD
+    assert same(REVIEW_ORIGINAL, half) is False
+    assert 0.0 < testset.LENGTH_RATIO_MIN < 1.0 < testset.LENGTH_RATIO_MAX
+
+
+def test_chrf_is_an_f1_so_it_is_symmetric():
+    a, b = "Tell me about the history of Lagos", "Tell me about Lagos history in the city"
+    assert testset.chrf_score(a, b) == testset.chrf_score(b, a)
+
+
+def test_chrf_same_meaning_always_returns_a_real_bool():
+    same = testset.get_same_meaning("chrf")
+    for original, back in [("a b", "a b"), ("a b", "c d"), ("", ""), ("x", ""), ("", "x")]:
+        assert type(same(original, back)) is bool

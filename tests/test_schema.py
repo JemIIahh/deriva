@@ -74,3 +74,22 @@ def test_dataclasses_are_frozen():
                source="s", license="l")
     with pytest.raises(AttributeError):
         p.text = "y"
+
+
+def test_write_jsonl_writes_identical_bytes_on_any_platform(tmp_path, monkeypatch):
+    # text mode would turn "\n" into "\r\n" on Windows; newline="" keeps the bytes the same everywhere
+    from pathlib import Path
+
+    opened = []
+    real_open = Path.open
+
+    def spy(self, *args, **kwargs):
+        opened.append(kwargs)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy)
+    path = tmp_path / "rows.jsonl"
+    write_jsonl(path, [Prompt(id="p", lang="en", kind="harmful", text="a\nb", split="dev", source="s", license="mit")])
+    assert opened and opened[-1].get("newline") == ""
+    data = path.read_bytes()
+    assert b"\r" not in data and data.endswith(b"\n")

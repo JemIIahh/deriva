@@ -73,7 +73,7 @@ def write_jsonl(path: str | Path, rows: Iterable[object]) -> None:
     """Write dataclass rows, one JSON object per line, as raw UTF-8 (no \\u escapes)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
+    with path.open("w", encoding="utf-8", newline="") as fh:  # newline="": same bytes on every platform
         for row in rows:
             fh.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
 

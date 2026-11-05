@@ -21,46 +21,50 @@ def _raw_dir(raw, name):
     return raw / testset.entry_dirname(name)
 
 
-@pytest.fixture
-def raw(tmp_path):
-    """A few bland rows for every source (Nemotron too, which is not a default), in the real file formats."""
-    root = tmp_path / "raw"
+def make_raw(root, harmful_rows, benign_rows):
+    """Bland rows for every source (Nemotron too, which is not a default), in the real file formats."""
     d = lambda name, file: _raw_dir(root, name) / file  # noqa: E731
     write_csv_file(
         d("centerforaisafety/HarmBench", "harmbench_behaviors_text_all.csv"),
         ["Behavior", "FunctionalCategory", "SemanticCategory", "Tags", "ContextString", "BehaviorID"],
-        [[f"hb behavior {i}", "standard", "c", "", "", f"hb_{i}"] for i in range(6)],
+        [[f"hb behavior {i}", "standard", "c", "", "", f"hb_{i}"] for i in range(harmful_rows)],
     )
     write_csv_file(
         d("llm-attacks/llm-attacks (AdvBench)", "harmful_behaviors.csv"),
         ["goal", "target"],
-        [[f"adv goal {i}", "t"] for i in range(6)],
+        [[f"adv goal {i}", "t"] for i in range(harmful_rows)],
     )
     write_csv_file(
         d("DAMO-NLP-SG/MultiJail", "MultiJail.csv"),
         ["id", "source", "tags", "en"],
-        [[str(i), "s", "[]", f"mj english {i}"] for i in range(6)],
+        [[str(i), "s", "[]", f"mj english {i}"] for i in range(harmful_rows)],
         bom=True,
     )
     write_jsonl_file(
         d("CohereLabs/aya_redteaming", "aya_eng.jsonl"),
-        [{"prompt": f"aya english {i}", "language": "English"} for i in range(6)],
+        [{"prompt": f"aya english {i}", "language": "English"} for i in range(harmful_rows)],
     )
     write_jsonl_file(
         d("nvidia/Nemotron-Safety-Guard-Dataset-v3", "en_test.jsonl"),
-        [{"id": f"n{i}", "prompt": f"nemo english {i}", "prompt_label": "unsafe", "tag": "generic"} for i in range(6)],
+        [{"id": f"n{i}", "prompt": f"nemo english {i}", "prompt_label": "unsafe", "tag": "generic"}
+         for i in range(harmful_rows)],
     )
     write_csv_file(
         d("Paul/XSTest", "xstest_prompts.csv"),
         ["id", "prompt", "type", "label"],
-        [[str(i), f"xs safe {i}", "t", "safe"] for i in range(6)],
+        [[str(i), f"xs safe {i}", "t", "safe"] for i in range(benign_rows)],
     )
     write_csv_file(
         d("bench-llm/or-bench", "or-bench-hard-1k.csv"),
         ["prompt", "category"],
-        [[f"or hard {i}", "x"] for i in range(6)],
+        [[f"or hard {i}", "x"] for i in range(benign_rows)],
     )
     return root
+
+
+@pytest.fixture
+def raw(tmp_path):
+    return make_raw(tmp_path / "raw", 6, 6)
 
 
 def run(args, raw, tmp_path):
@@ -87,9 +91,11 @@ def _manifest_entries():
     return load_sources(Path(__file__).resolve().parent.parent / "data" / "sources.yaml")
 
 
-def test_full_identity_dry_run_freezes_and_verifies(raw, tmp_path):
+def test_full_identity_dry_run_freezes_and_verifies(tmp_path):
+    raw = make_raw(tmp_path / "raw_big", 120, 160)  # enough rows that dev and report are both non-empty
     res = run(["--translator", "identity", "--back-translator", "identity", "--same-meaning", "exact", "--freeze"], raw, tmp_path)
     assert res.returncode == 0, res.stderr
+    assert "MANIFEST.json sha256:" in res.stdout and "FREEZE_LOG.md" in res.stdout
     out = tmp_path / "out"
     manifest = json.loads((out / "MANIFEST.json").read_text(encoding="utf-8"))
     assert len(manifest) == 10
@@ -114,13 +120,17 @@ def test_a_forbidden_source_is_refused_with_exit_2(raw, tmp_path):
 
 
 def test_freeze_of_a_partial_build_is_refused_but_a_dry_freeze_is_labelled(raw, tmp_path):
+    out = tmp_path / "out"
     res = run(["--langs", "en", "--freeze"], raw, tmp_path)
     assert res.returncode == 2 and "partial" in res.stderr
-    assert not (tmp_path / "out" / "MANIFEST.json").exists()
+    assert not (out / "MANIFEST.json").exists() and not (out / "MANIFEST.dry.json").exists()
     dry = run(["--langs", "en", "--dry-freeze"], raw, tmp_path)
     assert dry.returncode == 0 and "NOT the real freeze" in dry.stdout
-    assert subprocess.run([*VERIFY, "--dir", str(tmp_path / "out")], capture_output=True, text=True).returncode == 0
-    only = subprocess.run([*BUILD, "--out", str(tmp_path / "out"), "--freeze-only"], capture_output=True, text=True)
+    # a dry freeze never writes the real manifest name, so the real verify fails and --dry passes
+    assert (out / "MANIFEST.dry.json").is_file() and not (out / "MANIFEST.json").exists()
+    assert subprocess.run([*VERIFY, "--dir", str(out)], capture_output=True, text=True).returncode != 0
+    assert subprocess.run([*VERIFY, "--dry", "--dir", str(out)], capture_output=True, text=True).returncode == 0
+    only = subprocess.run([*BUILD, "--raw", str(raw), "--out", str(out), "--freeze-only"], capture_output=True, text=True)
     assert only.returncode == 2 and "hinglish" in only.stderr  # the real freeze needs all five
 
 
@@ -137,3 +147,16 @@ def test_print_fetch_lists_the_curl_commands(tmp_path):
     assert res.returncode == 0
     lines = res.stdout.strip().splitlines()
     assert len(lines) == len(testset.DEFAULT_SOURCES) and all(line.startswith("curl ") for line in lines)
+
+
+def test_usage_errors_exit_2_with_a_message_and_no_traceback(raw, tmp_path):
+    for args in (["--langs", "xx"], ["--langs", ""], ["--translator", "zz=identity"], ["--back-translator", "klingon=identity"]):
+        res = run(args, raw, tmp_path)
+        assert res.returncode == 2, (args, res.stderr)
+        assert res.stderr.startswith("error:") and "Traceback" not in res.stderr
+
+
+def test_print_fetch_for_a_source_without_a_loader_is_a_clean_error(tmp_path):
+    res = subprocess.run([*BUILD, "--raw", str(tmp_path / "raw"), "--source", "facebook/belebele", "--print-fetch"],
+                         capture_output=True, text=True)
+    assert res.returncode == 2 and "no loader" in res.stderr and "Traceback" not in res.stderr

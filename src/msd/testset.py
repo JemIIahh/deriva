@@ -13,8 +13,10 @@ Pipeline (see scripts/build_testset.py and scripts/verify_freeze.py, thin CLIs o
                    check (`msd.translate.translate_with_qc`; a translation inherits the split of
                    its English item), check dev/report leakage per language, then write
                    `<out>/<lang>/{dev,report}.jsonl`.
-4. `freeze`        write MANIFEST.json (`{relative_path: {"sha256", "n"}}`); `verify_freeze`
-                   re-checks the files against it.
+4. `freeze`        write MANIFEST.json (`{relative_path: {"sha256", "n"}}`) for the complete
+                   five-language set, after checking it against the build record; a partial set
+                   can only get a dry manifest, MANIFEST.dry.json. `verify_freeze` re-checks the
+                   files against the manifest and fails unless all ten files are listed.
 
 Translators and the same-meaning check are chosen by name from small registries; the real ones
 (an MT model, an LLM endpoint) are built lazily so importing this module needs no model library
@@ -34,15 +36,15 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from msd.config import DEV_BENIGN_N, LANGS, NON_ENGLISH, PROBE_N, REPORT_BENIGN_N, REPORT_HARMFUL_N
-from msd.schema import Prompt, write_jsonl
+from msd.schema import Prompt, read_jsonl, write_jsonl
 from msd.splits import LeakageError, assert_no_leakage, norm_text
-from msd.translate import Translator, translate_with_qc
+from msd.translate import Translator, translate_with_qc, translated_id
 
 # --- constants -------------------------------------------------------------------------------
 
@@ -60,7 +62,10 @@ SIZES: dict[str, dict[str, int]] = {
 }
 
 MANIFEST_NAME = "MANIFEST.json"
+DRY_MANIFEST_NAME = "MANIFEST.dry.json"  # a dry or partial freeze; never the real name
+_MANIFEST_FILES = frozenset({MANIFEST_NAME, DRY_MANIFEST_NAME})
 _SPLIT_FILES = ("dev", "report")
+EXPECTED_FILES: tuple[str, ...] = tuple(f"{lang}/{split}.jsonl" for lang in LANGS for split in _SPLIT_FILES)
 
 
 class ForbiddenSourceError(ValueError):
@@ -73,6 +78,15 @@ class UnknownNameError(ValueError):
 
 class TranslatorConfigError(RuntimeError):
     """Raised when a translator cannot run because its configuration is missing."""
+
+
+class AlreadyFrozenError(RuntimeError):
+    """Raised when a build or freeze would touch a directory that already holds MANIFEST.json."""
+
+
+class ConsistencyError(ValueError):
+    """Raised when languages disagree with each other, or the files or inputs disagree with the
+    build record (seed, sources, sizes, raw-file hashes, output hashes, QC drops)."""
 
 
 # --- raw items and the pool ------------------------------------------------------------------
@@ -285,6 +299,8 @@ def fetch_commands(raw_root: str | Path, names: Sequence[str] = DEFAULT_SOURCES)
     """Shell commands that download the raw files of `names` into <raw_root>/<entry>/."""
     commands = []
     for name in names:
+        if name not in SOURCES:
+            raise ForbiddenSourceError(f"source {name!r} has no loader, so there is nothing to download")
         spec = SOURCES[name]
         for filename, url in spec.files.items():
             path = Path(raw_root) / entry_dirname(name) / filename
@@ -309,11 +325,18 @@ def check_usable(entry: Mapping[str, Any]) -> str:
             f"source {name!r} is used_for {used_for!r}, not one of {sorted(KIND_BY_ROLE)}; "
             "it may not feed the test set"
         )
-    if entry.get("redistribute", True) is False:
-        raise ForbiddenSourceError(
-            f"source {name!r} has redistribute: false (evaluation only); its items may not be copied "
-            "into the released test set"
-        )
+    if "redistribute" in entry:
+        redistribute = entry["redistribute"]
+        if not isinstance(redistribute, bool):
+            raise ForbiddenSourceError(
+                f"source {name!r} has redistribute: {redistribute!r}, which is not true or false; "
+                "fix the manifest rather than guess"
+            )
+        if redistribute is False:
+            raise ForbiddenSourceError(
+                f"source {name!r} has redistribute: false (evaluation only); its items may not be copied "
+                "into the released test set"
+            )
     return KIND_BY_ROLE[used_for]
 
 
@@ -471,23 +494,30 @@ def assign_splits(
 # --- the same-meaning check ------------------------------------------------------------------------
 
 # Heuristic stand-in until a model-based same-meaning judge is available (a different model family
-# judge can replace it): a back-translation is accepted when its chrF reaches this score. Picked by
-# hand, not calibrated: clean English paraphrases score about 0.3-0.8, unrelated sentences about
-# 0.1-0.2, so it is meant to catch refusals, truncation, wrong language and hallucination.
+# judge can replace it). A back-translation is accepted when its chrF-F1 against the original reaches
+# CHRF_THRESHOLD AND its length (after norm_text) is within [LENGTH_RATIO_MIN, LENGTH_RATIO_MAX] times
+# the original's. Picked by hand, not calibrated.
+#   Catches: a refusal, an answer instead of a translation, a translation with an answer appended,
+#   truncation, repetition and unrelated or wrong-language text. A short preface on a long prompt
+#   ("Here is the translation: ...") stays under the length ratio and is NOT caught.
+#   Cannot catch: a negation ("how do I stop X" vs "how do I X") or a different question on the same
+#   topic, because their characters are nearly the same. Spot-read the kept items per language.
 CHRF_THRESHOLD = 0.35
+LENGTH_RATIO_MIN = 0.6
+LENGTH_RATIO_MAX = 1.5
 
 
 def _ngram_counts(text: str, n: int) -> Counter:
     return Counter(text[i : i + n] for i in range(len(text) - n + 1))
 
 
-def chrf_score(original: str, back: str, max_n: int = 6, beta: float = 2.0) -> float:
+def chrf_score(original: str, back: str, max_n: int = 6, beta: float = 1.0) -> float:
     """Character n-gram F-score (chrF) of `back` against `original`, in [0, 1].
 
     Both texts go through `norm_text` and lose their spaces; for each n-gram order 1..max_n the
-    F-beta of n-gram precision and recall is computed (beta 2 weights recall, so a back-translation
-    that drops content scores low), and the orders that have n-grams on both sides are averaged.
-    Deterministic: no randomness and no model. Empty text scores 0.
+    F-beta of n-gram precision and recall is computed, and the orders that have n-grams on both
+    sides are averaged. beta 1 (F1) makes it symmetric: extra text lowers precision as much as
+    missing text lowers recall. Deterministic: no randomness and no model. Empty text scores 0.
     """
     ref = norm_text(original).replace(" ", "")
     hyp = norm_text(back).replace(" ", "")
@@ -512,7 +542,14 @@ def _exact_same_meaning() -> Callable[[str, str], bool]:
 
 
 def _chrf_same_meaning() -> Callable[[str, str], bool]:
-    return lambda original, back: chrf_score(original, back) >= CHRF_THRESHOLD
+    def same(original: str, back: str) -> bool:
+        reference = len(norm_text(original))
+        if reference == 0:
+            return False
+        ratio = len(norm_text(back)) / reference
+        return bool(LENGTH_RATIO_MIN <= ratio <= LENGTH_RATIO_MAX and chrf_score(original, back) >= CHRF_THRESHOLD)
+
+    return same
 
 
 SAME_MEANING: dict[str, Callable[[], Callable[[str, str], bool]]] = {
@@ -746,11 +783,15 @@ def build_testset(
             raise LeakageError(f"{lang}: {exc}") from exc
         kept = _count(prompts)
         dropped = {s: {k: english_counts[s][k] - kept[s][k] for k in KIND_ORDER} for s in SPLIT_ORDER}
+        kept_ids = {p.id for p in prompts}
         languages[lang] = {
             "kept": kept,
             "dropped": dropped,
             "kept_total": len(prompts),
             "dropped_total": len(english) - len(prompts),
+            # the English ids whose translation did not survive QC; check_consistency needs them to
+            # tell a QC drop from a silent gap
+            "dropped_ids": [e.id for e in english if lang != "en" and translated_id(e.id, lang) not in kept_ids],
         }
 
     for lang, prompts in by_lang.items():
@@ -770,18 +811,185 @@ def _english_summary(english: Sequence[Prompt], shortfalls: list[dict[str, Any]]
     }
 
 
-def _write_summary(path: Path, summary: dict[str, Any]) -> None:
-    """Write the build record; keep other languages' entries from an earlier run of the same build."""
-    if path.is_file():
-        try:
-            old = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            old = {}
-        same_build = all(old.get(k) == summary[k] for k in ("seed", "sources_used", "sizes"))
-        if same_build:
-            summary = {**summary, "languages": {**old.get("languages", {}), **summary["languages"]}}
+def _jsonl_text(rows: Iterable[Prompt]) -> str:
+    """The text `msd.schema.write_jsonl` writes for `rows` (kept equal by a test)."""
+    return "".join(json.dumps(asdict(row), ensure_ascii=False) + "\n" for row in rows)
+
+
+def english_digests(english: Sequence[Prompt]) -> dict[str, str]:
+    """sha256 of the two English files as `build_testset` will write them, taken before writing."""
+    return {
+        f"en/{split}.jsonl": hashlib.sha256(_jsonl_text(p for p in english if p.split == split).encode("utf-8")).hexdigest()
+        for split in _SPLIT_FILES
+    }
+
+
+def file_sha256(path: str | Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def raw_hashes(
+    raw_root: str | Path, names: Sequence[str], sources: Mapping[str, SourceSpec] | None = None
+) -> dict[str, dict[str, str]]:
+    """sha256 of every raw file of the sources `names`: {entry name: {file name: sha256}}."""
+    sources = SOURCES if sources is None else sources
+    hashes: dict[str, dict[str, str]] = {}
+    for name in names:
+        if name not in sources:
+            raise ForbiddenSourceError(f"source {name!r} has no loader")
+        raw_dir = Path(raw_root) / entry_dirname(name)
+        hashes[name] = {fn: file_sha256(_raw_path(raw_dir, fn, url)) for fn, url in sorted(sources[name].files.items())}
+    return hashes
+
+
+# --- the build record: what a run was built from, and what it produced ------------------------------------------
+
+
+def _build_config(
+    seed: int, source_names: Sequence[str], sizes: Mapping[str, Mapping[str, int]], raw: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "seed": seed,
+        "sources_used": list(source_names),
+        "sizes": {kind: dict(per_split) for kind, per_split in sizes.items()},
+        "raw_files": {name: dict(files) for name, files in raw.items()},
+    }
+
+
+def _config_problems(recorded: Mapping[str, Any], current: Mapping[str, Any]) -> list[str]:
+    """How the current inputs differ from the ones a build record was made with."""
+    problems = []
+    if recorded.get("seed") != current["seed"]:
+        problems.append(f"seed differs (recorded {recorded.get('seed')!r}, now {current['seed']!r})")
+    if recorded.get("sources_used") != current["sources_used"]:
+        problems.append(f"sources differ (recorded {recorded.get('sources_used')!r}, now {current['sources_used']!r})")
+    if recorded.get("sizes") != current["sizes"]:
+        problems.append(f"sizes differ (recorded {recorded.get('sizes')!r}, now {current['sizes']!r})")
+    recorded_raw = recorded.get("raw_files") or {}
+    for name in sorted(set(recorded_raw) | set(current["raw_files"])):
+        old, new = recorded_raw.get(name, {}), current["raw_files"].get(name, {})
+        for filename in sorted(set(old) | set(new)):
+            if old.get(filename) != new.get(filename):
+                was = (old.get(filename) or "none")[:12]
+                now = (new.get(filename) or "none")[:12]
+                problems.append(f"raw file {name}/{filename} changed (recorded sha256 {was}..., now {now}...)")
+    return problems
+
+
+def _load_record(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConsistencyError(f"build record {path} is not valid JSON ({exc}); move it away to start over") from exc
+    if not isinstance(record, dict):
+        raise ConsistencyError(f"build record {path} must be a JSON object; move it away to start over")
+    return record
+
+
+def _check_same_build(
+    record: Mapping[str, Any], config: Mapping[str, Any], digests: Mapping[str, str], where: Path
+) -> None:
+    """Refuse to add this run to `record` unless it was made from exactly the same inputs."""
+    problems = _config_problems(record, config)
+    recorded_outputs = record.get("outputs") or {}
+    for rel, digest in digests.items():
+        if rel in recorded_outputs and recorded_outputs[rel] != digest:
+            problems.append(f"the English set of this run differs: {rel} is not what the recorded build produced")
+    if problems:
+        raise ConsistencyError(
+            f"this run differs from the build recorded in {where}: " + "; ".join(problems)
+            + ". Languages from different inputs cannot share one test set; delete the record and "
+            "rebuild every language, or fix the inputs"
+        )
+
+
+def _merge_record(existing: Mapping[str, Any] | None, this: dict[str, Any]) -> dict[str, Any]:
+    if existing is None:
+        return this
+    return {
+        **this,
+        "languages": {**existing.get("languages", {}), **this["languages"]},
+        "outputs": {**existing.get("outputs", {}), **this["outputs"]},
+    }
+
+
+def _write_record(path: Path, record: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def check_consistency(out_dir: str | Path, summary: Mapping[str, Any], langs: Sequence[str] | None = None) -> None:
+    """Raise ConsistencyError unless every non-English row belongs to the English files.
+
+    For each language directory present (or each of `langs`): every row's id must be
+    `translated_id` of an English row in en/, in the same split (and in the file of that split),
+    with the same kind, source and license; and the language must have a row for every English
+    item except those the build record lists in `languages[lang]["dropped_ids"]` (a QC drop). A
+    row without an English partner, an English item that is missing without a recorded drop, or a
+    recorded drop that is present all fail, as does a language with no build record.
+    """
+    out_dir = Path(out_dir)
+    english: dict[str, Prompt] = {}
+    for split in _SPLIT_FILES:
+        path = out_dir / "en" / f"{split}.jsonl"
+        if not path.is_file():
+            raise ConsistencyError(f"en/{split}.jsonl is missing, so no language can be checked against English")
+        for row in read_jsonl(path, Prompt):
+            if row.split != split:
+                raise ConsistencyError(f"en/{split}.jsonl: row {row.id} has split {row.split!r}")
+            english[row.id] = row
+
+    problems: list[str] = []
+    for lang in langs if langs is not None else [l for l in NON_ENGLISH if (out_dir / l).is_dir()]:
+        record = (summary.get("languages") or {}).get(lang)
+        if not isinstance(record, Mapping) or not isinstance(record.get("dropped_ids"), list):
+            problems.append(f"{lang}: no build record (dropped ids) for this language; rebuild it")
+            continue
+        partner = {translated_id(en_id, lang): en_id for en_id in english}
+        present: set[str] = set()
+        for split in _SPLIT_FILES:
+            path = out_dir / lang / f"{split}.jsonl"
+            if not path.is_file():
+                problems.append(f"{lang}/{split}.jsonl is missing")
+                continue
+            for row in read_jsonl(path, Prompt):
+                en_id = partner.get(row.id)
+                if en_id is None:
+                    problems.append(f"{lang}/{split}.jsonl: row {row.id[:12]} has no English partner in en/")
+                    continue
+                if en_id in present:
+                    problems.append(f"{lang}/{split}.jsonl: a second row for English item {en_id}")
+                present.add(en_id)
+                eng = english[en_id]
+                if row.lang != lang:
+                    problems.append(f"{lang}/{split}.jsonl: row for {en_id} has lang {row.lang!r}")
+                if not (row.split == split == eng.split):
+                    problems.append(
+                        f"{lang}/{split}.jsonl: row for {en_id} has split {row.split!r} but its English item is "
+                        f"in split {eng.split!r}"
+                    )
+                for field in ("kind", "source", "license"):
+                    if getattr(row, field) != getattr(eng, field):
+                        problems.append(
+                            f"{lang}/{split}.jsonl: row for {en_id} has {field} {getattr(row, field)!r}, English has "
+                            f"{getattr(eng, field)!r}"
+                        )
+        dropped = set(record["dropped_ids"])
+        unknown = sorted(dropped - set(english))
+        if unknown:
+            problems.append(f"{lang}: recorded dropped ids that are not English items: {unknown[:3]}")
+        alive = sorted(dropped & present)
+        if alive:
+            problems.append(f"{lang}: {len(alive)} item(s) recorded as dropped by QC are present, e.g. {alive[:3]}")
+        gap = sorted(set(english) - present - dropped)
+        if gap:
+            problems.append(f"{lang}: {len(gap)} English item(s) have no {lang} row and no QC drop recorded, e.g. {gap[:3]}")
+    if problems:
+        shown = "\n  ".join(problems[:8])
+        more = f"\n  ... and {len(problems) - 8} more" if len(problems) > 8 else ""
+        raise ConsistencyError(f"{len(problems)} cross-language problem(s) under {out_dir}:\n  {shown}{more}")
 
 
 def run_build(
@@ -797,21 +1005,37 @@ def run_build(
     sizes: Mapping[str, Mapping[str, int]] = SIZES,
     same_meaning_name: str = DEFAULT_SAME_MEANING,
     freeze: bool = False,
+    refreeze: bool = False,
     summary_path: str | Path | None = None,
     sources: Mapping[str, SourceSpec] | None = None,
     max_chars: int = MAX_PROMPT_CHARS,
 ) -> dict[str, Any]:
-    """The whole build: pool, dedupe, split, translate, QC, leakage check, write, optionally freeze.
+    """The whole build: pool, dedupe, split, translate, QC, leakage, write, check, optionally freeze.
 
-    `langs` always gets English added. `freeze=True` needs all five languages. Returns the build
-    summary (and merges it into `summary_path` when given).
+    `langs` always gets English added. `freeze=True` needs all five languages. A directory that
+    already holds MANIFEST.json is refused (AlreadyFrozenError) unless `refreeze=True`. When
+    `summary_path` names an existing build record, this run must have been made from exactly the
+    same inputs (seed, sources, sizes, raw-file hashes, English output) or it is refused with
+    ConsistencyError before anything is written; its languages are then merged into the record.
+    At the end every language directory present is checked against the English files
+    (`check_consistency`). Returns the merged build record.
     """
+    out_dir = Path(out_dir)
     langs = _ordered_langs(langs)
     if freeze and set(langs) != set(LANGS):
         raise ValueError(f"refusing to freeze a partial test set (languages {list(langs)} of {list(LANGS)})")
+    if (out_dir / MANIFEST_NAME).exists() and not refreeze:
+        raise AlreadyFrozenError(
+            f"{out_dir} already holds {MANIFEST_NAME}: it is a frozen test set. Building or freezing over it needs "
+            "the explicit refreeze flag (--refreeze); then record the new manifest sha256 in the freeze log"
+        )
+    existing = _load_record(Path(summary_path)) if summary_path is not None else None
 
     pool, stats = load_pool(manifest, raw_root, source_names, sources, max_chars)
     english, shortfalls = assign_splits(pool, seed, sizes)
+    config = _build_config(seed, source_names, sizes, raw_hashes(raw_root, source_names, sources))
+    if existing is not None:
+        _check_same_build(existing, config, english_digests(english), Path(summary_path))
 
     # Resolve every translator by name now (each distinct name is built once) so a missing
     # dependency or environment variable fails before any translation work starts.
@@ -832,11 +1056,15 @@ def run_build(
     result = build_testset(out_dir, english, langs, plans, same_meaning)
 
     by_name = {entry["name"]: entry for entry in manifest}
-    summary: dict[str, Any] = {
-        "seed": seed,
-        "sources_used": list(source_names),
+    for lang in plans:
+        result["languages"][lang].update(
+            translator=translator_names[lang],
+            back_translator=back_translator_names[lang],
+            same_meaning=same_meaning_name,
+        )
+    this: dict[str, Any] = {
+        **config,
         "licenses": {name: by_name[name]["license"] for name in source_names},
-        "sizes": {kind: dict(per_split) for kind, per_split in sizes.items()},
         "pool": {
             "max_chars": max_chars,
             "loaded": stats.loaded,
@@ -847,22 +1075,33 @@ def run_build(
             "kept": stats.kept,
         },
         "english": _english_summary(english, shortfalls),
+        "outputs": {f"{lang}/{split}.jsonl": file_sha256(out_dir / lang / f"{split}.jsonl")
+                    for lang in result["languages"] for split in _SPLIT_FILES},
         "languages": result["languages"],
     }
-    for lang in plans:
-        summary["languages"][lang].update(
-            translator=translator_names[lang],
-            back_translator=back_translator_names[lang],
-            same_meaning=same_meaning_name,
-        )
-    if freeze:
-        _freeze_dir(out_dir)
+    summary = _merge_record(existing, this)
+    check_consistency(out_dir, summary)
     if summary_path is not None:
-        _write_summary(Path(summary_path), summary)
+        _write_record(Path(summary_path), summary)
+    if freeze:
+        frozen = _freeze_dir(
+            out_dir, summary=summary, raw_root=raw_root, seed=seed, source_names=source_names, sizes=sizes,
+            sources=sources, refreeze=refreeze,
+        )
+        summary["freeze"] = {"manifest": frozen.path.name, "sha256": frozen.sha256}
+        if summary_path is not None:
+            _write_record(Path(summary_path), summary)
     return summary
 
 
 # --- freezing and verifying ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FreezeResult:
+    manifest: dict[str, dict[str, Any]]  # {relative path: {"sha256", "n"}}
+    path: Path  # the manifest file written
+    sha256: str  # sha256 of that manifest file: the value for the freeze log
 
 
 def _row_count(data: bytes) -> int:
@@ -870,56 +1109,111 @@ def _row_count(data: bytes) -> int:
 
 
 def _all_files(out_dir: Path) -> list[str]:
-    return sorted(p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file() and p.name != MANIFEST_NAME)
+    files = (p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file())
+    return sorted(rel for rel in files if rel not in _MANIFEST_FILES)
 
 
-def freeze(out_dir: str | Path, require_langs: Sequence[str] = LANGS) -> dict[str, dict[str, Any]]:
-    """Hash every `<lang>/{dev,report}.jsonl` under `out_dir` into MANIFEST.json and return it.
+def freeze(
+    out_dir: str | Path,
+    *,
+    summary: Mapping[str, Any] | None = None,
+    raw_root: str | Path | None = None,
+    seed: int = DEFAULT_SEED,
+    source_names: Sequence[str] = DEFAULT_SOURCES,
+    sizes: Mapping[str, Mapping[str, int]] = SIZES,
+    sources: Mapping[str, SourceSpec] | None = None,
+    dry: bool = False,
+    refreeze: bool = False,
+) -> FreezeResult:
+    """Hash the test-set files under `out_dir` into a manifest and return what was written.
 
-    Raises ValueError, writing nothing, if a file for one of `require_langs` is missing or if any
-    file other than `<lang>/{dev,report}.jsonl` is present. Pass a shorter `require_langs` only for
-    a dry check; the real freeze needs all five languages.
+    The REAL freeze (`dry=False`) writes MANIFEST.json and needs all ten `<lang>/{dev,report}.jsonl`
+    files, none empty, no other file, and the build record `summary`. It refuses (nothing is
+    written) when: MANIFEST.json already exists and `refreeze` is false (AlreadyFrozenError); the
+    current `seed`, `source_names`, `sizes` or the sha256 of the raw files under `raw_root` differ
+    from the record, a file's sha256 differs from the one recorded when it was built, a language is
+    missing from the record, or the languages disagree with the English files
+    (`check_consistency`) (ConsistencyError). A dry freeze (`dry=True`) hashes whichever
+    `<lang>/{dev,report}.jsonl` files exist into MANIFEST.dry.json, which `verify_freeze(dry=True)`
+    checks; it makes no completeness or provenance claim and never uses the real name.
     """
     out_dir = Path(out_dir)
-    expected = {f"{lang}/{split}.jsonl" for lang in LANGS for split in _SPLIT_FILES}
+    if not dry and (out_dir / MANIFEST_NAME).exists() and not refreeze:
+        raise AlreadyFrozenError(
+            f"{out_dir / MANIFEST_NAME} already exists: this set is frozen. Freezing again needs the explicit "
+            "refreeze flag (--refreeze); then record the new manifest sha256 in the freeze log"
+        )
     files = _all_files(out_dir) if out_dir.is_dir() else []
-    unexpected = [f for f in files if f not in expected]
+    unexpected = [f for f in files if f not in EXPECTED_FILES]
     if unexpected:
         raise ValueError(f"unexpected files under {out_dir}, not a test-set file: {unexpected}")
-    missing = [f"{lang}/{split}.jsonl" for lang in require_langs for split in _SPLIT_FILES if f"{lang}/{split}.jsonl" not in files]
-    if missing:
-        raise ValueError(f"cannot freeze {out_dir}: missing {missing}")
+    if dry:
+        if not files:
+            raise ValueError(f"nothing to freeze under {out_dir}")
+    else:
+        missing = [f for f in EXPECTED_FILES if f not in files]
+        if missing:
+            raise ValueError(f"cannot freeze {out_dir}: missing {missing}")
+        empty = [f for f in files if _row_count((out_dir / f).read_bytes()) == 0]
+        if empty:
+            raise ValueError(f"cannot freeze {out_dir}: empty test-set files {empty}")
+        if summary is None or raw_root is None:
+            raise ValueError("a real freeze needs the build record (summary) and the raw_root of the build")
+        _check_record_for_freeze(out_dir, summary, _build_config(seed, source_names, sizes, raw_hashes(raw_root, source_names, sources)))
+
     manifest = {}
     for rel in files:
         data = (out_dir / rel).read_bytes()
         manifest[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "n": _row_count(data)}
-    (out_dir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return manifest
+    path = out_dir / (DRY_MANIFEST_NAME if dry else MANIFEST_NAME)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return FreezeResult(manifest=manifest, path=path, sha256=file_sha256(path))
 
 
 _freeze_dir = freeze  # `run_build` has a parameter called freeze
 
 
-def verify_freeze(out_dir: str | Path) -> list[str]:
-    """Compare `out_dir` with its MANIFEST.json; return one problem string per mismatch (empty if intact).
+def _check_record_for_freeze(out_dir: Path, summary: Mapping[str, Any], config: Mapping[str, Any]) -> None:
+    problems = _config_problems(summary, config)
+    outputs = summary.get("outputs") or {}
+    for rel in EXPECTED_FILES:
+        if rel not in outputs:
+            problems.append(f"{rel}: its sha256 is not in the build record")
+        elif outputs[rel] != file_sha256(out_dir / rel):
+            problems.append(f"{rel}: changed since the build record was made (recorded sha256 {outputs[rel][:12]}...)")
+    absent = [lang for lang in LANGS if lang not in (summary.get("languages") or {})]
+    if absent:
+        problems.append(f"the build record has no entry for {absent}")
+    if problems:
+        raise ConsistencyError("refusing to freeze: " + "; ".join(problems))
+    check_consistency(out_dir, summary, langs=NON_ENGLISH)
 
-    Problems: a missing manifest, a missing file, a changed byte (sha256), an `n` that no longer
-    matches the file's row count, and any file under `out_dir` that the manifest does not list.
+
+def verify_freeze(out_dir: str | Path, dry: bool = False) -> list[str]:
+    """Compare `out_dir` with its manifest; return one problem string per mismatch (empty if intact).
+
+    Real mode (default) checks MANIFEST.json and fails unless all ten `<lang>/{dev,report}.jsonl`
+    files are listed, exist, match their sha256 and `n`, are not empty, and no other file is present.
+    `dry=True` checks MANIFEST.dry.json (written by a dry freeze) with the same file-level checks
+    but no completeness requirement. A missing or unreadable manifest is a problem in both modes.
     """
     out_dir = Path(out_dir)
-    manifest_path = out_dir / MANIFEST_NAME
+    name = DRY_MANIFEST_NAME if dry else MANIFEST_NAME
+    manifest_path = out_dir / name
     if not manifest_path.is_file():
-        return [f"{MANIFEST_NAME} missing in {out_dir}"]
+        return [f"{name} missing in {out_dir}"]
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        return [f"{MANIFEST_NAME} is not valid JSON: {exc}"]
+        return [f"{name} is not valid JSON: {exc}"]
     if not isinstance(manifest, dict):
-        return [f"{MANIFEST_NAME} must be a JSON object of path -> {{sha256, n}}"]
+        return [f"{name} must be a JSON object of path -> {{sha256, n}}"]
 
     problems: list[str] = []
     for rel in sorted(manifest):
         info = manifest[rel]
+        if rel not in EXPECTED_FILES:
+            problems.append(f"{rel}: not a test-set file (expected <lang>/dev.jsonl or <lang>/report.jsonl)")
         if not (isinstance(info, dict) and isinstance(info.get("sha256"), str) and isinstance(info.get("n"), int)):
             problems.append(f"{rel}: manifest entry must be {{sha256: str, n: int}}")
             continue
@@ -934,5 +1228,13 @@ def verify_freeze(out_dir: str | Path) -> list[str]:
         rows = _row_count(data)
         if rows != info["n"]:
             problems.append(f"{rel}: n is {rows}, manifest says {info['n']}")
-    problems += [f"{rel}: not in {MANIFEST_NAME}" for rel in _all_files(out_dir) if rel not in manifest]
+        if rows == 0 and not dry:
+            problems.append(f"{rel}: n is 0; an empty file cannot be part of a freeze")
+    if not dry:
+        problems += [
+            f"{rel}: not listed in {name} (a real freeze lists all {len(EXPECTED_FILES)} test-set files)"
+            for rel in EXPECTED_FILES
+            if rel not in manifest
+        ]
+    problems += [f"{rel}: not in {name}" for rel in _all_files(out_dir) if rel not in manifest]
     return problems

@@ -131,3 +131,15 @@ def write_jsonl_file(path, rows):
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+
+
+@pytest.fixture
+def freeze_kwargs(tmp_path, fixture_sources):
+    """Keyword arguments that make `testset.freeze` (real) check the fixture build's record."""
+    return dict(
+        raw_root=tmp_path / "raw",
+        seed=7,
+        source_names=FIXTURE_NAMES,
+        sizes=TEST_SIZES,
+        sources=fixture_sources,
+    )
