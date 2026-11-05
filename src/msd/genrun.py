@@ -47,7 +47,7 @@ import traceback
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from msd import gen
 from msd.config import ARMS, LANGS
@@ -312,13 +312,25 @@ class _Plan:
     n_done: int
 
 
-def run(args: argparse.Namespace, available: list[tuple[str, Path]], root: Path) -> int:
+def run(
+    args: argparse.Namespace,
+    available: list[tuple[str, Path]],
+    root: Path,
+    *,
+    extra_prompts: Mapping[str, Sequence[Prompt]] | None = None,
+) -> int:
+    """Generate for every (language, test-set file) in `available`; return the exit code (0).
+
+    `extra_prompts` maps a language to prompts that are generated into the same gens file after the
+    test-set prompts (`msd.evalrun` adds the closed-form task items this way, so there is one gens file,
+    one meta and one resume rule per arm / alpha / language / split).
+    """
     # Everything that can be refused is refused here, for every language, before the first generation
     # and before any model load: duplicate prompt ids, a corrupt or foreign gens file (a dry scan with
     # the code `generate` uses), a missing or conflicting meta.
     plans: list[_Plan] = []
     for lang, path in available:
-        prompts = load_prompts(path, lang, args.split, args.limit)
+        prompts = load_prompts(path, lang, args.split, args.limit) + list((extra_prompts or {}).get(lang, ()))
         gens_file = gen.gens_path(args.out_root, args.split, args.arm, args.alpha, lang)
         meta_file = gen.meta_path(gens_file)
         n_done = len(gen.scan_existing(prompts, gens_file, arm=args.arm, alpha=args.alpha).done)

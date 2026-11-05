@@ -282,6 +282,18 @@ def test_alpha_goes_into_the_path_the_rows_and_the_meta(repo, scratch):
     assert json.loads(gen.meta_path(gens_file).read_text(encoding="utf-8"))["alpha"] == 0.25
 
 
+def test_extra_prompts_are_generated_into_the_same_gens_file_after_the_test_set(repo, scratch):
+    build_testset(repo, n=2)
+    args = genrun.parse_args(fake_args(scratch), root=repo)
+    extra = [Prompt("task-0", "en", "task", f"{MARK} question", "dev", "fixture", "fixture", "B")]
+    available = [("en", repo / "data" / "testset" / "en" / "dev.jsonl")]
+    assert genrun.run(args, available, repo, extra_prompts={"en": extra, "hi": extra}) == 0
+    rows = read_jsonl(gen.gens_path(scratch, "dev", "A0", None, "en"), Generation)
+    assert [r.prompt_id for r in rows] == ["en-0", "en-1", "task-0"]
+    assert json.loads(gen.meta_path(gen.gens_path(scratch, "dev", "A0", None, "en")).read_text())["n_rows"] == 3
+    assert genrun.run(args, available, repo, extra_prompts={"en": extra}) == 0  # a rerun has nothing to do
+
+
 def test_report_split_reads_report_files(repo, scratch):
     build_testset(repo, n=3, split="report")
     assert run_cli(repo, *fake_args(scratch, split="report")) == 0
