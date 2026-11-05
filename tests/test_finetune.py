@@ -73,6 +73,7 @@ class FakeTrainer:
             (out / "adapter_model.safetensors").write_bytes(b"fake adapter weights")
         (out / "checkpoint-250").mkdir()
         (out / "checkpoint-250" / "optimizer.pt").write_bytes(b"fake optimizer")
+        (out / "lexsi_provenance.json").write_text(json.dumps({"output_dir": str(out)}), encoding="utf-8")  # absolute paths
         history = owner.losses if owner.losses is not None else losses_down(min(steps, 6) if steps > 1 else 1)
         last = history[-1][1] if history else float("nan")
         return {
@@ -120,7 +121,7 @@ class FakeMerge:
         )
         if self.error is not None:
             raise self.error
-        out_dir.mkdir(parents=True)
+        out_dir.mkdir(parents=True, exist_ok=True)  # the real merge does too: it is handed a fresh partial folder
         (out_dir / "config.json").write_text("{}", encoding="utf-8")
         (out_dir / "model.safetensors").write_bytes(b"fake merged weights")
         (out_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
@@ -217,6 +218,7 @@ class World:
         self.factory = FakeFactory()
         self.merge = FakeMerge()
         self.out = self.root / "results" / "finetune" / "ft_lora"
+        self.work = self.root / "work" / "finetune" / "ft_lora"
 
     def raw(self):
         return yaml.safe_load(REAL_CONFIG.read_text(encoding="utf-8"))
@@ -261,6 +263,10 @@ def world(tmp_path):
 def _no_token_in_the_environment(monkeypatch):
     for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
         monkeypatch.delenv(name, raising=False)
+
+
+def partials(folder):
+    return sorted(p.name for p in Path(folder).rglob("*") if p.name.endswith(".partial"))
 
 
 def siblings(path):
@@ -401,7 +407,7 @@ def test_the_fixed_keywords_and_the_derived_ones(world):
     assert params["precision"] == "fp16"  # derived from fp16 true / bf16 false; AlignTune's AUTO could pick bf16 on a T4
     assert params["data_seed"] == params["seed"] == raw["train"]["seed"]
     assert params["dataset_name"] == str(world.root / "data" / "ft" / "train.jsonl")
-    assert Path(params["output_dir"]).name == raw["output"]["adapter_dir"]
+    assert Path(params["output_dir"]) == world.work  # AlignTune writes into the persistent work folder
     assert "quantization" not in params  # mode none: nothing quantised, nothing sent
     assert "max_steps" not in params  # not a smoke run
 
@@ -670,30 +676,40 @@ def test_a_full_run_writes_the_adapter_the_merged_model_and_the_summary(world):
     assert (world.out / "adapter" / "adapter_config.json").is_file()
     assert (world.out / "merged" / "model.safetensors").is_file() and (world.out / "merged" / "tokenizer.json").is_file()
     assert (world.out / "finetune_summary.json").is_file()
-    assert siblings(world.out) == ["ft_lora"]  # no partial folder left next to it
+    assert sorted(p.name for p in world.out.iterdir()) == ["adapter", "finetune_summary.json", "merged"]
+    assert partials(world.root) == [] and not world.work.exists()
     (call,) = world.merge.calls
     assert call["base_model"] == "CohereLabs/tiny-aya-global"
     assert call["dtype"] == "float16"
     assert call["adapter_existed"] is True  # the adapter was on disk when the merge was called
-    assert call["adapter_dir"].name == "adapter" and call["out_dir"].name == "merged"
-    assert call["adapter_dir"].parent == call["out_dir"].parent  # both inside the same (partial) output folder
+    assert call["adapter_dir"] == world.out / "adapter"  # the published adapter, not the trainer's work folder
+    assert call["out_dir"].parent == world.out and call["out_dir"].name.startswith(".merged.")  # merged/ is written atomically
     assert world.summary()["smoke"] is False and world.summary()["merged"] is True
 
 
-def test_the_merge_receives_the_adapter_folder_the_trainer_wrote(world):
+def test_the_trainer_writes_into_the_work_folder_and_the_adapter_is_copied_out(world):
     assert world.run() == 0
-    trainer_output = Path(world.factory.calls[0]["output_dir"])
-    assert world.merge.calls[0]["adapter_dir"] == trainer_output
+    assert Path(world.factory.calls[0]["output_dir"]) == world.work
+    assert (world.out / "adapter" / "adapter_model.safetensors").read_bytes() == b"fake adapter weights"
+    names = sorted(p.name for p in (world.out / "adapter").iterdir())
+    assert names == ["adapter_config.json", "adapter_model.safetensors"]  # no checkpoints, no provenance file with paths
+
+
+def test_work_folder_comes_from_the_config_stem_and_the_smoke_flag(tmp_path):
+    w = World(tmp_path)
+    assert w.run("--max-steps", "3") == 0
+    assert Path(w.factory.calls[0]["output_dir"]) == w.root / "work" / "finetune" / "ft_lora-smoke"
 
 
 def test_checkpoint_folders_are_removed_unless_kept(tmp_path):
     a = World(tmp_path, name="a")
     assert a.run() == 0
-    assert not (a.out / "adapter" / "checkpoint-250").exists()
+    assert not (a.out / "adapter" / "checkpoint-250").exists() and not a.work.exists()
     b = World(tmp_path, name="b")
     b.write_config(lambda d: d["output"].update(keep_checkpoints=True))
     assert b.run() == 0
-    assert (b.out / "adapter" / "checkpoint-250" / "optimizer.pt").is_file()
+    assert not (b.out / "adapter" / "checkpoint-250").exists()  # the published adapter never holds optimizer states
+    assert (b.work / "checkpoint-250" / "optimizer.pt").is_file()  # they stay in the work folder
 
 
 def test_folder_names_inside_out_come_from_the_config(tmp_path):
@@ -777,7 +793,8 @@ def failed_run(world, capsys, **factory_options):
     assert world.run() == 1
     err = capsys.readouterr().err
     assert not world.out.exists()
-    assert not any(name.endswith(".partial") for name in siblings(world.out))
+    assert partials(world.root) == []
+    assert world.work.is_dir() and "work/finetune/ft_lora" in err  # kept for recovery, and named
     return err
 
 
@@ -900,30 +917,65 @@ def test_the_tokenizer_is_loaded_for_the_base_model(world):
 # --- atomic output ------------------------------------------------------------------------------------------------
 
 
-def test_a_trainer_that_raises_leaves_nothing_behind(world, capsys):
+def test_a_trainer_that_raises_keeps_the_work_folder_and_names_it(world, capsys):
     world.factory = FakeFactory(fail_with=RuntimeError("CUDA out of memory"))
     assert world.run() == 1
-    assert "CUDA out of memory" in capsys.readouterr().err
-    assert not world.out.exists()
-    assert not any(n.endswith(".partial") for n in siblings(world.out))
+    err = capsys.readouterr().err
+    assert "CUDA out of memory" in err and "work/finetune/ft_lora" in err and "kept" in err
+    assert world.work.is_dir() and not world.out.exists() and partials(world.root) == []
     assert world.merge.calls == []
 
 
-def test_a_merge_that_raises_leaves_nothing_behind(world, capsys):
+def test_a_keyboard_interrupt_keeps_the_work_folder_and_names_it(world, capsys):
+    world.factory = FakeFactory(fail_with=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        world.run()
+    assert "work/finetune/ft_lora" in capsys.readouterr().err
+    assert world.work.is_dir() and not world.out.exists() and partials(world.root) == []
+
+
+def test_a_merge_that_raises_keeps_the_adapter_and_the_work_folder(world, capsys):
     world.merge = FakeMerge(error=MemoryError("not enough RAM"))
     assert world.run() == 1
     err = capsys.readouterr().err
-    assert "not enough RAM" in err
-    assert not world.out.exists()
-    assert not any(n.endswith(".partial") for n in siblings(world.out))
+    assert "not enough RAM" in err and "work/finetune/ft_lora" in err
+    assert "results/finetune/ft_lora/adapter" in err and "--merge-only" in err  # how to finish the job
+    assert (world.out / "adapter" / "adapter_config.json").is_file() and world.work.is_dir()
+    assert not (world.out / "merged").exists() and not (world.out / "finetune_summary.json").exists()
+    assert partials(world.root) == []
 
 
-def test_a_trainer_factory_that_cannot_be_built_leaves_nothing_behind(world, capsys):
+def test_the_summary_is_written_last_after_the_merge(world):
+    seen = []
+
+    class Spy(FakeMerge):
+        def __call__(self, base_model, adapter_dir, out_dir, *, dtype):
+            seen.append((world.out / "finetune_summary.json").exists())
+            super().__call__(base_model, adapter_dir, out_dir, dtype=dtype)
+
+    world.merge = Spy()
+    assert world.run() == 0
+    assert seen == [False]  # no summary while the merge runs: its presence means the run finished
+    assert (world.out / "finetune_summary.json").is_file()
+
+
+def test_a_trainer_factory_that_cannot_be_built_does_not_block_the_next_run(world, capsys):
     def broken(params, start_check=None):
         raise ImportError("No module named 'aligntune'")
 
     assert world.run(factory=broken) == 1
     assert not world.out.exists()
+    assert world.run() == 0  # the work folder holds only the template file: it is not a recovery state
+    assert not world.work.exists()
+
+
+def test_a_work_folder_with_recovery_files_is_not_overwritten(world, capsys):
+    world.work.mkdir(parents=True)
+    (world.work / "checkpoint-250").mkdir()
+    assert world.run() == 2
+    err = capsys.readouterr().err
+    assert "work/finetune/ft_lora" in err and "not empty" in err
+    assert world.factory.calls == [] and (world.work / "checkpoint-250").is_dir()
 
 
 def test_a_non_empty_out_is_a_usage_error_and_nothing_runs(world, capsys):
@@ -1033,6 +1085,119 @@ def test_the_real_device_and_versions_helpers_never_raise_without_the_libraries(
     versions = finetune.library_versions()
     assert set(versions) >= {"aligntune", "trl", "transformers", "peft", "torch"}
     assert all(v is None or isinstance(v, str) for v in versions.values())
+
+
+# --- merging a kept adapter without training again ---------------------------------------------------------------
+
+
+def make_adapter(world, **overrides):
+    """An adapter folder that matches the real config, as `--merge-only --adapter` receives it."""
+    cfg = world.raw()
+    folder = world.root / "kept" / "adapter"
+    folder.mkdir(parents=True)
+    data = {
+        "peft_type": "LORA", "base_model_name_or_path": cfg["base_model"], "r": cfg["lora"]["rank"],
+        "lora_alpha": cfg["lora"]["alpha"], "target_modules": sorted(cfg["lora"]["target_modules"]),
+    }
+    data.update(overrides)
+    (folder / "adapter_config.json").write_text(json.dumps(data), encoding="utf-8")
+    (folder / "adapter_model.safetensors").write_bytes(b"kept adapter weights")
+    return folder
+
+
+def merge_only(world, adapter, *extra, **kwargs):
+    kwargs.setdefault("factory", forbidden)  # nothing is trained
+    kwargs.setdefault("tokenizer_loader", forbidden)  # and no data or tokenizer is needed
+    return world.run("--merge-only", "--adapter", str(adapter), *extra, **kwargs)
+
+
+def test_merge_only_merges_the_adapter_a_failed_merge_left_behind(world, capsys):
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run() == 1
+    kept = world.out / "adapter"
+    world.merge = FakeMerge()
+    assert merge_only(world, kept) == 0
+    assert (world.out / "merged" / "model.safetensors").is_file()
+    (call,) = world.merge.calls
+    assert call["adapter_dir"] == kept and call["dtype"] == "float16" and call["base_model"] == "CohereLabs/tiny-aya-global"
+    assert partials(world.root) == []
+    summary = world.summary()  # the failed run wrote none: merge-only writes a minimal one
+    assert summary["merged"] is True and summary["merge"]["adapter"] == "results/finetune/ft_lora/adapter"
+    assert summary["merge"]["dtype"] == "float16" and summary["config"]["path"] == "configs/ft_lora.yaml"
+
+
+def test_merge_only_appends_a_merge_section_to_an_existing_summary(world):
+    assert world.run("--no-merge") == 0
+    before = world.summary()
+    assert before["merged"] is False and "merge" not in before
+    assert merge_only(world, world.out / "adapter") == 0
+    after = world.summary()
+    assert after["merged"] is True and after["merge"]["dtype"] == "float16"
+    for key in before:
+        if key not in ("merged", "merge"):
+            assert after[key] == before[key], key  # the training record is untouched
+    assert (world.out / "merged" / "config.json").is_file()
+
+
+def test_merge_only_takes_an_adapter_from_anywhere_and_writes_next_to_the_default_out(world):
+    kept = make_adapter(world)
+    assert merge_only(world, kept) == 0
+    assert (world.out / "merged" / "model.safetensors").is_file() and not (world.out / "adapter").exists()
+    assert world.summary()["merge"]["adapter"] == "kept/adapter"
+
+
+@pytest.mark.parametrize(
+    "overrides, found",
+    [
+        ({"base_model_name_or_path": "Someone/else"}, "base_model"),
+        ({"r": 8}, "rank"),
+        ({"target_modules": ["q_proj"]}, "target_modules"),
+    ],
+)
+def test_merge_only_refuses_an_adapter_that_does_not_match_the_config(world, capsys, overrides, found):
+    kept = make_adapter(world, **overrides)
+    assert merge_only(world, kept) == 1
+    assert found in capsys.readouterr().err
+    assert world.merge.calls == [] and not world.out.exists()
+
+
+def test_merge_only_refuses_a_folder_without_an_adapter(world, capsys):
+    empty = world.root / "empty"
+    empty.mkdir()
+    assert merge_only(world, empty) == 1
+    assert "adapter_config.json" in capsys.readouterr().err and world.merge.calls == []
+
+
+def test_merge_only_refuses_when_merged_already_exists(world, capsys):
+    assert world.run() == 0
+    assert merge_only(world, world.out / "adapter") == 2
+    err = capsys.readouterr().err
+    assert "merged" in err and "not empty" in err
+    assert len(world.merge.calls) == 1  # only the first run's merge
+
+
+def test_a_failed_merge_only_leaves_the_adapter_and_no_partial(world, capsys):
+    kept = make_adapter(world)
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert merge_only(world, kept) == 1
+    assert "not enough RAM" in capsys.readouterr().err
+    assert (kept / "adapter_config.json").is_file() and not (world.out / "merged").exists() and partials(world.root) == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--max-steps", "3"], ["--no-merge"], ["--seed", "5"], ["--dry-run"], ["--push-to", "org/name"], ["--data", "x.jsonl"]],
+)
+def test_merge_only_cannot_be_combined_with_training_options(world, capsys, extra, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", TOKEN)
+    assert merge_only(world, make_adapter(world), *extra, api_factory=forbidden) == 2
+    assert "--merge-only" in capsys.readouterr().err and world.merge.calls == []
+
+
+def test_merge_only_needs_an_adapter_and_an_adapter_needs_merge_only(world, capsys):
+    assert world.run("--merge-only") == 2
+    assert world.run("--adapter", str(make_adapter(world))) == 2
+    assert world.merge.calls == [] and world.factory.calls == []
 
 
 # --- pushing to the Hub -------------------------------------------------------------------------------------------

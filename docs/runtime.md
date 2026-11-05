@@ -272,10 +272,31 @@ STAGE_ARGS = "--config data/configs/ft_lora.yaml"
 STAGE_ARGS = "--config data/configs/ft_lora_strong.yaml"
 ```
 
-The notebook then uploads the whole of `results/finetune/` to the private workspace repo, merged weights included
-(about 6.7 GB in fp16 plus the adapter); a failed run exits non-zero, leaves no output folder and so uploads nothing.
-A killed session (SIGKILL, a dropped runtime) cannot clean up: the hidden `.ft_lora.<8 hex>.partial` folder stays and is
-named at the start of the next run, never deleted. AlignTune has no resume, so a dropped run starts again.
+The notebook then uploads `results/finetune/` to the private workspace repo, merged weights included
+(about 6.7 GB in fp16 plus the adapter); a failed run exits non-zero and uploads nothing it did not finish.
+
+**Where things are written.** AlignTune trains into a persistent work folder, `work/finetune/<config stem>[-smoke]/`
+(checkpoints every `save_steps`, the adapter files at the end). It is kept on ANY failure, including Ctrl-C, and the
+error names it; a later run refuses to start while it holds anything but the chat-template file, so a failed run
+cannot silently overwrite its own recovery files. After training the adapter is copied (without checkpoints) into its
+own folder `<out>/adapter`, then the merged weights go into `<out>/merged`, each written under a hidden `.partial`
+name and renamed only when whole, and `finetune_summary.json` is written last, so its presence means the run
+finished. A successful run deletes the work folder (`output.keep_checkpoints: true` keeps it). A killed session
+(SIGKILL, a dropped runtime) cannot clean up: a hidden `.<name>.<8 hex>.partial` folder stays and is named at the
+start of the next run, never deleted.
+
+**After a failure.** AlignTune itself has no resume: it has no switch to continue from a checkpoint, so a dropped run
+starts again. What is kept is for recovery by hand.
+
+- The merge failed (out of RAM, say): the error names `<out>/adapter`. Finish without training again:
+  `STAGE_ARGS = "--config data/configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter"`. It
+  checks that adapter against the config (base model, rank, alpha, target modules), merges into
+  `<out>/merged` and adds a `merge` section to `finetune_summary.json` (it writes a small one when the failed run
+  left none). It trains nothing and reads no data; it takes no `--data`, `--seed`, `--max-steps`, `--no-merge`,
+  `--dry-run` or `--push-to`.
+- Training failed or the session was interrupted: look in the named work folder for `checkpoint-<step>/`. Continuing
+  one needs your own script (`Trainer.train(resume_from_checkpoint=<folder>)`; UNVERIFIED that it works through
+  AlignTune's objects). Otherwise move or delete the work folder and run again.
 
 **Held-out accuracy check, A0 against A1** (the task items only; no judge and no API key). `run_eval.py` reads
 `data/ft/taskdev.jsonl` for `--split dev` and `data/ft/heldout.jsonl` for `--split report` and scores the bare answer

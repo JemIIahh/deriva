@@ -22,8 +22,12 @@ builds the trainer through AlignTune's `create_sft_trainer`, trains, checks that
 configured one, that the trainer saw every row and that the loss is finite and fell, merges the adapter into a
 fresh fp16 copy of the base model, and writes `finetune_summary.json` (config and data hashes, library versions,
 steps, sampled loss history, wall-clock seconds, seed, `smoke`, device, `loss_ok`; never a token or an absolute
-path). Everything goes into a hidden partial folder that is renamed to `--out` only when the run succeeded.
-`--max-steps N` is a smoke run: N steps, every step logged, merge only with `--merge`, never pushed.
+path). AlignTune trains into a persistent work folder `work/finetune/<config stem>[-smoke]/`, kept (and named
+in the error) on any failure; after training the adapter is copied into `<out>/adapter`, the merged weights go
+into `<out>/merged`, each under a hidden partial name that is renamed only when whole, and the summary is
+written last. `--max-steps N` is a smoke run: N steps, every step logged, merge only with `--merge`, never
+pushed. `--merge-only --adapter PATH` trains nothing: it checks that adapter against the config, merges it into
+`<out>/merged` and adds a `merge` section to the summary (the recovery after a failed merge).
 
 `--push-to ORG/NAME` uploads the merged folder after a successful full run, but only to a repo that already
 exists and for which `HfApi.repo_info(...).private is True` (checked before training starts). The token is read
@@ -77,7 +81,8 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
 SUMMARY_FILE = "finetune_summary.json"
 ADAPTER_CONFIG = "adapter_config.json"
 SMOKE_SUFFIX = "-smoke"
-TEMPLATE_FILE = "chat_template.jinja"
+TEMPLATE_FILE = "default_chat_template.jinja"  # not chat_template.jinja: the trainer saves its own under that name
+NOT_PUBLISHED = ("lexsi_provenance.json",)  # AlignTune's provenance file records absolute paths
 DEFAULT_TEMPLATE = "default"
 IGNORE_INDEX = -100  # PyTorch's cross-entropy ignore index: a label with this value takes no part in the loss
 ALIGNTUNE_VERSION = "0.1.31"
@@ -920,6 +925,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--push-to", type=_repo_id, metavar="ORG/NAME",
                     help="after a successful full run upload the merged folder to this PRIVATE Hub repo (HF_TOKEN from the environment)")
     ap.add_argument("--seed", type=_seed, help="seed (default: train.seed of the config)")
+    ap.add_argument("--merge-only", action="store_true",
+                    help="train nothing: merge the adapter given by --adapter into <out>/merged and add a merge section to the summary")
+    ap.add_argument("--adapter", type=Path, help="with --merge-only: the adapter folder to merge (e.g. <out>/adapter left by a failed merge)")
     return ap
 
 
@@ -928,6 +936,18 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     ap = build_parser()
     args = ap.parse_args(argv)
     args.smoke = args.max_steps is not None
+    if args.merge_only:
+        if args.adapter is None:
+            ap.error("--merge-only needs --adapter PATH, the adapter folder to merge")
+        given = (
+            ("--max-steps", args.smoke), ("--no-merge", args.merge is False), ("--seed", args.seed is not None),
+            ("--dry-run", args.dry_run), ("--push-to", bool(args.push_to)), ("--data", args.data is not None),
+        )
+        clash = [name for name, on in given if on]
+        if clash:
+            ap.error(f"--merge-only cannot be combined with {', '.join(clash)}: it merges an existing adapter and trains nothing")
+    elif args.adapter is not None:
+        ap.error("--adapter is only for --merge-only")
     args.merge_effective = args.merge if args.merge is not None else not args.smoke
     if args.push_to:
         if args.smoke:
@@ -997,11 +1017,10 @@ def _check_adapter(adapter_dir: Path, cfg: SimpleNamespace, name: str) -> None:
 
 
 def _train_and_check(
-    hooks: Hooks, cfg: SimpleNamespace, args: argparse.Namespace, check: DataCheck, seed: int, folder: Path, template_path: Path
+    hooks: Hooks, cfg: SimpleNamespace, args: argparse.Namespace, check: DataCheck, seed: int, work: Path
 ) -> dict[str, Any]:
-    adapter_dir = folder / cfg.output.adapter_dir
     params = build_trainer_params(
-        cfg, data_path=check.path, adapter_dir=adapter_dir, chat_template_path=template_path, seed=seed, max_steps=args.max_steps
+        cfg, data_path=check.path, adapter_dir=work, chat_template_path=work / TEMPLATE_FILE, seed=seed, max_steps=args.max_steps
     )
     start_check = StartCheck(rows=cfg.checks.label_check_rows, minimum=cfg.checks.label_tokens_min, maximum=cfg.checks.label_tokens_max)
     trainer = hooks.trainer_factory(params, start_check)
@@ -1011,7 +1030,7 @@ def _train_and_check(
     if start_check.label_counts is None:
         print(f"note: the labelled-token check could not run ({start_check.label_note or 'the trainer never reported its rows'})", file=sys.stderr)
 
-    _check_adapter(adapter_dir, cfg, cfg.output.adapter_dir)
+    _check_adapter(work, cfg, "work")
     rows_seen = result.get("rows_seen")
     if rows_seen is not None and rows_seen != check.rows:
         raise FinetuneError(
@@ -1039,11 +1058,7 @@ def _train_and_check(
         raise FinetuneError(f"{reason}; logged losses (step:loss) {_show_history(history, cfg.checks.history_points)}")
     if final is None:
         final = history[-1][1]
-    if not cfg.output.keep_checkpoints:
-        for checkpoint in adapter_dir.glob("checkpoint-*"):
-            shutil.rmtree(checkpoint, ignore_errors=True)
     return {
-        "adapter_dir": adapter_dir,
         "rows_seen": rows_seen,
         "planned": planned,
         "steps": steps,
@@ -1107,7 +1122,7 @@ def _summary(
 
 def _plan_lines(
     cfg: SimpleNamespace, args: argparse.Namespace, config_path: Path, check: DataCheck, seed: int, out: Path, root: Path,
-    length_line: str, template_line: str,
+    length_line: str, template_line: str, work: Path,
 ) -> list[str]:
     t = cfg.train
     effective = t.per_device_batch_size * t.gradient_accumulation_steps
@@ -1132,6 +1147,7 @@ def _plan_lines(
         lines.append(f"smoke run: stops after {args.max_steps} steps, logs every step, output {where}")
     else:
         lines.append(f"output: {where}")
+    lines.append(f"work folder: {shown(work, root)} (AlignTune writes its checkpoints here; kept if the run fails)")
     lines.append(length_line)
     lines.append(template_line)
     lines.append(f"seed: {seed}; merge: {'yes' if args.merge_effective else 'no'} ({cfg.output.merge_dtype})")
@@ -1199,23 +1215,135 @@ def _work_dir(root: Path, stem: str, smoke: bool) -> Path:
     return Path(root) / "work" / "finetune" / (stem + (SMOKE_SUFFIX if smoke else ""))
 
 
+def _work_contents(work: Path) -> list[str]:
+    return sorted(p.name for p in work.iterdir() if p.name != TEMPLATE_FILE) if work.is_dir() else []
+
+
+def _check_work_dir(work: Path, root: Path) -> None:
+    """A work folder that holds an earlier run's files (checkpoints, an adapter) is never overwritten."""
+    if work.is_symlink() or (work.exists() and not work.is_dir()):
+        raise UsageError(f"the work folder {shown(work, root)} is not a plain folder; move it away")
+    left = _work_contents(work)
+    if left:
+        raise UsageError(
+            f"the work folder {shown(work, root)} is not empty ({', '.join(left)}): it is what an earlier run left for "
+            "recovery. Move or delete it, then run again"
+        )
+
+
+def _kept_note(work: Path, root: Path, adapter: Path | None) -> str:
+    left = _work_contents(work)
+    text = (
+        f"the work folder {shown(work, root)} was kept, holding {', '.join(left)} (AlignTune cannot resume from it by "
+        "itself: docs/runtime.md, 'After a failure')"
+        if left
+        else f"the work folder {shown(work, root)} was kept, empty apart from the chat template file"
+    )
+    if adapter is not None:
+        text += f"; the finished adapter is in {shown(adapter, root)}: merge it with --merge-only --adapter {shown(adapter, root)}"
+    return text
+
+
+def _copy_adapter(work: Path, folder: Path) -> None:
+    """The adapter's own files, not the checkpoints (optimizer states), the tracker logs or the provenance file."""
+    for item in sorted(work.iterdir()):
+        if item.is_file() and item.name != TEMPLATE_FILE and item.name not in NOT_PUBLISHED:
+            shutil.copyfile(item, folder / item.name)
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Write `path` whole or not at all: a file in the same folder, flushed to disk, then renamed over it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _merge(hooks: Hooks, cfg: SimpleNamespace, adapter_dir: Path, merged_out: Path) -> None:
+    """Merge into a hidden partial folder that becomes `merged_out` only when the merge finished."""
+    with atomic_output_dir(merged_out) as folder:
+        hooks.merge_fn(cfg.base_model, adapter_dir, folder, dtype=cfg.output.merge_dtype)
+        if not any(folder.iterdir()):
+            raise FinetuneError(f"the merge wrote nothing into {cfg.output.merged_dir}")
+
+
+def _json_text(data: Mapping[str, Any]) -> str:
+    return scrub(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def _data_folders(cfg: SimpleNamespace, train_path: Path, root: Path) -> list[tuple[str, Path]]:
+    folders = {_resolve(p, root).parent for p in (cfg.data.train, cfg.data.heldout, cfg.data.taskdev)} | {train_path.parent}
+    return [("data", d) for d in sorted(folders)]
+
+
+def execute_merge_only(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
+    """`--merge-only --adapter PATH`: merge an adapter that is already on disk; nothing is trained, no data is read."""
+    cfg = load_config(args.config)
+    out = args.out if args.out else Path(root) / "results" / "finetune" / args.config.stem
+    adapter = _resolve(args.adapter, root)
+    merged_out = out / cfg.output.merged_dir
+    try:
+        check_out_dir(merged_out, sources=_data_folders(cfg, _resolve(cfg.data.train, root), root))
+    except (FileExistsError, ValueError) as exc:
+        raise UsageError(str(exc)) from None
+    note_stale_partials(merged_out)
+    _check_adapter(adapter, cfg, "adapter")  # the adapter must be the configured one, base model included
+
+    started = hooks.clock()
+    _merge(hooks, cfg, adapter, merged_out)
+    seconds = hooks.clock() - started
+    section = {
+        "adapter": shown(adapter, root),
+        "dtype": cfg.output.merge_dtype,
+        "wall_clock_seconds": float(format(seconds, _FLOAT)),
+        "libraries": dict(hooks.versions()),
+    }
+    summary_path = out / SUMMARY_FILE
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise FinetuneError(f"the merged model is in {shown(merged_out, root)} but {SUMMARY_FILE} cannot be read: {exc}") from None
+        if not isinstance(summary, dict):
+            raise FinetuneError(f"the merged model is in {shown(merged_out, root)} but {SUMMARY_FILE} is not a JSON object")
+    else:
+        summary = {
+            "schema": 1,
+            "config": {"path": shown(args.config, root), "sha256": hashlib.sha256(args.config.read_bytes()).hexdigest()},
+            "base_model": cfg.base_model,
+            "merge_dtype": cfg.output.merge_dtype,
+            "note": NOTE,
+        }
+    summary["merged"] = True
+    summary["merge"] = section
+    _write_atomically(summary_path, _json_text(summary))
+    print(f"merged {shown(adapter, root)} into {shown(merged_out, root)} ({cfg.output.merge_dtype}); {SUMMARY_FILE} has the merge section")
+    return EXIT_OK
+
+
 def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
+    if args.merge_only:
+        return execute_merge_only(args, root, hooks)
     cfg = load_config(args.config)
     seed = args.seed if args.seed is not None else cfg.train.seed
     stem = args.config.stem
     out = args.out if args.out else Path(root) / "results" / "finetune" / (stem + (SMOKE_SUFFIX if args.smoke else ""))
     train_path = args.data if args.data else _resolve(cfg.data.train, root)
-    data_dirs = {_resolve(p, root).parent for p in (cfg.data.train, cfg.data.heldout, cfg.data.taskdev)} | {train_path.parent}
     try:
-        check_out_dir(out, sources=[("data", d) for d in sorted(data_dirs)])
+        check_out_dir(out, sources=_data_folders(cfg, train_path, root))
     except (FileExistsError, ValueError) as exc:
-        raise UsageError(str(exc)) from None
+        hint = f" (an adapter a failed run left there can be merged: --merge-only --adapter {shown(out / cfg.output.adapter_dir, root)})"
+        raise UsageError(str(exc) + (hint if (out / cfg.output.adapter_dir).is_dir() else "")) from None
     note_stale_partials(out)
     work = _work_dir(root, stem, args.smoke)
-    try:
-        check_out_dir(work)
-    except (FileExistsError, ValueError) as exc:
-        raise UsageError(f"{exc}; it is what an earlier run left: move or delete it, then run again") from None
+    _check_work_dir(work, root)
 
     check = check_data(cfg, train_path, root)
     for note in check.notes:
@@ -1223,7 +1351,7 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     tokenizer, why = _load_tokenizer(hooks, cfg, required=not args.dry_run)
     length_line = _measure(tokenizer, why, cfg, check)
     template_text, template_sha256, template_line = _prepare_template(tokenizer)
-    for line in _plan_lines(cfg, args, args.config, check, seed, out, root, length_line, template_line):
+    for line in _plan_lines(cfg, args, args.config, check, seed, out, root, length_line, template_line, work):
         print(line)
     if args.dry_run:
         return EXIT_OK
@@ -1235,22 +1363,30 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
 
     started = hooks.clock()
     work.mkdir(parents=True, exist_ok=True)
-    template_path = work / TEMPLATE_FILE
-    template_path.write_text(template_text, encoding="utf-8")
-    with atomic_output_dir(out) as folder:
-        trained = _train_and_check(hooks, cfg, args, check, seed, folder, template_path)
+    (work / TEMPLATE_FILE).write_text(template_text, encoding="utf-8")
+    adapter_out = out / cfg.output.adapter_dir
+    published = False
+    try:
+        trained = _train_and_check(hooks, cfg, args, check, seed, work)
+        with atomic_output_dir(adapter_out) as folder:
+            _copy_adapter(work, folder)
+        published = True
         merged = False
         if args.merge_effective:
-            merged_dir = folder / cfg.output.merged_dir
-            hooks.merge_fn(cfg.base_model, trained["adapter_dir"], merged_dir, dtype=cfg.output.merge_dtype)
-            if not merged_dir.is_dir():
-                raise FinetuneError(f"the merge left no {cfg.output.merged_dir} folder")
+            _merge(hooks, cfg, adapter_out, out / cfg.output.merged_dir)
             merged = True
         seconds = hooks.clock() - started
         summary = _summary(cfg, args, args.config, check, seed, trained, merged, seconds, hooks, root, template_sha256)
-        text = scrub(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
-        (folder / SUMMARY_FILE).write_text(text, encoding="utf-8")
-    shutil.rmtree(work, ignore_errors=True)
+        _write_atomically(out / SUMMARY_FILE, _json_text(summary))  # last: its presence means the run finished
+    except FinetuneError as exc:
+        raise FinetuneError(f"{exc}; {_kept_note(work, root, adapter_out if published else None)}") from None
+    except BaseException:  # a CUDA error, Ctrl-C: the traceback stays, and the recovery folder is named
+        print(f"note: {_kept_note(work, root, adapter_out if published else None)}", file=sys.stderr)
+        raise
+    if cfg.output.keep_checkpoints:
+        print(f"kept the work folder {shown(work, root)} (output.keep_checkpoints): AlignTune's checkpoints are in it")
+    else:
+        shutil.rmtree(work, ignore_errors=True)
 
     print(f"wrote {shown(out, root)} ({'smoke run, ' if args.smoke else ''}{trained['steps']} steps, final loss {trained['final_loss']:{_FLOAT}}; {trained['loss_reason']})")
     if args.smoke:

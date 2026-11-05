@@ -58,7 +58,11 @@ train:
   seed: 20261105                         # the repository's seed (pipelines/ft_data.yaml); also sent as data_seed
   assistant_only_loss: true              # loss on the answer letter and the two end tokens only, not the preamble or the question
   logging_steps: 10
-  save_steps: 250                        # checkpoints for a manual recovery only: AlignTune has no resume (UNVERIFIED)
+  # A checkpoint is written to work/finetune/<config stem>[-smoke]/checkpoint-<step>/ every save_steps (the
+  # last save_total_limit are kept). AlignTune itself has no resume: after a crash, a checkpoint can be
+  # continued only by hand, with Trainer.train(resume_from_checkpoint=<that folder>) in your own script
+  # (docs/runtime.md, 'After a failure'). The work folder is kept on any failure and removed after a success.
+  save_steps: 250
   save_total_limit: 2
 
 aligntune:
@@ -73,7 +77,7 @@ output:
   adapter_dir: adapter                   # inside --out
   merged_dir: merged                     # inside --out: the A1 model folder (fp16 weights + tokenizer)
   merge_dtype: float16
-  keep_checkpoints: false                # the checkpoint-* folders are scratch once the adapter is saved
+  keep_checkpoints: false                # true keeps the work folder (checkpoints) after a successful run; the published adapter never holds them
 
 checks:
   history_points: 20                     # loss points kept in finetune_summary.json

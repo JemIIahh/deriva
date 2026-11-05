@@ -623,6 +623,11 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   `trainer.trainer.save_model()`: **the adapter (`adapter_model.safetensors`, `adapter_config.json`) lands in
   `output_dir` itself**, next to `checkpoint-<step>/` folders every `save_steps`, plus an AlignTune
   `lexsi_provenance.json` (it records absolute paths, so it never goes into anything we publish).
+  `finetune.py` therefore gives AlignTune a persistent, non-atomic work folder
+  `work/finetune/<config stem>[-smoke]/` as `output_dir` (kept on any failure and named in the error), then
+  copies only the adapter's files (no checkpoints, no provenance file, not its own template file) into
+  `<out>/adapter`, merges into `<out>/merged`, and writes `finetune_summary.json` last, each part atomically.
+  `--merge-only --adapter PATH` repeats just the merge from a kept adapter.
 - `train()` returns a dict with `final_loss`, `steps`, `epochs`, `metrics`, `model_path` and `training_time`.
   The per-step losses are in `trainer.trainer.state.log_history` (entries with a `"loss"` key).
 - **There is no resume API**: a dropped Kaggle or Colab session restarts the run (the checkpoint folders are
