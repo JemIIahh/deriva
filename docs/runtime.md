@@ -123,7 +123,7 @@ workspace repo and be resumable. Kaggle's numbers need to be read off the accoun
 ## 4. Python versions and SafeTune (needs Python 3.12 or newer)
 
 Required Python per package (PyPI JSON, read 2026-11-05): `safetune` 0.1.12 needs >=3.12,
-`aligntune` 0.1.30 >=3.11, `curatorkit` 0.1.22 >=3.11, `auditkit` 1.1.3 >=3.10. Our own `msd` needs >=3.12.
+`aligntune` 0.1.30 >=3.11 (0.1.31 was published later the same day, also >=3.11), `curatorkit` 0.1.22 >=3.11, `auditkit` 1.1.3 >=3.10. Our own `msd` needs >=3.12.
 
 - **Colab:** the newest runtime snapshot is Python 3.13. Evidence:
   https://github.com/googlecolab/backend-info README lists runtime 2026.10 = Python 3.13.18
@@ -209,3 +209,101 @@ fallback in section 4.
 | toolkit versions | aligntune, safetune: not installed; auditkit is in its own venv `envs/auditkit`, so null here | DEFERRED-RUNTIME | DEFERRED-RUNTIME |
 | Tiny Aya HEAD (no token) | 401 on both | DEFERRED-RUNTIME | DEFERRED-RUNTIME |
 | Decision | | | |
+
+### Fine-tune A1 with AlignTune (plan Task 14, DEFERRED-RUNTIME)
+
+`scripts/finetune.py` trains A1 = A0 + a LoRA adapter on the harmless Global-MMLU letter task and merges it to
+fp16 weights. Every training value is in `configs/ft_lora.yaml` (and `configs/ft_lora_strong.yaml`, the retry);
+what each AlignTune keyword does is in `docs/toolkit-notes.md`, "AlignTune SFT (read from source)". The code
+is tested with fakes only. Nothing below has run on a GPU, and every time or memory figure is an UNVERIFIED
+estimate until the first run replaces it.
+
+**What works today, on the Mac, with no GPU and no AlignTune** (done 2026-11-05 on the real data: 6,000 rows,
+1,500 per language, train sha256 `348c164f...01ce80` as recorded in the notes, validation ok with heldout,
+taskdev and the safety splits all checked, 750 steps for the base config and 1,125 for the strong one; the
+token lengths line said "not estimated" because there is no tokenizer here):
+
+```
+python scripts/finetune.py --config configs/ft_lora.yaml --dry-run
+python scripts/finetune.py --config configs/ft_lora_strong.yaml --dry-run
+```
+
+**Before the first run on Kaggle or Colab** (three gaps, stated plainly; `kaggle/10_run_stage.ipynb` is not changed):
+
+1. The wheel in the workspace repo must be rebuilt and replaced (`uv build --wheel --out-dir dist .`, upload, keep
+   exactly one): `msd.finetune` is new. `scripts/finetune.py`, `pipelines/` and `data/` (with `data/ft/` and
+   `data/testset/`) must be current there as well.
+2. The stage notebook pulls only `scripts/*`, `pipelines/*` and `data/**`, **not `configs/`**. Upload the two
+   YAML files into the workspace repo as `data/configs/ft_lora.yaml` and `data/configs/ft_lora_strong.yaml`
+   (the `data/**` pattern pulls them) and pass `--config data/configs/ft_lora.yaml`. The summary records that
+   path and the file's sha256, which is the same as the one in `configs/`.
+3. The notebook installs no toolkit. In the pushed copy of the notebook (not in the repo file) add a code cell
+   above the run cell: `!pip install -q aligntune==0.1.31` (needs Python 3.11 or newer; 0.1.31 was published
+   2026-11-05). It pulls torch/transformers/trl/peft pins (`transformers>=5.15,<6`, `trl==1.7.1`,
+   `torch>=2.4,<2.14`) and may replace the preinstalled torch: run `python scripts/env_check.py` again afterwards
+   (UNVERIFIED either way). Use this runtime only for the fine-tune, not for SafeTune (one environment per toolkit).
+
+The token: the notebook already puts `HF_TOKEN` into the environment; the gated base model
+(`CohereLabs/tiny-aya-global`, licence accepted on its page) is downloaded with it. `finetune.py` never prints it.
+On a two-T4 Kaggle runtime the config uses the first card only (`aligntune.device_map: {"": 0}`).
+
+Run these in order, each as a separate run of the stage notebook (`STAGE`, `STAGE_ARGS` in its second cell):
+
+```
+# 1. Plan on the runtime (a tokenizer can be loaded here, so the token lengths and the longest example are printed;
+#    check that max_seq_length 2048 covers it). Writes nothing.
+STAGE = "finetune"
+STAGE_ARGS = "--config data/configs/ft_lora.yaml --dry-run"
+
+# 2. Smoke run: 20 steps, every step logged, merges once so the merge path (CPU RAM, tokenizer save) is proven
+#    BEFORE the long run. Output goes to results/finetune/ft_lora-smoke; it is not A1 and is never pushed.
+STAGE_ARGS = "--config data/configs/ft_lora.yaml --max-steps 20 --merge"
+#    Read the printed lines and results/finetune/ft_lora-smoke/finetune_summary.json: rows_seen must be 6000 (a lower
+#    number means AlignTune/CuratorKIT dropped rows), loss_ok true, steps 20, peak memory in the log (UNVERIFIED how it
+#    is shown; watch nvidia-smi). If the adapter check, the keyword names or the assistant-only mask are wrong this is
+#    where it shows.
+
+# 3. The real run: 2 epochs = 750 optimizer steps. Writes results/finetune/ft_lora/{adapter,merged,finetune_summary.json}.
+STAGE_ARGS = "--config data/configs/ft_lora.yaml"
+#    Optional, after a successful run only: add  --push-to <hf-user>/<private-repo>  (the repo must already exist and be
+#    PRIVATE; HF_TOKEN from the environment; nothing is created, nothing is uploaded without the flag).
+
+# 4. Only if step 3's held-out accuracy (below) shows the model barely moved: the strong retry, 3 epochs = 1,125 steps.
+STAGE_ARGS = "--config data/configs/ft_lora_strong.yaml"
+```
+
+The notebook then uploads the whole of `results/finetune/` to the private workspace repo, merged weights included
+(about 6.7 GB in fp16 plus the adapter); a failed run exits non-zero, leaves no output folder and so uploads nothing.
+A killed session (SIGKILL, a dropped runtime) cannot clean up: the hidden `.ft_lora.<8 hex>.partial` folder stays and is
+named at the start of the next run, never deleted. AlignTune has no resume, so a dropped run starts again.
+
+**Held-out accuracy check, A0 against A1** (the task items only; no judge and no API key). `run_eval.py` reads
+`data/ft/taskdev.jsonl` for `--split dev` and `data/ft/heldout.jsonl` for `--split report` and scores the bare answer
+letter with `--stages generate,task`. The generate stage also writes the safety completions of that split (the
+study needs them for A0 and A1 anyway); `--limit N` caps both for a quick look. Use `--langs en,hi,ar,sw` (hinglish
+has no task rows). Run the dev split first, A0 then A1, then the report split once:
+
+```
+STAGE = "run_eval"
+STAGE_ARGS = "--arm A0 --split dev --model CohereLabs/tiny-aya-global --out results/run_eval --stages generate,task --langs en,hi,ar,sw"
+STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out results/run_eval --stages generate,task --langs en,hi,ar,sw"
+# then the same two with --split report
+```
+
+(A later notebook run starts from a fresh working folder and the notebook pulls only scripts, pipelines and data,
+so fetch the merged model first in an extra cell, `snapshot_download(WORKSPACE_REPO, repo_type="dataset",
+local_dir=".", token=token, allow_patterns=["results/finetune/ft_lora/merged/*"])`, or pass the `--push-to` repo id
+as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `task` block has `n`, `correct` and
+`accuracy` per language. Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
+heldout split). What A1 must show is that it answers the bare letter more often than A0 does (the point of the
+task); how much is a result, not a gate here.
+
+**Expected cost, all UNVERIFIED estimates** (nothing measured): with batch 1 and gradient checkpointing a step
+processes 16 sequences of mostly 500 to 1,500 tokens; AlignTune's own heuristic puts the base config at 1.7 h
+(1,024-token sequences) to 3.4 h (2,048) on a T4 (formulas and table in the notes, with its +/-30%), so plan 2 to
+4 hours for the base config and 3 to 6 hours for the strong one, the 20-step smoke run at a few minutes plus model
+download (6.7 GB) and a merge of a few minutes. Memory: about 13 to 14 GB at the longest examples against 16 GB
+(arithmetic in the notes). If step 2 runs out of memory, lower `train.max_seq_length` only to what the dry run's
+longest example needs, never below it (the run refuses a shorter limit); `per_device_batch_size` is already 1. A
+Kaggle or Colab session limit (section 3 lists only what was read) may cut a 4 to 6 hour run: the strong retry is the
+one at risk, and there is no resume.
