@@ -15,7 +15,7 @@ python scripts/build_ft_data.py fetch      # public datasets-server, no token; 1
 python scripts/build_ft_data.py prepare    # data/raw/... -> data/ft/prep/candidates.jsonl
 envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir data/ft/curated --dry-run   # plan only
 envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir data/ft/curated             # ~70 s, no LLM call
-python scripts/build_ft_data.py finalize   # joins the export back to ids -> data/ft/train.jsonl, heldout.jsonl
+python scripts/build_ft_data.py finalize   # joins the export back to ids -> data/ft/train.jsonl, heldout.jsonl, taskdev.jsonl
 python scripts/validate_ft_data.py --langs en,hi,ar,sw   # checks the subject allowlist of pipelines/ft_data.yaml by default
 ```
 
@@ -34,7 +34,7 @@ throwaway venv (`datasets` is not installed in any project venv):
 
 ```
 datasets.get_dataset_config_names("data/ft/curated")        -> ['sft_messages']
-datasets.load_dataset("data/ft/curated", "sft_messages")    -> DatasetDict({train: 7960 rows, features: ['messages']})
+datasets.load_dataset("data/ft/curated", "sft_messages")    -> DatasetDict({train: 8986 rows, features: ['messages']})
 datasets.load_dataset("data/ft/curated")                    -> the same
 datasets.load_dataset("data/ft/curated", "sft_alpaca")      -> ValueError (only exporters in the YAML get a config)
 ```
@@ -62,9 +62,10 @@ curation result, not our release format: the split is always `train` and the onl
 - `stratified_sampler` cuts every listed category down to the smallest one (it never pads). A
   category with no samples is skipped with a warning, not an error.
 - `minhash_dedup` at 0.85 judges the whole `instruction + output` text, so it is not an
-  exact-duplicate filter. It removed 134 of 8,147 samples here. The two dedup steps and the
-  samplers removed 195 samples in all (8 exact copies, 134 near-duplicates, 53 by the samplers);
-  of the 187 whose text no longer survives, 131 shared a source passage with a kept sample
+  exact-duplicate filter. It removed 146 of 9,185 samples here (train, heldout and taskdev rows
+  together). The two dedup steps and the samplers removed 207 samples in all (8 exact copies, 146
+  near-duplicates, 53 by the samplers); of the 199 whose text no longer survives, 142 shared a
+  source passage with a kept sample
   (different questions about the same text) and some others were mirror-image questions
   (kinetic energy doubles / momentum doubles). `ignore_for_dedup` masks the fixed option labels
   and instruction lines so they do not inflate similarity. Train rows are read first, so a
@@ -113,9 +114,44 @@ not committed, so this is the record.
   | --- | --- | --- |
   | `data/ft/train.jsonl` | 6,000 (1,500 per language) | `348c164f35d092d4a237872556c0a59d866ba6eea3367126ea33807b5401ce80` |
   | `data/ft/heldout.jsonl` | 800 (200 per language) | `c90d3ee401d2740911c1895885c15fdcc0edf2516baec2266c47e10f660899bc` |
+  | `data/ft/taskdev.jsonl` | 800 (200 per language, the same 200 items in all four) | `cb3cc328d186131d4d2720771c6acf8e7268f3c724403c54f37bdb42081d424b` |
 
-  CuratorKIT's own export, `data/ft/curated/sft_messages.jsonl`, has 7,960 rows (6,964 train and
-  996 heldout before the per-language caps) and 46 gate rejections (all `above_max_tokens`).
+  CuratorKIT's own export, `data/ft/curated/sft_messages.jsonl`, has 8,986 rows (6,964 train, 996
+  heldout and 1,026 taskdev before the per-language caps) and 47 gate rejections (all
+  `above_max_tokens`, one of them a taskdev row). The `train.jsonl` and `heldout.jsonl` hashes are
+  the ones from before `taskdev.jsonl` existed: adding it changed neither file (compared with
+  `cmp` on the real data, and by `test_adding_taskdev_to_the_settings_does_not_change_train_or_heldout_bytes`).
+
+### The dev task file, `data/ft/taskdev.jsonl` (built 2026-11-05)
+
+The task items alpha is chosen on (the dev split), so that the report split can keep all 200
+`heldout.jsonl` items per language. `src/msd/evalrun.py` reads it as `TASK_FILES["dev"]` and the
+records have exactly the heldout shape, `{id, lang, messages: [user, assistant], gold}`; the real
+file loads through `evalrun.read_task_records` and `task_prompts(..., split="dev")` (checked).
+
+- Drawn from the allowlisted items that neither train nor heldout took: `prepare` ranks the items
+  once with the split seed and fills heldout, then train, then (a third pass) taskdev up to
+  `taskdev_pool: 260` from what is left. Whole passage groups only, so a passage never straddles
+  two splits. Pool and cap are `taskdev_pool` and `taskdev_cap: 200` in `pipelines/ft_data.yaml`.
+- Read by CuratorKIT after train and heldout, so a taskdev item that near-duplicates either is the
+  one dropped (13 taskdev candidates were removed this way or by the length gate). `finalize`
+  then keeps, per language, the best-ranked items that survived in every language, so all four
+  languages hold the same 200 items (they did; if too few were shared a language would fill up
+  from its own survivors and the validator would warn, never fail, about differing item sets).
+- Pool and result per language (en / hi / ar / sw): 260 / 260 / 260 / 259 candidates, 256 / 257 /
+  258 / 255 CuratorKIT survivors, **200 / 200 / 200 / 200** final. No shortfall.
+- Disjointness, checked on the real files with code independent of the validator: 0 items shared
+  with `train.jsonl` or `heldout.jsonl`, and also 0 with the whole train and heldout pools
+  (including the rows capped off); 0 shared normalised prompts; the 30 distinct (language,
+  passage) pairs in taskdev (12% of rows carry a passage) appear in neither file.
+- Composition: 14 subjects, psychology 30, biology 22, human aging 19, nutrition 18, prehistory
+  16, physics 15, astronomy 14, geography 13, government, world history, anatomy and US history
+  11 each, global facts 7, European history 2 (the pool is a random draw, so the mix is whatever
+  was left). Gold letters A / B / C / D = 44 / 45 / 49 / 62, the same in every language because
+  the items are the same: a model that always answers D scores 31% on dev, a little above the
+  27-28% floor of the heldout split. Report the dev accuracy against that floor.
+- The validator checks it (`scripts/validate_ft_data.py`, exit code 19 when it shares a prompt,
+  item or passage with train or heldout); see the module docstring of `src/msd/ftdata.py`.
 
 ## Judge candidates (checked 2026-11-05)
 

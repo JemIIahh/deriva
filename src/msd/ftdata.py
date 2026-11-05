@@ -39,6 +39,21 @@ Rules, by class:
                 `--no-subject-check` skips it; the report always says which it was.
   safety_empty  a language the safety test set lists as covered has no dev prompts or no report
                 prompts, which would make the leakage check pass without comparing anything
+  taskdev_overlap
+                the optional dev task file (`taskdev.jsonl`, exit code 19: the 10-18 range was
+                full) shares a prompt (norm_text of the full user turn), a source item (any
+                language: `hi:x/test/3` in taskdev and `en:x/test/3` in train are one item) or a
+                passage with train or heldout. Its other problems use the ordinary classes with
+                where="taskdev": format, refusal, answer, language and subject as everywhere,
+                overlap for a repeated prompt inside it or a prompt equal to a safety prompt,
+                imbalance for an uneven count per language and missing_lang for an expected
+                language with no rows.
+
+taskdev is optional. `validate(taskdev=None)` (a missing file) leaves the report's `taskdev_built`
+False and render prints "taskdev: not built"; the command line turns that into an error only with
+`--require-taskdev`. The dev items of different languages should be the same items; when they are
+not the report carries a warning, not a failure (a language can lose an item to a language-specific
+gate).
 """
 
 from __future__ import annotations
@@ -68,6 +83,7 @@ RULES: tuple[str, ...] = (
     "missing_lang",
     "subject",
     "safety_empty",
+    "taskdev_overlap",
 )
 # 0 ok, 1 several classes failed, 2 bad arguments or unreadable input (as in build_testset.py).
 EXIT_CODES: dict[str, int] = {
@@ -80,7 +96,9 @@ EXIT_CODES: dict[str, int] = {
     "missing_lang": 16,
     "subject": 17,
     "safety_empty": 18,
+    "taskdev_overlap": 19,
 }
+TASKDEV_FILE = "taskdev.jsonl"  # next to heldout.jsonl; evalrun.TASK_FILES["dev"] reads the same name
 IMBALANCE_TOLERANCE = 0.20
 MAX_ANSWER_WORDS = 8
 MAX_ANSWER_CHARS = 80
@@ -343,6 +361,8 @@ class Report:
     allowed_subjects: tuple[str, ...] | None = None  # None: the subject allowlist was NOT checked
     subject_rows_checked: int = 0
     safety_counts: dict[str, tuple[int, int]] | None = None  # lang -> (dev, report) prompts; None: not checked
+    taskdev_built: bool = False  # False: no taskdev file was given (counts has no "taskdev" entry)
+    missing_taskdev: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -529,6 +549,81 @@ def _check_split(
     return usable
 
 
+def _first_by(records: Iterable[dict[str, Any]], key: Any) -> dict[str, str]:
+    """key(record) -> id of the first record that has it."""
+    out: dict[str, str] = {}
+    for rec in records:
+        out.setdefault(key(rec), rec["id"])
+    return out
+
+
+def _check_taskdev(
+    dev: Sequence[dict[str, Any]],
+    train: Sequence[dict[str, Any]],
+    heldout: Sequence[dict[str, Any]],
+    problems: list[Problem],
+) -> None:
+    """The cross-record rules for the dev task file: unique inside, and disjoint from train and heldout.
+
+    Everything is compared with the normalisation of the other leakage checks (`norm_text`), and
+    the source item without its language prefix, so an item in one language of taskdev and another
+    language of train is one item. Like the train/heldout rules this sees same-language text only;
+    the prepare step keeps each item and passage on one side across languages.
+    """
+    seen: dict[str, str] = {}
+    prompts: dict[str, str] = {}
+    for rec in dev:
+        if rec["id"] in seen:
+            problems.append(Problem("format", "taskdev", rec["id"], "duplicate id (also in taskdev)"))
+        seen.setdefault(rec["id"], rec["id"])
+        key = norm_text(_user(rec))
+        if key in prompts:
+            problems.append(Problem("overlap", "taskdev", rec["id"], f"duplicate prompt (same as {prompts[key]})"))
+        else:
+            prompts[key] = rec["id"]
+    passages = {}
+    for rec in dev:
+        passage = passage_of(_user(rec))
+        if passage:
+            passages.setdefault(norm_text(passage), rec["id"])
+    for name, recs in (("train", train), ("heldout", heldout)):
+        other_prompts = _first_by(recs, lambda r: norm_text(_user(r)))
+        other_passages = {}
+        for rec in recs:
+            passage = passage_of(_user(rec))
+            if passage:
+                other_passages.setdefault(norm_text(passage), rec["id"])
+        other_items = _first_by(recs, lambda r: item_key(r["id"]))
+        for rec in dev:
+            hit = other_prompts.get(norm_text(_user(rec)))
+            if hit:
+                problems.append(Problem("taskdev_overlap", "taskdev", rec["id"], f"prompt also in {name} ({hit})"))
+            hit = other_items.get(item_key(rec["id"]))
+            if hit:
+                problems.append(
+                    Problem("taskdev_overlap", "taskdev", rec["id"], f"source item {clip(item_key(rec['id']))!r} is also in {name} ({hit})")
+                )
+        for key, rid in passages.items():
+            if key in other_passages:
+                problems.append(Problem("taskdev_overlap", "taskdev", rid, f"passage also in {name} ({other_passages[key]})"))
+
+
+def _taskdev_item_warnings(dev: Sequence[dict[str, Any]], expected: Sequence[str]) -> list[str]:
+    """A warning when the expected languages do not all have the same dev items (empty list when they do)."""
+    items = {lang: {item_key(r["id"]) for r in dev if r["lang"] == lang} for lang in expected}
+    items = {lang: found for lang, found in items.items() if found}
+    if len(items) < 2:
+        return []
+    shared = set.intersection(*items.values())
+    union = set.union(*items.values())
+    if shared == union:
+        return []
+    return [
+        f"taskdev: the languages do not hold the same items ({len(shared)} items in every language, "
+        f"{len(union) - len(shared)} in only some of them)"
+    ]
+
+
 def validate(
     train: Sequence[Any],
     heldout: Sequence[Any],
@@ -538,10 +633,15 @@ def validate(
     safety_report: Iterable[str] = (),
     allowed_subjects: Collection[str] | None = None,
     safety_counts: dict[str, tuple[int, int]] | None = None,
+    taskdev: Sequence[Any] | None = None,
     imbalance_tolerance: float = IMBALANCE_TOLERANCE,
     read_problems: Sequence[Problem] = (),
 ) -> Report:
-    """Run every rule on the train and heldout records and return the Report.
+    """Run every rule on the train and heldout records (and taskdev when given) and return the Report.
+
+    `taskdev=None` means there is no dev task file: nothing is checked for it and the Report says
+    "not built". A list (even an empty one) is checked as the dev split and must share no prompt,
+    item or passage with train or heldout.
 
     `allowed_subjects=None` means the subject rule is off, and the Report says so. `safety_counts`
     is what `load_safety_texts` returned for the languages the safety texts came from (None when
@@ -553,6 +653,7 @@ def validate(
 
     train_ok = _check_split(train, "train", allowed_subjects, problems)
     held_ok = _check_split(heldout, "heldout", allowed_subjects, problems)
+    dev_ok = _check_split(taskdev, "taskdev", allowed_subjects, problems) if taskdev is not None else []
 
     # ids: unique inside each split and across the two
     seen: dict[str, str] = {}
@@ -593,13 +694,18 @@ def validate(
         if other:
             problems.append(Problem("overlap", "heldout", rec["id"], f"source item {clip(item_key(rec['id']))!r} is also in train ({other})"))
 
+    if taskdev is not None:
+        _check_taskdev(dev_ok, train_ok, held_ok, problems)
+
     # the safety splits: dev vs report once, then each fine-tuning split against each of them
     if safety_dev or safety_report:
         try:
             assert_no_leakage(safety_dev, safety_report)
         except LeakageError as exc:
             problems.append(Problem("overlap", "safety", None, f"safety dev and report splits overlap: {exc}"))
-        for where, recs in (("train", train_ok), ("heldout", held_ok)):
+        for where, recs in (("train", train_ok), ("heldout", held_ok), ("taskdev", dev_ok)):
+            if not recs:
+                continue
             texts = _leak_texts(recs)
             for name, dev, rep in (("dev", safety_dev, ()), ("report", (), safety_report)):
                 try:
@@ -627,6 +733,15 @@ def validate(
     for message in _imbalanced(counts["train"], expected, imbalance_tolerance):
         problems.append(Problem("imbalance", "train", None, message))
     warnings = [f"heldout: {m}" for m in _imbalanced(counts["heldout"], expected, imbalance_tolerance)]
+    missing_taskdev: list[str] = []
+    if taskdev is not None:
+        counts["taskdev"] = _counts(dev_ok)
+        for message in _imbalanced(counts["taskdev"], expected, imbalance_tolerance):
+            problems.append(Problem("imbalance", "taskdev", None, message))
+        missing_taskdev = [lang for lang in expected if counts["taskdev"].get(lang, 0) == 0]
+        for lang in missing_taskdev:
+            problems.append(Problem("missing_lang", "taskdev", None, f"expected language {lang} has no taskdev rows"))
+        warnings += _taskdev_item_warnings(dev_ok, expected)
 
     missing = [
         lang for lang in expected if counts["train"].get(lang, 0) == 0 or counts["heldout"].get(lang, 0) == 0
@@ -645,8 +760,10 @@ def validate(
         missing,
         not_covered,
         allowed_subjects=None if allowed_subjects is None else tuple(sorted(allowed_subjects)),
-        subject_rows_checked=len(train_ok) + len(held_ok) if allowed_subjects is not None else 0,
+        subject_rows_checked=len(train_ok) + len(held_ok) + len(dev_ok) if allowed_subjects is not None else 0,
         safety_counts=None if safety_counts is None else dict(safety_counts),
+        taskdev_built=taskdev is not None,
+        missing_taskdev=missing_taskdev,
     )
 
 
@@ -662,9 +779,17 @@ def render(report: Report, max_per_rule: int = 5) -> str:
         counts = report.counts[split]
         shown = ", ".join(f"{lang} {n}" for lang, n in counts.items()) or "none"
         lines.append(f"{split + ':':<9} {shown} (total {sum(counts.values())})")
+    if report.taskdev_built:
+        counts = report.counts["taskdev"]
+        shown = ", ".join(f"{lang} {n}" for lang, n in counts.items()) or "none"
+        lines.append(f"{'taskdev:':<9} {shown} (total {sum(counts.values())})")
+    else:
+        lines.append("taskdev: not built (optional; --require-taskdev turns a missing file into an error)")
     lines.append(f"expected languages: {', '.join(report.expected_langs)}")
     if report.missing_expected:
         lines.append(f"missing expected languages: {', '.join(report.missing_expected)}")
+    if report.missing_taskdev:
+        lines.append(f"missing expected languages in taskdev: {', '.join(report.missing_taskdev)}")
     if report.not_covered:
         lines.append(f"not covered (in the study, no rows, not expected here): {', '.join(report.not_covered)}")
     if report.allowed_subjects is None:

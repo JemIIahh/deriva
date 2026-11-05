@@ -161,3 +161,104 @@ def test_the_pipeline_yaml_masks_exactly_the_instruction_lines_ftprep_writes():
     assert strata == {f"{split}:{lang}" for split in ("train", "heldout") for lang in ftprep.SOURCE_LANGS}
     assert [e["type"] for e in config["exporters"]] == ["messages"]
     assert "generators" not in config  # no LLM key: the generator step is only a commented stub
+
+
+# --- taskdev: built by the same commands ---------------------------------------------------------
+
+
+def build_all(tmp_path, name, **extra):
+    """prepare, a stand-in for CuratorKIT (export everything), finalize; returns the ft directory."""
+    raw = tmp_path / "raw"
+    if not raw.exists():
+        make_raw(raw, n=80, other=3)
+    pipeline = tmp_path / f"{name}.yaml"
+    write_pipeline(pipeline, taskdev_pool=10, taskdev_cap=8, **extra)
+    ft = tmp_path / name
+    cands_path = ft / "prep" / "candidates.jsonl"
+    prep = run(BUILD, "prepare", "--pipeline", str(pipeline), "--raw", str(raw), "--out", str(cands_path))
+    assert prep.returncode == 0, prep.stderr
+    cands = [json.loads(line) for line in cands_path.read_text(encoding="utf-8").splitlines()]
+    curated = ft / "curated"
+    curated.mkdir()
+    lines = [{"messages": [{"role": "user", "content": c["instruction"]}, {"role": "assistant", "content": c["output"]}]} for c in cands]
+    (curated / "sft_messages.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in lines), encoding="utf-8")
+    fin = run(BUILD, "finalize", "--pipeline", str(pipeline), "--curated", str(curated), "--candidates", str(cands_path), "--out", str(ft))
+    assert fin.returncode == 0, fin.stderr
+    return ft, pipeline, cands
+
+
+def test_taskdev_is_built_by_prepare_and_finalize_and_the_validator_accepts_it(tmp_path):
+    ft, pipeline, cands = build_all(tmp_path, "run")
+    assert sum(c["split"] == "taskdev" for c in cands) == 4 * 10
+    dev = [json.loads(line) for line in (ft / "taskdev.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(dev) == 4 * 8 and all(list(r) == ["id", "lang", "messages", "gold"] for r in dev)
+    for lang in LANGS4:  # the same eight items in every language
+        assert {r["id"].split(":", 1)[1] for r in dev if r["lang"] == lang} == {r["id"].split(":", 1)[1] for r in dev if r["lang"] == "en"}
+    summary = json.loads((ft / "build_summary.json").read_text(encoding="utf-8"))
+    assert summary["final"]["taskdev"] == {lang: 8 for lang in LANGS4}
+    val = run(
+        VALIDATE,
+        "--train", str(ft / "train.jsonl"),
+        "--heldout", str(ft / "heldout.jsonl"),
+        "--no-testset",
+        "--pipeline", str(pipeline),
+        "--langs", ",".join(LANGS4),
+        "--require-taskdev",
+    )
+    assert val.returncode == 0, val.stdout + val.stderr
+    assert "taskdev:  en 8, hi 8, ar 8, sw 8 (total 32)" in val.stdout
+
+
+def test_a_rebuild_gives_byte_identical_train_heldout_and_taskdev(tmp_path):
+    first, _, _ = build_all(tmp_path, "one")
+    second, _, _ = build_all(tmp_path, "two")
+    for name in ("train.jsonl", "heldout.jsonl", "taskdev.jsonl"):
+        assert (first / name).read_bytes() == (second / name).read_bytes(), name
+
+
+def test_adding_taskdev_to_the_settings_does_not_change_train_or_heldout_bytes(tmp_path):
+    raw = tmp_path / "raw"
+    make_raw(raw, n=80, other=3)
+    outputs = {}
+    for name, extra in (("plain", {}), ("dev", {"taskdev_pool": 10, "taskdev_cap": 8})):
+        pipeline = tmp_path / f"{name}.yaml"
+        write_pipeline(pipeline, **extra)
+        ft = tmp_path / name
+        cands_path = ft / "prep" / "candidates.jsonl"
+        assert run(BUILD, "prepare", "--pipeline", str(pipeline), "--raw", str(raw), "--out", str(cands_path)).returncode == 0
+        cands = [json.loads(line) for line in cands_path.read_text(encoding="utf-8").splitlines()]
+        curated = ft / "curated"
+        curated.mkdir()
+        lines = [{"messages": [{"role": "user", "content": c["instruction"]}, {"role": "assistant", "content": c["output"]}]} for c in cands]
+        (curated / "sft_messages.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in lines), encoding="utf-8")
+        fin = run(BUILD, "finalize", "--pipeline", str(pipeline), "--curated", str(curated), "--candidates", str(cands_path), "--out", str(ft))
+        assert fin.returncode == 0, fin.stderr
+        outputs[name] = ft
+    assert not (outputs["plain"] / "taskdev.jsonl").exists()
+    for name in ("train.jsonl", "heldout.jsonl"):
+        assert (outputs["plain"] / name).read_bytes() == (outputs["dev"] / name).read_bytes(), name
+
+
+def test_the_built_taskdev_file_loads_through_the_orchestrators_own_readers_for_split_dev(tmp_path):
+    from msd import evalrun
+
+    ft, _, _ = build_all(tmp_path, "run")
+    path = ft / evalrun.TASK_FILES["dev"]
+    records = evalrun.read_task_records(path)
+    assert len(records) == 4 * 8
+    for lang in LANGS4:
+        prompts = evalrun.task_prompts(records, lang, "dev", None, "taskdev.jsonl")
+        assert len(prompts) == 8
+        assert {p.kind for p in prompts} == {"task"} and {p.split for p in prompts} == {"dev"}
+        assert all(p.gold in ("A", "B", "C", "D") and p.text.strip() for p in prompts)
+        assert all(p.lang == lang for p in prompts)
+    limited = evalrun.task_prompts(records, "en", "dev", 3, "taskdev.jsonl")
+    assert [p.id for p in limited] == [r["id"] for r in records if r["lang"] == "en"][:3]
+
+
+def test_the_real_pipeline_yaml_asks_for_two_hundred_taskdev_items_per_language():
+    from msd import ftprep
+
+    settings = ftprep.load_settings(Path(__file__).resolve().parent.parent / "pipelines" / "ft_data.yaml")
+    assert settings["taskdev_cap"] == 200
+    assert settings["taskdev_pool"] >= settings["taskdev_cap"]

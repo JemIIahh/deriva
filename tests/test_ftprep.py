@@ -426,3 +426,211 @@ def test_dataset_revision_is_none_when_the_api_has_no_sha_or_cannot_be_reached()
         raise OSError("offline")
 
     assert ftprep.dataset_revision(get_json=offline) is None
+
+
+# --- taskdev: the dev split's own task items -----------------------------------------------------
+#
+# Drawn from the items neither train nor heldout took (the unused tail of the seeded ranking), as a
+# third pass over the same ranking, so the train and heldout assignment cannot move.
+
+PASSAGE = "This question refers to the following information.\nSource 1: " + "the council met and voted. " * 5
+
+
+def test_assign_splits_with_a_taskdev_pool_leaves_train_and_heldout_exactly_as_they_were():
+    ids = [f"s/test/{i}" for i in range(100)]
+    before = ftprep.assign_splits(ids, seed=1, heldout_pool=10, train_pool=60)
+    assert ftprep.assign_splits(ids, seed=1, heldout_pool=10, train_pool=60, taskdev_pool=0) == before
+    with_dev = ftprep.assign_splits(ids, seed=1, heldout_pool=10, train_pool=60, taskdev_pool=15)
+    assert {i: s for i, s in with_dev.items() if s != "taskdev"} == before
+    dev = {i for i, s in with_dev.items() if s == "taskdev"}
+    assert len(dev) == 15 and not dev & set(before)  # only items that were unused
+
+
+def test_assign_splits_taskdev_gets_what_is_left_and_is_never_padded():
+    ids = [f"s/test/{i}" for i in range(75)]
+    split = ftprep.assign_splits(ids, seed=1, heldout_pool=10, train_pool=60, taskdev_pool=15)
+    assert sum(v == "taskdev" for v in split.values()) == 5  # 75 - 70
+    split = ftprep.assign_splits(ids[:60], seed=1, heldout_pool=10, train_pool=60, taskdev_pool=15)
+    assert "taskdev" not in split.values()  # train took everything that was left
+
+
+def test_assign_splits_taskdev_keeps_a_passage_group_whole():
+    ids = [f"s/test/{i:03d}" for i in range(90)]
+    group_of = {i: "g1" for i in ids[:6]} | {i: "g2" for i in ids[6:12]}
+    split = ftprep.assign_splits(ids, seed=4, heldout_pool=10, train_pool=40, taskdev_pool=12, group_of=group_of)
+    for members in (ids[:6], ids[6:12]):
+        assert len({split.get(m) for m in members}) == 1
+    assert sum(v == "taskdev" for v in split.values()) <= 12
+
+
+def test_prepare_without_a_taskdev_pool_has_no_taskdev_rows(tmp_path):
+    make_raw(tmp_path, n=40)
+    cands, summary = ftprep.prepare(tmp_path, ("en", "hi"), ALLOWED, seed=3, heldout_pool=6, train_pool=20)
+    assert not any(c["split"] == "taskdev" for c in cands)
+    assert "taskdev" not in summary["candidates"]
+
+
+def test_prepare_with_a_taskdev_pool_leaves_every_train_and_heldout_candidate_unchanged(tmp_path):
+    make_raw(tmp_path, n=60, other=3)
+    langs = ("en", "hi", "ar", "sw")
+    base, _ = ftprep.prepare(tmp_path, langs, ALLOWED, seed=3, heldout_pool=6, train_pool=20)
+    cands, summary = ftprep.prepare(tmp_path, langs, ALLOWED, seed=3, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    assert [c for c in cands if c["split"] != "taskdev"] == base  # same rows, same order, same ranks
+    dev = [c for c in cands if c["split"] == "taskdev"]
+    assert {lang: sum(c["lang"] == lang for c in dev) for lang in langs} == {lang: 8 for lang in langs}
+    assert summary["candidates"]["taskdev"] == {lang: 8 for lang in langs}
+    assert summary["taskdev_pool"] == 8
+
+
+def test_prepare_taskdev_is_disjoint_from_train_and_heldout_by_item_and_parallel_across_languages(tmp_path):
+    make_raw(tmp_path, n=60)
+    langs = ("en", "hi", "ar", "sw")
+    cands, _ = ftprep.prepare(tmp_path, langs, ALLOWED, seed=3, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    items = {s: {c["item"] for c in cands if c["split"] == s} for s in ("train", "heldout", "taskdev")}
+    assert not (items["train"] | items["heldout"]) & items["taskdev"]
+    assert len(items["taskdev"]) == 8
+    for lang in langs:
+        assert {c["item"] for c in cands if c["split"] == "taskdev" and c["lang"] == lang} == items["taskdev"]
+    assert all(c["stratum"] == f"taskdev:{c['lang']}" for c in cands if c["split"] == "taskdev")
+
+
+def test_prepare_lists_taskdev_rows_after_train_and_heldout_so_dedup_keeps_the_others(tmp_path):
+    make_raw(tmp_path, n=60)
+    cands, _ = ftprep.prepare(tmp_path, ("en", "hi"), ALLOWED, seed=3, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    order = {"train": 0, "heldout": 1, "taskdev": 2}
+    splits = [order[c["split"]] for c in cands]
+    assert splits == sorted(splits)
+
+
+def test_prepare_taskdev_shares_no_passage_with_train_or_heldout_in_any_language(tmp_path):
+    hi_passage = "यह प्रश्न निम्नलिखित जानकारी से संबंधित है।\nस्रोत 1: " + "परिषद की बैठक हुई और मतदान हुआ। " * 5
+    for lang, base in (("en", PASSAGE), ("hi", hi_passage)):
+        rows = [raw_row(lang, i) for i in range(60)]
+        for k in range(8):  # eight groups of three items share a passage each
+            for j in range(3):
+                n = k * 3 + j
+                rows[n]["question"] = f"{base} Part {k}.\n" + QUESTIONS[lang].format(i=n)
+        write_raw(tmp_path, lang, rows)
+    cands, _ = ftprep.prepare(tmp_path, ("en", "hi"), ALLOWED, seed=9, heldout_pool=8, train_pool=20, taskdev_pool=12)
+    for lang in ("en", "hi"):
+        by_passage = {}
+        for c in (c for c in cands if c["lang"] == lang):
+            passage = ftdata.passage_of(c["instruction"])
+            if passage:
+                by_passage.setdefault(passage, set()).add(c["split"])
+        assert by_passage and all(len(s) == 1 for s in by_passage.values()), lang
+    recs = {s: [ftprep.to_record(c) for c in cands if c["split"] == s] for s in ("train", "heldout", "taskdev")}
+    report = ftdata.validate(recs["train"], recs["heldout"], taskdev=recs["taskdev"], expected_langs=("en", "hi"), allowed_subjects=ALLOWED)
+    assert report.ok, report.problems
+    assert report.counts["taskdev"]["en"] > 0
+
+
+def test_prepare_taskdev_output_validates_with_the_default_checks(tmp_path):
+    make_raw(tmp_path, n=80)
+    langs = ("en", "hi", "ar", "sw")
+    cands, _ = ftprep.prepare(tmp_path, langs, ALLOWED, seed=3, heldout_pool=6, train_pool=30, taskdev_pool=10)
+    recs = {s: [ftprep.to_record(c) for c in cands if c["split"] == s] for s in ("train", "heldout", "taskdev")}
+    report = ftdata.validate(recs["train"], recs["heldout"], taskdev=recs["taskdev"], expected_langs=langs, allowed_subjects=ALLOWED)
+    assert report.ok, report.problems
+
+
+def test_prepare_is_deterministic_with_a_taskdev_pool(tmp_path):
+    make_raw(tmp_path, n=60)
+    langs = ("en", "hi", "ar", "sw")
+    a, _ = ftprep.prepare(tmp_path, langs, ALLOWED, seed=3, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    b, _ = ftprep.prepare(tmp_path, langs, ALLOWED, seed=3, heldout_pool=6, train_pool=20, taskdev_pool=8)
+    assert a == b
+
+
+def test_cap_taskdev_prefers_the_items_every_language_kept():
+    survivors = [cand("en", i, split="taskdev") for i in range(10)]
+    survivors += [cand("hi", i, split="taskdev") for i in range(10) if i not in (2, 5)]  # hi lost items 2 and 5
+    kept = ftprep.cap_taskdev(survivors, cap=6)
+    items = {lang: {c["item"] for c in kept if c["lang"] == lang} for lang in ("en", "hi")}
+    assert items["en"] == items["hi"] == {f"high_school_geography/test/{i}" for i in (0, 1, 3, 4, 6, 7)}
+
+
+def test_cap_taskdev_fills_from_a_languages_own_best_items_when_few_are_shared_and_never_pads():
+    survivors = [cand("en", i, split="taskdev") for i in range(10)]
+    survivors += [cand("hi", i, split="taskdev") for i in (0, 1, 8, 9)]
+    kept = ftprep.cap_taskdev(survivors, cap=6)
+    en = sorted(c["rank"] for c in kept if c["lang"] == "en")
+    hi = sorted(c["rank"] for c in kept if c["lang"] == "hi")
+    assert en == [0, 1, 2, 3, 8, 9]  # the four shared items, then its own next best two
+    assert hi == [0, 1, 8, 9]  # nothing invented to reach 6
+
+
+def test_cap_taskdev_caps_every_language_and_ignores_other_splits():
+    survivors = [cand(lang, i, split="taskdev") for lang in ("en", "hi") for i in range(12)]
+    survivors += [cand("en", 50 + i, split="train") for i in range(3)]
+    kept = ftprep.cap_taskdev(survivors, cap=5)
+    assert all(c["split"] == "taskdev" for c in kept)
+    assert [sum(c["lang"] == lang for c in kept) for lang in ("en", "hi")] == [5, 5]
+
+
+def _all_splits(extra_dev=True):
+    cands = [cand("en", i, rank=i) for i in range(8)] + [cand("hi", i, rank=i) for i in range(8)]
+    cands += [cand("en", 100 + i, split="heldout", rank=100 + i) for i in range(3)]
+    cands += [cand("hi", 100 + i, split="heldout", rank=100 + i) for i in range(3)]
+    if extra_dev:
+        cands += [cand(lang, 200 + i, split="taskdev", rank=200 + i) for lang in ("en", "hi") for i in range(6)]
+    return cands
+
+
+def test_finalize_writes_taskdev_when_given_a_cap_and_leaves_train_and_heldout_bytes_alone(tmp_path):
+    without = _all_splits(extra_dev=False)
+    with_dev = _all_splits()
+    out_a, out_b = tmp_path / "a", tmp_path / "b"
+    ftprep.finalize(without, [exported(c) for c in without], out_a, train_cap=5, heldout_cap=2)
+    summary = ftprep.finalize(with_dev, [exported(c) for c in with_dev], out_b, train_cap=5, heldout_cap=2, taskdev_cap=4)
+    assert not (out_a / "taskdev.jsonl").exists()
+    for name in ("train.jsonl", "heldout.jsonl"):
+        assert (out_a / name).read_bytes() == (out_b / name).read_bytes()
+    dev = [json.loads(line) for line in (out_b / "taskdev.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(dev) == 8 and all(list(r) == ["id", "lang", "messages", "gold"] for r in dev)
+    assert summary["final"]["taskdev"] == {"en": 4, "hi": 4}
+    assert summary["capped_off"]["taskdev"] == {"en": 2, "hi": 2}
+    assert summary["caps"]["taskdev"] == 4
+
+
+def test_finalize_taskdev_survivors_lost_in_curatorkit_are_counted(tmp_path):
+    cands = _all_splits()
+    lost = [c for c in cands if c["split"] == "taskdev"][0]
+    summary = ftprep.finalize(cands, [exported(c) for c in cands if c is not lost], tmp_path, train_cap=5, heldout_cap=2, taskdev_cap=4)
+    assert summary["removed_by_curatorkit"]["taskdev"] == {lost["lang"]: 1}
+
+
+def test_finalize_refuses_taskdev_candidates_without_a_cap_and_a_cap_without_candidates(tmp_path):
+    with_dev = _all_splits()
+    with pytest.raises(ValueError, match="taskdev_cap"):
+        ftprep.finalize(with_dev, [exported(c) for c in with_dev], tmp_path, train_cap=5, heldout_cap=2)
+    without = _all_splits(extra_dev=False)
+    with pytest.raises(ValueError, match="prepare"):
+        ftprep.finalize(without, [exported(c) for c in without], tmp_path, train_cap=5, heldout_cap=2, taskdev_cap=4)
+
+
+def test_the_taskdev_file_is_the_one_the_evaluation_orchestrator_looks_for():
+    from msd import evalrun
+
+    assert ftprep.TASKDEV_FILE == evalrun.TASK_FILES["dev"] == "taskdev.jsonl"
+
+
+def test_load_settings_reads_the_optional_taskdev_keys_together_or_not_at_all(tmp_path):
+    import yaml
+
+    base = {"harmless_subjects": ["nutrition"], "split_seed": 1, "heldout_pool": 5, "train_pool": 9, "heldout_cap": 4, "train_cap": 8}
+
+    def write(**extra):
+        path = tmp_path / "p.yaml"
+        path.write_text(yaml.safe_dump({"name": "t", "extra": {**base, **extra}}), encoding="utf-8")
+        return path
+
+    assert "taskdev_pool" not in ftprep.load_settings(write())
+    settings = ftprep.load_settings(write(taskdev_pool=7, taskdev_cap=6))
+    assert (settings["taskdev_pool"], settings["taskdev_cap"]) == (7, 6)
+    with pytest.raises(ValueError, match="taskdev"):
+        ftprep.load_settings(write(taskdev_pool=7))
+    with pytest.raises(ValueError, match="taskdev"):
+        ftprep.load_settings(write(taskdev_cap=6))
+    with pytest.raises(ValueError, match="taskdev"):
+        ftprep.load_settings(write(taskdev_pool=3, taskdev_cap=6))  # the pool cannot be smaller than the cap

@@ -8,13 +8,17 @@ recorded. The whole run, in order (from the repository root):
     python scripts/build_ft_data.py fetch                  # raw rows -> data/raw/<source>/
     python scripts/build_ft_data.py prepare                # -> data/ft/prep/candidates.jsonl
     envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir data/ft/curated
-    python scripts/build_ft_data.py finalize               # -> data/ft/train.jsonl, heldout.jsonl
+    python scripts/build_ft_data.py finalize               # -> data/ft/train.jsonl, heldout.jsonl, taskdev.jsonl
     python scripts/validate_ft_data.py --langs en,hi,ar,sw
 
 fetch needs the network (the public Hugging Face datasets-server, no token) and only reads the
 allowlisted subjects of the test split. prepare and finalize run in the core venv; only the
 CuratorKIT step uses envs/curatorkit. Hinglish has no source: its rows are produced later by
 translating the Hindi rows, so it is not built here.
+
+taskdev.jsonl (the dev split's own task items, drawn from the items train and heldout left
+unused) is built by the same commands when the YAML settings hold taskdev_pool and taskdev_cap;
+without them the outputs are exactly the train and heldout files, byte for byte as before.
 
 Exit status: 0 ok; 2 bad arguments, missing data or a failed fetch.
 """
@@ -94,6 +98,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         seed=settings["split_seed"],
         heldout_pool=settings["heldout_pool"],
         train_pool=settings["train_pool"],
+        taskdev_pool=settings.get("taskdev_pool", 0),
     )
     ftprep.write_candidates(args.out, cands)
     write_json(Path(args.out).with_name("prep_summary.json"), summary)
@@ -117,6 +122,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         args.out,
         train_cap=settings["train_cap"],
         heldout_cap=settings["heldout_cap"],
+        taskdev_cap=settings.get("taskdev_cap"),
         rejected=rejected,
     )
     manifest = curated / "manifest.json"
@@ -130,7 +136,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     for key in ("candidates", "curatorkit_survivors", "removed_by_curatorkit", "capped_off", "final"):
         print(f"{key}: {summary[key]}")
     print(f"gate rejections: {summary['gate_rejections']}")
-    print(f"wrote {Path(args.out) / 'train.jsonl'} and {Path(args.out) / 'heldout.jsonl'}")
+    written = ["train.jsonl", "heldout.jsonl", *([ftprep.TASKDEV_FILE] if "taskdev" in summary["final"] else [])]
+    print("wrote " + ", ".join(str(Path(args.out) / name) for name in written))
     return 0
 
 

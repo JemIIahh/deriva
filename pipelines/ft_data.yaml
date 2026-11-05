@@ -28,8 +28,11 @@
 #   * exporter    messages -> <output-dir>/sft_messages.jsonl (only `messages`; the ids come back
 #                 in the finalize step), plus a manifest, a rejected-samples sidecar and a README.
 #
-# Sample order matters: train rows are listed before heldout rows, and both dedup steps keep the
-# first sample of a duplicate group, so a heldout item that repeats a train item is the one dropped.
+# Sample order matters: train rows are listed first, then heldout, then taskdev, and both dedup steps
+# keep the first sample of a duplicate group, so a heldout item that repeats a train item is the one
+# dropped, and a taskdev item that repeats either is dropped before it can leak into the dev split.
+# The two samplers below list only train and heldout strata; taskdev strata pass through them
+# untouched (finalize equalises taskdev across the languages by choosing common items).
 
 name: ft_data_global_mmlu_harmless_mc
 version: "0.1.0"
@@ -64,6 +67,11 @@ extra:
   train_pool: 1800        # ... and for train, before CuratorKIT drops anything
   heldout_cap: 200        # at most this many heldout rows per language in the final file
   train_cap: 1500         # at most this many train rows per language in the final file
+  # The dev split's own task items (data/ft/taskdev.jsonl, the file evalrun reads for split dev):
+  # drawn from the items train and heldout left unused, so no item or passage is shared with them.
+  # Same pool and cap style as heldout; finalize keeps the same items in every language where it can.
+  taskdev_pool: 260       # candidate items per language, before CuratorKIT drops anything
+  taskdev_cap: 200        # at most this many taskdev rows per language in the final file
   deferred: "hinglish rows come from translating the Hindi rows with the llm-chat translator (needs an endpoint)"
 
 readers:

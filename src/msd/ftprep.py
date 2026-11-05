@@ -3,7 +3,12 @@
 The pipeline is: fetch (raw rows from the Hugging Face datasets-server) -> prepare (this module
 builds the closed-form prompts and splits by source item) -> CuratorKIT (dedup, gates, balance,
 export; pipelines/ft_data.yaml) -> finalize (this module joins CuratorKIT's export back to the
-ids, caps each language and writes train.jsonl / heldout.jsonl).
+ids, caps each language and writes train.jsonl / heldout.jsonl, and taskdev.jsonl when the
+settings ask for it).
+
+`taskdev.jsonl` holds the task items the dev split's alpha is chosen on. It is drawn from the items
+that neither train nor heldout took: a third pass over the same seeded ranking, so the train and
+heldout assignment (and their bytes) cannot move when it is switched on.
 
 CuratorKIT's exporters write only the `messages` of a sample, never its id, language or gold, and
 its gates cannot build a prompt, so the two thin steps around it live here, in pure Python with
@@ -42,6 +47,8 @@ SPLIT = "test"
 OPTION_FIELDS = ("option_a", "option_b", "option_c", "option_d")
 RAW_FIELDS = ("sample_id", "subject", "question", *OPTION_FIELDS, "answer")
 ANSWERS = ("A", "B", "C", "D")
+TASKDEV_FILE = ftdata.TASKDEV_FILE  # the file the evaluation orchestrator reads for split dev (evalrun.TASK_FILES)
+SPLIT_ORDER: dict[str, int] = {"train": 0, "heldout": 1, "taskdev": 2}  # candidate order: dedup keeps the earlier row
 HF_ROWS_URL = "https://datasets-server.huggingface.co/rows"
 HF_API_URL = "https://huggingface.co/api/datasets"
 
@@ -57,13 +64,17 @@ INSTRUCTION_LINES: dict[str, str] = {
 }
 
 _SETTINGS_KEYS = ("split_seed", "heldout_pool", "train_pool", "heldout_cap", "train_cap")
+_TASKDEV_KEYS = ("taskdev_pool", "taskdev_cap")  # optional: the dev split's own task items
 
 
 # --- settings (kept in the pipeline YAML, `extra:`) -------------------------------------------
 
 
 def load_settings(pipeline_yaml: str | Path) -> dict[str, Any]:
-    """`extra.harmless_subjects` plus the seed, pool sizes and caps, validated."""
+    """`extra.harmless_subjects` plus the seed, pool sizes and caps, validated.
+
+    `taskdev_pool` and `taskdev_cap` are optional; when present they are returned too.
+    """
     with Path(pipeline_yaml).open("r", encoding="utf-8") as fh:
         extra = (yaml.safe_load(fh) or {}).get("extra") or {}
     subjects = ftdata.load_allowed_subjects(pipeline_yaml)
@@ -72,6 +83,13 @@ def load_settings(pipeline_yaml: str | Path) -> dict[str, Any]:
         raise ValueError(f"{pipeline_yaml}: extra must hold integers for {', '.join(missing)}")
     settings = {k: extra[k] for k in _SETTINGS_KEYS}
     settings["harmless_subjects"] = subjects
+    if any(k in extra for k in _TASKDEV_KEYS):  # optional, but both or neither
+        bad = [k for k in _TASKDEV_KEYS if not isinstance(extra.get(k), int) or isinstance(extra.get(k), bool) or extra[k] <= 0]
+        if bad:
+            raise ValueError(f"{pipeline_yaml}: extra must hold positive integers for both taskdev_pool and taskdev_cap, or neither (check {', '.join(bad)})")
+        if extra["taskdev_pool"] < extra["taskdev_cap"]:
+            raise ValueError(f"{pipeline_yaml}: taskdev_pool ({extra['taskdev_pool']}) must be at least taskdev_cap ({extra['taskdev_cap']})")
+        settings.update({k: extra[k] for k in _TASKDEV_KEYS})
     return settings
 
 
@@ -162,25 +180,28 @@ def assign_splits(
     heldout_pool: int,
     train_pool: int,
     group_of: Mapping[str, str] | None = None,
+    taskdev_pool: int = 0,
 ) -> dict[str, str]:
-    """item -> "heldout" or "train", one assignment for every language.
+    """item -> "heldout", "train" or "taskdev", one assignment for every language.
 
     Items are taken a group at a time (a group is the items of `group_of` sharing a value, every
     other item its own group) in a seeded global ranking: heldout fills up to `heldout_pool`
-    items, then train up to `train_pool`. A group that does not fit the room left is skipped for
-    that split, never cut, so a passage never straddles the split and a pool is never overfilled.
-    A small universe gives heldout first, then whatever is left to train (nothing is padded);
-    items beyond both pools are unused.
+    items, then train up to `train_pool`, then taskdev up to `taskdev_pool` from what both left.
+    A group that does not fit the room left is skipped for that split, never cut, so a passage
+    never straddles the split and a pool is never overfilled. A small universe gives heldout
+    first, then whatever is left to train, then to taskdev (nothing is padded); items beyond all
+    pools are unused. The third pass only reads what the first two left, so `taskdev_pool` never
+    changes the heldout or train assignment (0, the default, switches it off).
     """
     group_of = group_of or {}
     members: dict[str, list[str]] = {}
     for item in set(item_ids):
         members.setdefault(group_of.get(item, item), []).append(item)
     split: dict[str, str] = {}
-    taken = {"heldout": 0, "train": 0}
-    room = {"heldout": heldout_pool, "train": train_pool}
+    taken = {"heldout": 0, "train": 0, "taskdev": 0}
+    room = {"heldout": heldout_pool, "train": train_pool, "taskdev": taskdev_pool}
     pending = global_ranking(members, seed)
-    for name in ("heldout", "train"):
+    for name in ("heldout", "train", "taskdev"):
         left = []
         for group in pending:
             if taken[name] + len(members[group]) <= room[name]:
@@ -215,14 +236,15 @@ def prepare(
     seed: int,
     heldout_pool: int,
     train_pool: int,
+    taskdev_pool: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Candidates for every language (train rows first, then heldout) and a summary of the drops."""
+    """Candidates for every language (train rows first, then heldout, then taskdev) and a summary of the drops."""
     raw = {lang: _read_raw(raw_dir, lang) for lang in langs}
     allowed_rows = {lang: [r for r in rows if r.get("subject") in allowed_subjects] for lang, rows in raw.items()}
     universe = {r["sample_id"] for rows in allowed_rows.values() for r in rows}
     reference = "en" if "en" in allowed_rows else langs[0]  # questions are parallel across languages
     group_of = item_groups(allowed_rows[reference])
-    split_of = assign_splits(universe, seed, heldout_pool, train_pool, group_of)
+    split_of = assign_splits(universe, seed, heldout_pool, train_pool, group_of, taskdev_pool)
     group_rank = {g: n for n, g in enumerate(global_ranking({group_of.get(i, i) for i in universe}, seed))}
     rank_of = {item: group_rank[group_of.get(item, item)] for item in universe}
 
@@ -247,12 +269,13 @@ def prepare(
         outside_pool[lang] = unused
 
     order = {lang: n for n, lang in enumerate(langs)}
-    candidates.sort(key=lambda c: (c["split"] != "train", order[c["lang"]], c["rank"]))
+    candidates.sort(key=lambda c: (SPLIT_ORDER[c["split"]], order[c["lang"]], c["rank"]))
     summary = {
         "source": SOURCE_NAME,
         "seed": seed,
         "heldout_pool": heldout_pool,
         "train_pool": train_pool,
+        **({"taskdev_pool": taskdev_pool} if taskdev_pool else {}),
         "allowed_subjects": sorted(allowed_subjects),
         "raw_rows": {lang: len(rows) for lang, rows in raw.items()},
         "universe_items": len(universe),
@@ -260,13 +283,13 @@ def prepare(
         "items_in_passage_groups": len(group_of),
         "dropped": dropped,
         "outside_pool": outside_pool,
-        "candidates": _by_split_lang(candidates),
+        "candidates": _by_split_lang(candidates, bool(taskdev_pool)),
     }
     return candidates, summary
 
 
-def _by_split_lang(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
-    out: dict[str, dict[str, int]] = {"train": {}, "heldout": {}}
+def _by_split_lang(rows: Iterable[Mapping[str, Any]], with_taskdev: bool = False) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = {"train": {}, "heldout": {}, **({"taskdev": {}} if with_taskdev else {})}
     for row in rows:
         out[row["split"]][row["lang"]] = out[row["split"]].get(row["lang"], 0) + 1
     return {split: {lang: out[split][lang] for lang in LANGS if lang in out[split]} for split in out}
@@ -312,6 +335,32 @@ def cap_by_rank(survivors: Iterable[dict[str, Any]], *, train_cap: int, heldout_
     return kept
 
 
+def cap_taskdev(survivors: Iterable[dict[str, Any]], *, cap: int) -> list[dict[str, Any]]:
+    """At most `cap` taskdev rows per language, the same items in every language where possible.
+
+    Items that survived in every language come first, best rank first (the rank belongs to the
+    item, so every language picks the same ones). A language that has fewer than `cap` of those
+    adds its own best-ranked remaining rows; nothing is padded, so a language can end up short.
+    """
+    by_lang: dict[str, list[dict[str, Any]]] = {}
+    for cand in survivors:
+        if cand["split"] == "taskdev":
+            by_lang.setdefault(cand["lang"], []).append(cand)
+    ordered = {
+        lang: sorted(by_lang[lang], key=lambda c: (c["rank"], c["id"])) for lang in LANGS if lang in by_lang
+    }
+    if not ordered:
+        return []
+    shared = set.intersection(*({c["item"] for c in rows} for rows in ordered.values()))
+    kept: list[dict[str, Any]] = []
+    for rows in ordered.values():
+        chosen = [c for c in rows if c["item"] in shared][:cap]
+        taken = {c["id"] for c in chosen}
+        chosen += [c for c in rows if c["id"] not in taken][: max(0, cap - len(chosen))]
+        kept.extend(sorted(chosen, key=lambda c: (c["rank"], c["id"])))
+    return kept
+
+
 def _removed(before: Mapping[str, Mapping[str, int]], after: Mapping[str, Mapping[str, int]]) -> dict[str, dict[str, int]]:
     return {
         split: {lang: n - after[split].get(lang, 0) for lang, n in before[split].items() if n - after[split].get(lang, 0)}
@@ -333,18 +382,31 @@ def finalize(
     *,
     train_cap: int,
     heldout_cap: int,
+    taskdev_cap: int | None = None,
     rejected: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    """Write `train.jsonl` and `heldout.jsonl` under `out_dir`; return the counts at every stage."""
+    """Write `train.jsonl` and `heldout.jsonl` (and `taskdev.jsonl`) under `out_dir`; return the counts.
+
+    `taskdev_cap` is given exactly when `prepare` was run with a taskdev pool: taskdev candidates
+    without a cap, or a cap without candidates, mean the settings and the candidates file do not
+    belong together and are refused rather than guessed at.
+    """
+    has_dev = any(c["split"] == "taskdev" for c in candidates)
+    if has_dev and taskdev_cap is None:
+        raise ValueError("the candidates hold taskdev rows but taskdev_cap is not set (add taskdev_pool and taskdev_cap to extra:)")
+    if taskdev_cap is not None and not has_dev:
+        raise ValueError("taskdev_cap is set but the candidates hold no taskdev rows (prepare was run without taskdev_pool, or no unused items were left); run prepare again with the same settings")
     survivors = join_exported(candidates, exported)
     kept = cap_by_rank(survivors, train_cap=train_cap, heldout_cap=heldout_cap)
+    if has_dev:
+        kept = kept + cap_taskdev(survivors, cap=taskdev_cap)
     out = Path(out_dir)
-    for split in ("train", "heldout"):
+    for split in ("train", "heldout", *(("taskdev",) if has_dev else ())):
         _write_jsonl(out / f"{split}.jsonl", (to_record(c) for c in kept if c["split"] == split))
 
     gates = Counter(f"{r.get('rejecting_step')}: {str(r.get('rejection_reason', '')).split(':', 1)[0]}" for r in rejected)
     gate_langs = Counter((r.get("metadata") or {}).get("lang", "unknown") for r in rejected)
-    cands_n, surv_n, final_n = _by_split_lang(candidates), _by_split_lang(survivors), _by_split_lang(kept)
+    cands_n, surv_n, final_n = (_by_split_lang(rows, has_dev) for rows in (candidates, survivors, kept))
     return {
         "candidates": cands_n,
         "curatorkit_survivors": surv_n,
@@ -353,7 +415,7 @@ def finalize(
         "gate_rejections_by_lang": dict(gate_langs),
         "capped_off": _removed(surv_n, final_n),
         "final": final_n,
-        "caps": {"train": train_cap, "heldout": heldout_cap},
+        "caps": {"train": train_cap, "heldout": heldout_cap, **({"taskdev": taskdev_cap} if has_dev else {})},
     }
 
 

@@ -921,3 +921,275 @@ def test_cli_empty_safety_files_fail_instead_of_passing_vacuously(ft_dir):
     assert result.returncode == ftdata.EXIT_CODES["safety_empty"], result.stdout + result.stderr
     assert "en: 0 dev + 0 report" in result.stdout
     assert "FAIL safety_empty" in result.stdout
+
+
+# --- taskdev: the dev split's own task items ---------------------------------------------------
+#
+# data/ft/taskdev.jsonl holds the task items alpha is chosen on. It must share no item, passage or
+# prompt with train or heldout, and it is optional: a missing file is a status line, not a failure.
+
+DEV_PASSAGE = "This question refers to the following information.\nSource 1: " + "the council met and voted. " * 5
+
+
+def devs(langs=FOUR, n=3, start=2000):
+    """Valid taskdev records: item numbers disjoint from sets() (train 0..9, heldout 1000..1002)."""
+    return [rec(lang, start + i) for lang in langs for i in range(n)]
+
+
+def test_valid_taskdev_passes_and_reports_its_counts():
+    train, held = sets()
+    report = run(train, held, taskdev=devs())
+    assert report.ok, report.problems
+    assert report.taskdev_built
+    assert report.counts["taskdev"] == {lang: 3 for lang in FOUR}
+    assert "taskdev:  en 3, hi 3, ar 3, sw 3 (total 12)" in ftdata.render(report)
+
+
+def test_an_absent_taskdev_is_a_status_line_not_a_failure():
+    train, held = sets()
+    report = run(train, held)  # taskdev=None: the file does not exist
+    assert report.ok and not report.taskdev_built
+    assert "taskdev: not built" in ftdata.render(report)
+
+
+def test_taskdev_sharing_a_prompt_with_train_fails_with_its_own_class():
+    train, held = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, user=train[0]["messages"][0]["content"])  # a new item id, the same text
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"taskdev_overlap"}
+    assert report.exit_code() == ftdata.EXIT_CODES["taskdev_overlap"]
+    (problem,) = report.problems
+    assert problem.where == "taskdev" and problem.id == dev[0]["id"]
+    assert "train" in problem.message and train[0]["id"] in problem.message
+
+
+def test_taskdev_sharing_a_prompt_with_heldout_fails_with_its_own_class():
+    train, held = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, user=held[1]["messages"][0]["content"])  # held[1] is an English row
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"taskdev_overlap"}
+    assert "heldout" in report.problems[0].message
+
+
+def test_taskdev_overlap_uses_the_normalisation_of_the_other_leakage_checks():
+    train, held = sets()
+    dev = devs()
+    shouty = "  " + train[0]["messages"][0]["content"].upper().replace("\n", "\n\n") + "  "  # case and whitespace only
+    dev[0] = rec("en", 2000, user=shouty)
+    assert classes(run(train, held, taskdev=dev)) == {"taskdev_overlap"}
+
+
+def test_taskdev_in_one_language_and_train_in_another_share_a_source_item():
+    train, held = sets()
+    train = [r for r in train if r["id"] != "hi:history/test/0"]  # the hi row of item 0 is not in train ...
+    dev = devs()
+    dev[3] = rec("hi", 2000, item="history/test/0")  # ... but the en row is, so this is the same item
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"taskdev_overlap"}
+    assert any("history/test/0" in p.message and "en:history/test/0" in p.message for p in report.problems)
+
+
+def test_taskdev_sharing_an_item_with_heldout_across_languages_fails():
+    train, held = sets()
+    held = [r for r in held if r["id"] != "ar:history/test/1000"]
+    dev = devs()
+    dev[7] = rec("ar", 2001, item="history/test/1000")
+    assert classes(run(train, held, taskdev=dev)) == {"taskdev_overlap"}
+
+
+def test_taskdev_sharing_a_passage_with_train_fails_even_for_a_different_question():
+    train, held = sets()
+    put(train, rec("en", 0, user=user_turn("en", 0, question=f"{DEV_PASSAGE}\nWhat did the council do?")))
+    dev = devs()
+    dev[0] = rec("en", 2000, user=user_turn("en", 0, question=f"{DEV_PASSAGE}\nWhen did the council meet?"))
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"taskdev_overlap"}
+    assert "passage" in report.problems[0].message
+
+
+def test_taskdev_items_may_share_a_passage_with_each_other():
+    train, held = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, user=user_turn("en", 0, question=f"{DEV_PASSAGE}\nWhat did the council do?"))
+    dev[1] = rec("en", 2001, user=user_turn("en", 0, question=f"{DEV_PASSAGE}\nWhen did the council meet?"))
+    assert run(train, held, taskdev=dev).ok
+
+
+def test_taskdev_item_outside_the_subject_allowlist_fails_the_subject_rule():
+    train, held = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, item="virology/test/2000")
+    report = run(train, held, taskdev=dev, allowed_subjects={"history"})
+    assert classes(report) == {"subject"}
+    assert report.problems[0].where == "taskdev" and "virology" in report.problems[0].message
+    assert report.subject_rows_checked == len(train) + len(held) + len(dev)
+
+
+def test_taskdev_is_held_to_the_same_schema_as_the_other_splits():
+    train, held = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, assistant=REFUSALS["en"])
+    dev[1]["extra"] = "key"
+    dev[2] = rec("en", 2002, user=user_turn("en", 2002, question="12 + 30 = ?"))
+    dev[2]["gold"] = "Z"
+    got = classes(run(train, held, taskdev=dev))
+    assert {"refusal", "format", "answer"} <= got
+
+
+def test_a_repeated_id_inside_taskdev_is_a_format_failure():
+    train, held = sets()
+    dev = devs()
+    dev.append(dict(dev[0]))
+    assert "format" in classes(run(train, held, taskdev=dev))
+
+
+def test_a_repeated_prompt_inside_taskdev_is_an_overlap_failure():
+    train, held = sets()
+    dev = devs()
+    dev[1] = rec("en", 2001, user=dev[0]["messages"][0]["content"])
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"overlap"}
+    assert report.problems[0].where == "taskdev"
+
+
+def test_taskdev_prompt_equal_to_a_safety_prompt_is_an_overlap_failure():
+    train, held = sets()
+    dev = devs()
+    report = run(train, held, taskdev=dev, safety_report=[dev[0]["messages"][0]["content"]])
+    assert classes(report) == {"overlap"}
+    assert any(p.where == "taskdev" for p in report.problems)
+
+
+def test_taskdev_with_a_very_uneven_count_per_language_fails_the_imbalance_rule():
+    train, held = sets()
+    dev = devs(("en",), n=20) + devs(("hi", "ar", "sw"), n=5)
+    report = run(train, held, taskdev=dev)
+    assert classes(report) == {"imbalance"}
+    assert report.problems[0].where == "taskdev" and "en" in report.problems[0].message
+
+
+def test_an_expected_language_with_no_taskdev_rows_is_missing():
+    train, held = sets()
+    report = run(train, held, taskdev=devs(("en", "hi", "ar")))
+    assert classes(report) == {"missing_lang"}
+    assert report.missing_taskdev == ["sw"]
+    assert any(p.where == "taskdev" and "sw" in p.message for p in report.problems)
+
+
+def test_an_empty_taskdev_file_misses_every_expected_language():
+    train, held = sets()
+    report = run(train, held, taskdev=[])
+    assert report.taskdev_built and report.missing_taskdev == list(FOUR)
+
+
+def test_different_item_sets_across_languages_are_a_warning_only():
+    train, held = sets()
+    dev = devs(("en", "hi", "ar"), n=3) + devs(("sw",), n=3, start=3000)
+    report = run(train, held, taskdev=dev)
+    assert report.ok
+    assert any(w.startswith("taskdev:") and "item" in w for w in report.warnings)
+
+
+def test_the_same_items_in_every_language_give_no_warning():
+    train, held = sets()
+    assert run(train, held, taskdev=devs()).warnings == []
+
+
+def test_taskdev_overlap_has_the_next_free_exit_code_after_the_safety_codes():
+    assert ftdata.EXIT_CODES["taskdev_overlap"] == 19
+    assert ftdata.EXIT_CODES["safety_empty"] == 18  # 10-18 were all taken, so 19 is the next free one
+
+
+def test_taskdev_overlap_and_another_failure_give_the_generic_exit_code():
+    train, held = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, user=train[0]["messages"][0]["content"])
+    put(train, rec("sw", 0, assistant=REFUSALS["sw"]))
+    assert run(train, held, taskdev=dev).exit_code() == 1
+
+
+# --- the command line: taskdev -----------------------------------------------------------------
+
+
+def write_taskdev(ft_dir, rows, name="taskdev.jsonl"):
+    write_ft(ft_dir / "ft" / name, rows)
+
+
+def test_cli_without_a_taskdev_file_says_not_built_and_still_passes(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "taskdev: not built" in result.stdout
+
+
+def test_cli_require_taskdev_fails_clearly_when_the_file_is_missing(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS, "--require-taskdev")
+    assert result.returncode == 2
+    assert "taskdev.jsonl" in result.stderr and "--require-taskdev" in result.stderr
+
+
+def test_cli_validates_the_taskdev_file_that_sits_next_to_the_heldout_file(ft_dir):
+    write_taskdev(ft_dir, devs())
+    result = cli(ft_dir, *FOUR_LANGS, "--require-taskdev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "taskdev:  en 3, hi 3, ar 3, sw 3 (total 12)" in result.stdout
+
+
+def test_cli_the_default_taskdev_file_follows_the_heldout_argument(ft_dir):
+    other = ft_dir / "elsewhere"
+    write_ft(other / "heldout.jsonl", sets()[1])
+    write_ft(other / "taskdev.jsonl", devs())
+    result = cli(ft_dir, *FOUR_LANGS, held=other / "heldout.jsonl")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "taskdev:  en 3" in result.stdout
+
+
+def test_cli_taskdev_flag_names_another_file(ft_dir):
+    write_taskdev(ft_dir, devs(), name="mine.jsonl")
+    result = cli(ft_dir, *FOUR_LANGS, "--taskdev", str(ft_dir / "ft" / "mine.jsonl"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "taskdev:  en 3" in result.stdout
+
+
+def test_cli_taskdev_overlapping_train_exits_with_the_taskdev_overlap_code(ft_dir):
+    train, _ = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, user=train[0]["messages"][0]["content"])
+    write_taskdev(ft_dir, dev)
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert result.returncode == ftdata.EXIT_CODES["taskdev_overlap"], result.stdout + result.stderr
+    assert "FAIL taskdev_overlap" in result.stdout and train[0]["id"] in result.stdout
+
+
+def test_cli_taskdev_overlap_is_reported_even_when_taskdev_is_not_required(ft_dir):
+    train, _ = sets()
+    dev = devs()
+    dev[0] = rec("en", 2000, item="history/test/3")  # the same source item as train
+    write_taskdev(ft_dir, dev)
+    assert cli(ft_dir, *FOUR_LANGS).returncode == ftdata.EXIT_CODES["taskdev_overlap"]
+
+
+def test_cli_taskdev_subject_is_checked_by_default(ft_dir):
+    dev = devs()
+    dev[0] = rec("en", 2000, item="virology/test/2000")
+    write_taskdev(ft_dir, dev)
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert result.returncode == ftdata.EXIT_CODES["subject"], result.stdout + result.stderr
+    assert "[taskdev " in result.stdout
+    assert cli(ft_dir, *FOUR_LANGS, "--no-subject-check").returncode == 0
+
+
+def test_cli_taskdev_unparseable_line_is_a_format_failure(ft_dir):
+    write_taskdev(ft_dir, devs())
+    path = ft_dir / "ft" / "taskdev.jsonl"
+    path.write_text(path.read_text(encoding="utf-8") + "{not json\n", encoding="utf-8")
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert result.returncode == ftdata.EXIT_CODES["format"], result.stdout + result.stderr
+    assert "taskdev" in result.stdout
+
+
+def test_cli_a_taskdev_path_that_was_named_but_does_not_exist_is_an_error_not_a_skip(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS, "--taskdev", str(ft_dir / "ft" / "typo.jsonl"))
+    assert result.returncode == 2
+    assert "typo.jsonl" in result.stderr and "--taskdev" in result.stderr

@@ -17,11 +17,17 @@ repository's pipelines/ft_data.yaml. --pipeline points at another file; --no-sub
 the rule off and the output then says "subject allowlist: NOT checked". The output always has an
 allowlist status line (which subjects and how many rows were checked, or NOT checked).
 
+The dev task items, taskdev.jsonl, are optional and are read from the directory of --heldout unless
+--taskdev names another file. A missing default file prints "taskdev: not built" and is not a
+failure; --require-taskdev makes it an error, and so does a --taskdev path that does not exist.
+When the file is there it gets the same schema, subject and per-language count checks as the
+other splits and must share no prompt, source item or passage with train or heldout.
+
 Exit status: 0 ok; 1 several rule classes failed; 2 bad arguments or unreadable input;
 10 format, 11 refusal, 12 answer not bare / not gold, 13 overlap (train, heldout or safety
 splits), 14 language imbalance, 15 wrong script for the language code, 16 expected language
 missing, 17 subject not on the allowlist, 18 a covered safety language has no dev or no report
-prompts.
+prompts, 19 taskdev shares a prompt, item or passage with train or heldout.
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--train", type=Path, default=ROOT / "data" / "ft" / "train.jsonl")
     ap.add_argument("--heldout", type=Path, default=ROOT / "data" / "ft" / "heldout.jsonl")
+    ap.add_argument("--taskdev", type=Path, help="dev task items (default: taskdev.jsonl next to --heldout)")
+    ap.add_argument("--require-taskdev", action="store_true", help="a missing taskdev file is an error, not a 'not built' line")
     ap.add_argument("--testset", type=Path, default=ROOT / "data" / "testset", help="safety test-set directory")
     ap.add_argument("--no-testset", action="store_true", help="skip the safety-split overlap check (says so in the output)")
     ap.add_argument("--langs", default=",".join(LANGS), help="comma-separated languages the data must cover")
@@ -67,6 +75,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         train, train_problems = ftdata.read_jsonl_records(args.train, "train")
         heldout, held_problems = ftdata.read_jsonl_records(args.heldout, "heldout")
+        taskdev_path = args.taskdev or args.heldout.with_name(ftdata.TASKDEV_FILE)
+        taskdev_records, taskdev_problems = None, []
+        if taskdev_path.is_file():
+            taskdev_records, taskdev_problems = ftdata.read_jsonl_records(taskdev_path, "taskdev")
+        elif args.require_taskdev or args.taskdev:  # asked for by flag or by name: never skipped silently
+            why = "--require-taskdev was given" if args.require_taskdev else "named with --taskdev"
+            raise FileNotFoundError(f"{taskdev_path} not found ({why}); build it with scripts/build_ft_data.py")
         subjects = None if args.no_subject_check else ftdata.load_allowed_subjects(args.pipeline)
         if args.no_testset:
             dev, report_texts, safety_counts = [], [], None
@@ -84,8 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         safety_report=report_texts,
         allowed_subjects=subjects,
         safety_counts=safety_counts,
+        taskdev=taskdev_records,
         imbalance_tolerance=args.tolerance,
-        read_problems=[*train_problems, *held_problems],
+        read_problems=[*train_problems, *held_problems, *taskdev_problems],
     )
     print(ftdata.render(report))
     return report.exit_code()
