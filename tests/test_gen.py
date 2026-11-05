@@ -360,8 +360,8 @@ def test_duplicate_ids_in_an_existing_file_are_a_loud_error(tmp_path):
         ("A0", None, "A1", None),  # another arm
         ("A2", 0.25, "A2", 0.5),  # another alpha
         ("A2", 0.25, "A3", None),
-        ("A3", None, "A3", 0.5),  # None vs a number
-        ("A3", 0.5, "A3", None),
+        ("A2n", 0.5, "A2n", 0.25),
+        ("A3", 0.5, "A3", None),  # a number vs None
     ],
 )
 def test_rows_of_another_arm_or_alpha_in_an_existing_file_are_a_loud_error(
@@ -432,7 +432,7 @@ def test_a_failed_write_is_rolled_back(tmp_path, monkeypatch):
         ("BASE", 0.5, False), ("A0", 0.0, False), ("A1", 1.0, False),
         ("A2", 0.5, True), ("A2", 0.0, True), ("A2", 1.0, True), ("A2", None, False),
         ("A2n", 0.25, True), ("A2n", None, False),
-        ("A3", None, True), ("A3", 0.5, True),  # A3 is a fine-tune: alpha is allowed but not required
+        ("A3", None, True), ("A3", 0.5, False), ("A3", 0.0, False),  # A3 (Harden, a fine-tune) has no alpha
         ("A9", None, False), ("a0", None, False),
         ("A2", float("nan"), False), ("A2", float("inf"), False), ("A2", -0.1, False),
     ],
@@ -557,6 +557,42 @@ def test_run_meta_never_contains_the_token(monkeypatch):
     assert token not in text and "hf_A1b2" not in text
     monkeypatch.setenv("SOME_API_KEY", "super-secret-value-123")
     assert "super-secret-value-123" not in json.dumps(_meta(model_path="x/super-secret-value-123/y"))
+
+
+def test_row_fields_follow_the_generation_dataclass():
+    import dataclasses
+
+    assert gen._ROW_FIELDS == {f.name for f in dataclasses.fields(Generation)}
+
+
+def test_scan_existing_is_a_dry_run_that_reports_what_a_run_would_do(tmp_path):
+    out = tmp_path / "g.jsonl"
+    good = _good_lines(2)
+    out.write_bytes(good + b'{"prompt_id": "p2", "ar')
+    before = out.read_bytes()
+    found = gen.scan_existing(make_prompts(4), out, arm="A1", alpha=None)
+    assert found.done == {"p0", "p1"} and found.torn_bytes == len(b'{"prompt_id": "p2", "ar')
+    assert out.read_bytes() == before  # a scan never writes
+    assert gen.scan_existing(make_prompts(4), tmp_path / "missing.jsonl", arm="A1", alpha=None).done == frozenset()
+    with pytest.raises(ResumeError):
+        gen.scan_existing(make_prompts(1), out, arm="A1", alpha=None)  # p1 is not among the prompts
+    with pytest.raises(ValueError, match="p0"):
+        gen.scan_existing(make_prompts(2) + make_prompts(1), out, arm="A1", alpha=None)
+    with pytest.raises(ValueError, match="alpha"):
+        gen.scan_existing(make_prompts(2), out, arm="A3", alpha=0.5)
+
+
+def test_dropping_a_torn_tail_is_reported_on_stderr_by_size_and_file_name_only(tmp_path, capsys):
+    out = tmp_path / "g.jsonl"
+    tail = b'{"prompt_id": "p2", "text": "SECRET-COMPLETION-TEXT'
+    out.write_bytes(_good_lines(2) + tail)
+    generate(make_prompts(3), Recorder(), out, arm="A1", alpha=None)
+    err = capsys.readouterr().err
+    assert "g.jsonl" in err and str(len(tail)) in err and "torn" in err
+    assert "SECRET-COMPLETION-TEXT" not in err
+
+    generate(make_prompts(3), Recorder(), out, arm="A1", alpha=None)  # a clean file says nothing
+    assert capsys.readouterr().err == ""
 
 
 def test_run_meta_has_no_environment_dump(monkeypatch):

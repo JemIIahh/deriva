@@ -5,6 +5,7 @@ a fake or injected backend, and never a model.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,6 @@ from msd.gen import GenOut
 from msd.schema import Generation, Prompt, read_jsonl, write_jsonl
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "generate.py"
-REPO_ROOT = SCRIPT.parent.parent
 MARK = "SENTINEL-PROMPT-TEXT"  # stands in for prompt text; it must never be printed
 
 
@@ -98,6 +98,7 @@ def hf_args(scratch, *extra, arm="A0", split="dev"):
         ["--arm", "A0", "--split", "dev", "--backend", "fake", "--alpha", "0.5"],  # alpha on an arm without one
         ["--arm", "BASE", "--split", "dev", "--backend", "fake", "--alpha", "0"],
         ["--arm", "A1", "--split", "dev", "--backend", "fake", "--alpha", "1.0"],
+        ["--arm", "A3", "--split", "dev", "--backend", "fake", "--alpha", "0.5"],  # Harden has no alpha either
         ["--arm", "A2", "--split", "dev", "--backend", "fake"],  # alpha is required
         ["--arm", "A2n", "--split", "dev", "--backend", "fake"],
         ["--arm", "A2", "--split", "dev", "--backend", "fake", "--alpha", "none"],
@@ -134,7 +135,7 @@ def test_help_exits_0(repo, capsys):
 @pytest.mark.parametrize(
     "arm, extra",
     [("BASE", []), ("A0", []), ("A1", []), ("A2", ["--alpha", "0.25"]), ("A2n", ["--alpha", "0.5"]),
-     ("A3", []), ("A3", ["--alpha", "0.5"]), ("A0", ["--alpha", "none"]), ("A1", ["--alpha", "None"])],
+     ("A3", []), ("A3", ["--alpha", "none"]), ("A0", ["--alpha", "none"]), ("A1", ["--alpha", "None"])],
 )
 def test_valid_arm_alpha_combinations_run(repo, scratch, arm, extra):
     build_testset(repo, n=2)
@@ -192,6 +193,62 @@ def test_fake_backend_is_fine_elsewhere_and_the_real_backend_may_use_results(rep
     assert run_cli(repo, *fake_args(scratch)) == 0
     assert run_cli(repo, "--arm", "A0", "--split", "dev", "--backend", "hf", "--model-path", "m") == 0  # default out root
     assert (repo / "results" / "dev" / "A0" / "none" / "en.gens.jsonl").is_file()
+
+
+BLOCKED_SPELLINGS = [
+    "results", "./results", "results/", "results/../results", "{abs}", "{abs}/.", "{abs}/../results",
+    "{link}", "{link}/sub", "Results", "RESULTS/x", "results/generate", "{abs_upper}", "../{reponame}/results",
+]
+ALLOWED_SPELLINGS = ["~/results", "results_x", "results.bak", "{root}", "{elsewhere}/results"]
+
+
+@pytest.fixture
+def layout(repo, tmp_path, monkeypatch):
+    (repo / "results").mkdir()
+    link = tmp_path / "lnk"
+    link.symlink_to(repo / "results", target_is_directory=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(repo)
+    return {"root": str(repo), "abs": str(repo / "results"), "link": str(link), "elsewhere": str(elsewhere),
+            "abs_upper": str(repo / "RESULTS"), "reponame": repo.name}
+
+
+@pytest.mark.parametrize("spelling", BLOCKED_SPELLINGS)
+def test_every_spelling_of_the_real_results_dir_is_recognised(repo, layout, spelling):
+    assert genrun.is_in_results(Path(spelling.format(**layout)), repo)
+
+
+@pytest.mark.parametrize("spelling", ALLOWED_SPELLINGS)
+def test_other_directories_are_not_taken_for_results(repo, layout, spelling):
+    assert not genrun.is_in_results(Path(spelling.format(**layout)), repo)
+
+
+def test_a_case_variant_of_results_is_recognised_from_another_cwd(repo, layout, monkeypatch):
+    monkeypatch.chdir(layout["elsewhere"])
+    assert genrun.is_in_results(repo / "Results", repo)  # works on a case-sensitive file system too
+    assert genrun.is_in_results(repo / "RESULTS" / "generate" / "deep", repo)
+    assert not genrun.is_in_results(repo / "Resultsx", repo)
+
+
+def test_fake_backend_with_a_case_variant_out_root_writes_nothing(repo, layout, capsys):
+    build_testset(repo, n=2)
+    for variant in ("Results", "RESULTS/x", str(repo / "Results")):
+        assert genrun.main(fake_args(variant), root=repo) == 2
+    assert list((repo / "results").iterdir()) == []  # on a case-insensitive file system Results IS results
+    assert not (repo / "Results").exists() or (repo / "Results").samefile(repo / "results")
+    assert "fake" in capsys.readouterr().err
+
+
+def test_a_path_that_is_the_same_directory_by_the_file_system_is_refused(repo, layout, tmp_path, monkeypatch):
+    mount = tmp_path / "mount"
+    mount.mkdir()
+    assert not genrun.is_in_results(mount / "sub", repo)
+    # the file system says `mount` is results/ (a bind mount, a case-insensitive spelling the name test misses ...)
+    monkeypatch.setattr(os.path, "samefile", lambda a, b: Path(a).name == "mount")
+    assert genrun.is_in_results(mount / "sub", repo)
+    build_testset(repo, n=2)
+    assert genrun.main(fake_args(mount / "sub"), root=repo) == 2
 
 
 # --- a normal run -------------------------------------------------------------------------------------------------
@@ -440,15 +497,35 @@ def test_switching_between_fake_and_real_backend_in_one_directory_is_refused(rep
     assert run_cli(repo, *hf_args(scratch)) not in (0, 2)  # fake rows must not become a real run
 
 
-def test_the_same_setup_again_is_accepted_and_keeps_the_first_timestamp(repo, scratch):
+def test_the_same_setup_again_is_accepted_and_a_no_op_rerun_leaves_the_meta_untouched(repo, scratch):
     build_testset(repo, n=2)
     assert run_cli(repo, *fake_args(scratch)) == 0
     meta_file = gen.meta_path(gen.gens_path(scratch, "dev", "A0", None, "en"))
-    first = json.loads(meta_file.read_text(encoding="utf-8"))
+    first = meta_file.read_bytes()
     assert run_cli(repo, *fake_args(scratch)) == 0
-    second = json.loads(meta_file.read_text(encoding="utf-8"))
-    assert second["n_rows"] == first["n_rows"] == 2
-    assert [e["timestamp_utc"] for e in second["earlier"]] == [first["timestamp_utc"]]  # the first run stays on record
+    assert meta_file.read_bytes() == first  # nothing new was generated and the setup is the same: no rewrite
+    assert "earlier" not in json.loads(first)
+    assert run_cli(repo, *fake_args(scratch, "--force-new-meta")) == 0  # forcing the same setup changes nothing either
+    assert meta_file.read_bytes() == first
+
+
+def test_a_forced_setup_change_with_nothing_to_generate_still_updates_the_meta(repo, scratch):
+    build_testset(repo, n=3)
+    assert run_cli(repo, *fake_args(scratch, "--batch-size", "4")) == 0
+    gens_file = gen.gens_path(scratch, "dev", "A0", None, "en")
+    before = gens_file.read_bytes()
+    assert run_cli(repo, *fake_args(scratch, "--batch-size", "8", "--force-new-meta")) == 0
+    meta = json.loads(gen.meta_path(gens_file).read_text(encoding="utf-8"))
+    assert meta["batch_size"] == 8 and [e["batch_size"] for e in meta["earlier"]] == [4]
+    assert gens_file.read_bytes() == before
+
+
+def test_a_run_that_adds_rows_records_the_previous_meta_once(repo, scratch):
+    build_testset(repo, n=6)
+    assert run_cli(repo, *fake_args(scratch, "--limit", "2")) == 0
+    assert run_cli(repo, *fake_args(scratch, "--limit", "6")) == 0
+    meta = json.loads(gen.meta_path(gen.gens_path(scratch, "dev", "A0", None, "en")).read_text(encoding="utf-8"))
+    assert meta["n_rows"] == 6 and [e["n_rows"] for e in meta["earlier"]] == [2]
 
 
 def test_an_unreadable_meta_file_is_refused_unless_forced(repo, scratch):
@@ -484,18 +561,172 @@ def test_the_meta_file_never_holds_a_token(repo, scratch, hf, monkeypatch):
     assert token not in gen.gens_path(scratch, "dev", "A0", None, "en").read_text(encoding="utf-8")
 
 
+# --- hard kills: the meta must already be on disk -------------------------------------------------------------------------
+
+KILLER = r"""
+import os, sys
+from pathlib import Path
+from msd import gen, genrun
+calls = {"n": 0}
+real_fake = gen.fake_backend
+def killing_fake():
+    inner = real_fake()
+    def run(prompts):
+        calls["n"] += 1
+        if calls["n"] == int(os.environ["KILL_ON_CALL"]):
+            os._exit(137)  # what SIGKILL, the OOM killer or a Colab disconnect does: no handler runs
+        return inner(prompts)
+    return run
+gen.fake_backend = killing_fake
+sys.exit(genrun.main(sys.argv[2:], root=Path(sys.argv[1])))
+"""
+
+
+def run_killed(repo, kill_on_call, *argv):
+    env = {**os.environ, "KILL_ON_CALL": str(kill_on_call)}
+    return subprocess.run([sys.executable, "-c", KILLER, str(repo), *argv], capture_output=True, text=True, env=env)
+
+
+def test_a_hard_kill_leaves_a_meta_that_guards_the_rerun(repo, scratch):
+    build_testset(repo, n=8)
+    gens_file = gen.gens_path(scratch, "dev", "A0", None, "en")
+    meta_file = gen.meta_path(gens_file)
+
+    killed = run_killed(repo, 2, *fake_args(scratch, "--batch-size", "3"))
+    assert killed.returncode == 137, killed.stderr
+    assert gens_file.read_bytes().count(b"\n") == 3  # the first batch is on disk
+    assert json.loads(meta_file.read_text(encoding="utf-8"))["batch_size"] == 3  # and so is its meta
+    assert not meta_file.with_name(meta_file.name + ".tmp").exists()
+    before = gens_file.read_bytes()
+
+    assert run_cli(repo, *fake_args(scratch, "--batch-size", "5")) not in (0, 2)  # another setup must not join the file
+    assert gens_file.read_bytes() == before
+    assert json.loads(meta_file.read_text(encoding="utf-8"))["batch_size"] == 3
+
+    assert run_cli(repo, *fake_args(scratch, "--batch-size", "3")) == 0  # the same setup resumes
+    assert [r.prompt_id for r in read_jsonl(gens_file, Generation)] == [f"en-{i}" for i in range(8)]
+    assert json.loads(meta_file.read_text(encoding="utf-8"))["n_rows"] == 8
+
+
+def test_a_kill_in_the_middle_of_a_later_language_keeps_the_first_one_clean(repo, scratch):
+    build_testset(repo, langs=("en", "hi"), n=4)
+    killed = run_killed(repo, 4, *fake_args(scratch, "--langs", "en,hi", "--batch-size", "2"))  # hi, 2nd batch
+    assert killed.returncode == 137
+    for lang, rows in (("en", 4), ("hi", 2)):
+        gens_file = gen.gens_path(scratch, "dev", "A0", None, lang)
+        assert gens_file.read_bytes().count(b"\n") == rows and gen.meta_path(gens_file).is_file()
+    assert run_cli(repo, *fake_args(scratch, "--langs", "en,hi", "--batch-size", "2")) == 0
+
+
+def test_a_gens_file_with_rows_but_no_meta_is_refused_unless_forced(repo, scratch, capsys):
+    build_testset(repo, n=6)
+    assert run_cli(repo, *fake_args(scratch, "--limit", "3")) == 0
+    gens_file = gen.gens_path(scratch, "dev", "A0", None, "en")
+    meta_file = gen.meta_path(gens_file)
+    meta_file.unlink()  # a kill before the meta existed, or a deleted file
+    before = gens_file.read_bytes()
+    capsys.readouterr()
+
+    assert run_cli(repo, *fake_args(scratch, "--limit", "6")) not in (0, 2)
+    err = capsys.readouterr().err
+    assert str(gens_file) in err and "--force-new-meta" in err and "no meta" in err
+    assert gens_file.read_bytes() == before and not meta_file.exists()
+
+    assert run_cli(repo, *fake_args(scratch, "--limit", "6", "--force-new-meta")) == 0
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["n_rows"] == 6 and meta["unrecorded_rows"] == 3  # the rows made without a record are marked as such
+    assert run_cli(repo, *fake_args(scratch, "--limit", "6")) == 0  # and now the setup is on record
+
+
+def test_the_meta_is_on_disk_before_the_first_batch_is_generated(repo, scratch, monkeypatch):
+    build_testset(repo, n=5)
+    meta_file = gen.meta_path(gen.gens_path(scratch, "dev", "A0", None, "en"))
+    seen = []
+
+    def spy_backend():
+        def run(prompts):
+            seen.append(json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else None)
+            return [GenOut("x", "stop") for _ in prompts]
+
+        return run
+
+    monkeypatch.setattr(gen, "fake_backend", spy_backend)
+    assert run_cli(repo, *fake_args(scratch, "--batch-size", "2")) == 0
+    assert len(seen) == 3 and all(m is not None for m in seen)
+    assert seen[0]["n_rows"] == 0 and seen[0]["batch_size"] == 2 and seen[0]["backend"] == "fake"
+    assert json.loads(meta_file.read_text(encoding="utf-8"))["n_rows"] == 5  # updated at the end
+    assert not meta_file.with_name(meta_file.name + ".tmp").exists()
+
+
+def test_a_failure_before_any_row_does_not_lock_the_setup(repo, monkeypatch, scratch, capsys):
+    build_testset(repo, n=4)
+    monkeypatch.setattr(gen, "hf_backend", Hf(fail_on_call=1))  # for example an out-of-memory in the first batch
+    assert run_cli(repo, *hf_args(scratch, "--batch-size", "32")) not in (0, 2)
+    gens_file = gen.gens_path(scratch, "dev", "A0", None, "en")
+    assert not gens_file.exists()  # no rows, so the leftover meta describes nothing
+    monkeypatch.setattr(gen, "hf_backend", Hf())
+    assert run_cli(repo, *hf_args(scratch, "--batch-size", "2")) == 0  # a smaller batch is not refused
+    meta = json.loads(gen.meta_path(gens_file).read_text(encoding="utf-8"))
+    assert meta["batch_size"] == 2 and "earlier" not in meta
+
+
+# --- everything refusable is refused before the first generation -----------------------------------------------------------------
+
+
+def test_a_duplicate_prompt_id_in_the_test_set_is_refused_before_any_language_runs(repo, hf, scratch, capsys):
+    build_testset(repo, langs=("en", "hi"), n=3)
+    rows = read_jsonl(repo / "data" / "testset" / "hi" / "dev.jsonl", Prompt)
+    write_jsonl(repo / "data" / "testset" / "hi" / "dev.jsonl", [*rows, rows[0]])
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en,hi")) not in (0, 2)
+    err = capsys.readouterr().err
+    assert "duplicate" in err and "hi-0" in err
+    assert hf.built == [] and not scratch.exists()  # not even English was generated
+
+
+def test_a_corrupt_gens_file_of_a_later_language_is_found_before_an_earlier_one_runs(repo, hf, scratch, capsys):
+    build_testset(repo, langs=("en", "hi"), n=4)
+    hi_file = gen.gens_path(scratch, "dev", "A0", None, "hi")
+    assert run_cli(repo, *hf_args(scratch, "--langs", "hi")) == 0
+    lines = hi_file.read_bytes().split(b"\n")
+    lines[1] = b"{not json"
+    hi_file.write_bytes(b"\n".join(lines))
+    built_before = len(hf.built)
+    capsys.readouterr()
+
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en,hi")) not in (0, 2)
+    assert "line 2" in capsys.readouterr().err
+    assert len(hf.built) == built_before  # the model was not loaded
+    assert not gen.gens_path(scratch, "dev", "A0", None, "en").exists()  # and English was not generated
+
+
+def test_a_wrong_arm_row_of_a_later_language_is_found_before_an_earlier_one_runs(repo, scratch):
+    build_testset(repo, langs=("en", "hi"), n=2)
+    write_jsonl(gen.gens_path(scratch, "dev", "A1", None, "hi"), [Generation("hi-0", "A0", None, "x", "stop")])
+    assert run_cli(repo, *fake_args(scratch, "--langs", "en,hi", arm="A1")) not in (0, 2)
+    assert not gen.gens_path(scratch, "dev", "A1", None, "en").exists()
+
+
+def test_load_prompts_refuses_duplicate_ids(tmp_path):
+    path = tmp_path / "en" / "dev.jsonl"
+    prompts = [Prompt("a", "en", "harmful", "t", "dev", "s", "l"), Prompt("a", "en", "harmful", "u", "dev", "s", "l")]
+    write_jsonl(path, prompts)
+    with pytest.raises(ValueError, match="duplicate.*'a'|'a'.*duplicate"):
+        genrun.load_prompts(path, "en", "dev", None)
+
+
 # --- the script itself ----------------------------------------------------------------------------------------------------------------
 
 
-def run_script(*argv):
-    return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True)
+def run_script(*argv, cwd=None):
+    return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, cwd=cwd)
 
 
-def test_script_help_and_usage_errors():
+def test_script_help_and_usage_errors(tmp_path):
     assert run_script("--help").returncode == 0
     assert run_script().returncode == 2
     assert run_script("--arm", "A0", "--split", "dev", "--alpha", "0.5", "--backend", "fake",
-                      "--out-root", str(REPO_ROOT / "results" / "zz-test-never-created")).returncode == 2
+                      "--out-root", str(tmp_path / "never-created")).returncode == 2
+    assert not (tmp_path / "never-created").exists()
 
 
 def test_script_fake_run_end_to_end_and_guard(tmp_path):
@@ -509,12 +740,13 @@ def test_script_fake_run_end_to_end_and_guard(tmp_path):
     assert len(read_jsonl(out / "dev" / "A2" / "0.5" / "en.gens.jsonl", Generation)) == 3
     assert "hi" in done.stderr and "not built" in done.stderr
 
-    refused = REPO_ROOT / "results" / "zz-test-never-created"
+    # the guard, with the cwd in the temp dir so that a regression could only ever write under tmp_path
     guard = run_script("--arm", "A0", "--split", "dev", "--backend", "fake", "--testset-dir", str(testset_dir),
-                       "--out-root", str(refused))
-    assert guard.returncode == 2 and not refused.exists()
-    default_root = run_script("--arm", "A0", "--split", "dev", "--backend", "fake", "--testset-dir", str(testset_dir))
-    assert default_root.returncode == 2
+                       "--out-root", "results", cwd=tmp_path)
+    assert guard.returncode == 2 and not (tmp_path / "results").exists()
+    guard = run_script("--arm", "A0", "--split", "dev", "--backend", "fake", "--testset-dir", str(testset_dir),
+                       "--out-root", "Results/x", cwd=tmp_path)
+    assert guard.returncode == 2 and not (tmp_path / "Results").exists()
 
 
 def test_script_exit_code_is_nonzero_when_nothing_could_be_generated(tmp_path):

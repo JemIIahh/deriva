@@ -382,7 +382,8 @@ def test_repo_ids_and_local_directories_are_passed_through_unchanged(world, path
     assert world.tokenizer_loads[0][0] == path and world.model_loads[0][0] == path
 
 
-def test_no_token_and_no_remote_code_are_passed_and_nothing_is_printed(world, monkeypatch, capsys):
+def test_no_token_and_no_remote_code_are_passed_and_nothing_is_printed(monkeypatch, capsys):
+    world = World(cuda=True).install(monkeypatch)  # on a GPU there is nothing to warn about
     token = "hf_" + "Q9w8E7r6T5" * 4
     monkeypatch.setenv("HF_TOKEN", token)  # transformers reads it from the environment itself
     world.model.script = [[enc("a") + [EOS]]]
@@ -405,3 +406,18 @@ def test_missing_libraries_give_a_clear_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", None)
     with pytest.raises(ImportError, match="torch.*transformers|transformers.*torch"):
         gen.hf_backend("some/model")
+
+
+@pytest.mark.parametrize(
+    "cuda, dtype, warns",
+    [(False, "float16", True), (False, "float32", False), (False, "bfloat16", False), (True, "float16", False)],
+)
+def test_fp16_on_the_cpu_gets_one_stderr_warning(monkeypatch, capsys, cuda, dtype, warns):
+    World(cuda=cuda).install(monkeypatch)
+    gen.hf_backend("some/model", dtype=dtype)
+    shown = capsys.readouterr()
+    assert shown.out == ""
+    if warns:
+        assert shown.err.count("\n") == 1 and "fp16 on CPU" in shown.err and "--dtype float32" in shown.err
+    else:
+        assert shown.err == ""

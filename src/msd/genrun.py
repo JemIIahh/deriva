@@ -13,10 +13,24 @@ message; it is a failure when no requested language could be generated.
 The `fake` backend writes clearly marked canned text and is refused when `--out-root` is, or is
 inside, the real `results/` directory, so fake output can never end up among real results.
 
-A meta file is the record of how a gens file was made. If one exists with a different model path,
-alpha, batch size, max_new_tokens, dtype or backend, the run is refused before any generation
-(rows from two setups must not share a file) unless `--force-new-meta` is given; the replaced
-setup is then kept in the new meta file under "earlier".
+A meta file is the record of how a gens file was made, and it is written BEFORE the first batch
+(atomically: temp file, fsync, rename), so even a SIGKILL, an out-of-memory kill or a lost Colab
+session leaves a gens file with its meta next to it. Rows from two setups must not share a file:
+
+  * a gens file that has rows and a meta with a different model path, alpha, batch size,
+    max_new_tokens, dtype or backend is refused, and so is a gens file that has rows but NO meta
+    (what made them is unknown), before any generation or model load, unless `--force-new-meta` is
+    given. A forced run keeps the replaced setup in the new meta under "earlier", and marks rows
+    of unknown origin as "unrecorded_rows".
+  * a meta with no rows behind it (a first batch that failed, for example out of memory) describes
+    nothing and is simply replaced, so a retry with a smaller --batch-size is fine.
+  * the meta is rewritten only when it is new, when the setup changed, or when new rows were
+    generated; a rerun that has nothing to do leaves it byte-identical.
+
+Everything that can be refused is refused before the first generation, for every requested
+language: duplicate prompt ids, a corrupt or foreign existing gens file, a meta conflict.
+Resuming after a crash is therefore: run the same command again (same settings).
+There is one writer per output file; do not start two runs on the same --out-root at once.
 
 Exit codes: 0 done; 2 usage error (bad arguments, fake backend aimed at results/); 3 none of the
 requested languages has a test-set file; 1 any other failure (a refused or corrupt file, a backend
@@ -30,6 +44,8 @@ import json
 import os
 import sys
 import traceback
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -91,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model-path", help="Hugging Face repo id or local (merged) model directory; required for --backend hf")
     ap.add_argument("--arm", required=True, choices=ARMS)
     ap.add_argument("--alpha", type=_alpha_arg, default=None,
-                    help="blend / repair setting; required for A2 and A2n, optional for A3, forbidden for BASE, A0, A1")
+                    help="blend / repair setting; required for A2 and A2n, forbidden for BASE, A0, A1, A3")
     ap.add_argument("--split", required=True, choices=sorted(SPLITS))
     ap.add_argument("--langs", type=_langs_arg, default=None, help=f"comma-separated subset of {','.join(LANGS)} (default: all)")
     ap.add_argument("--limit", type=_positive_int, default=None, help="only the first N prompts of each language file (smoke runs)")
@@ -106,12 +122,31 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _folded(path: Path) -> list[str]:
+    return [part.casefold() for part in path.parts]
+
+
 def is_in_results(out_root: Path, root: Path) -> bool:
-    """True if `out_root` is, or is inside, the real results directory (of the repo or of the cwd)."""
+    """True if `out_root` is, or is inside, the real results directory (of the repo or of the cwd).
+
+    Compared on resolved paths (so `..` and symlinks are followed), case-folded (a case-insensitive
+    file system such as the macOS default treats `Results` as `results`), and, where the paths
+    exist, by `os.path.samefile` on the target and each of its parents (the file system itself says
+    they are one directory).
+    """
     target = Path(out_root).resolve()
+    target_parts = _folded(target)
     for base in {(Path(root) / "results").resolve(), (Path.cwd() / "results").resolve()}:
-        if target == base or base in target.parents:
+        base_parts = _folded(base)
+        if target_parts[: len(base_parts)] == base_parts:
             return True
+        if base.exists():
+            for candidate in (target, *target.parents):
+                try:
+                    if candidate.exists() and os.path.samefile(candidate, base):
+                        return True
+                except OSError:
+                    continue
     return False
 
 
@@ -148,6 +183,9 @@ def load_prompts(path: Path, lang: str, split: str, limit: int | None) -> list[P
         prompts = prompts[:limit]
     if not prompts:
         raise ValueError(f"{path}: no prompts to generate for")
+    repeated = sorted(pid for pid, n in Counter(p.id for p in prompts).items() if n > 1)
+    if repeated:
+        raise ValueError(f"{path}: duplicate prompt ids {repeated[:5]}")
     wrong = [p.id for p in prompts if p.lang != lang or p.split != split]
     if wrong:
         raise ValueError(f"{path}: {len(wrong)} row(s) are not {lang}/{split} rows, e.g. {wrong[:3]}")
@@ -176,10 +214,28 @@ def read_meta(meta_file: Path, *, strict: bool) -> dict[str, Any] | None:
     return meta
 
 
-def check_meta(meta_file: Path, new: dict[str, Any], *, force: bool) -> dict[str, Any] | None:
-    """Return the existing meta (or None); raise MetaMismatchError if its setup differs and not `force`."""
-    old = read_meta(meta_file, strict=not force)
-    if old is not None and not force:
+def check_meta(
+    meta_file: Path, gens_file: Path, new: dict[str, Any], *, n_rows: int, force: bool
+) -> tuple[dict[str, Any] | None, bool, int]:
+    """Decide what to do with the meta of a gens file that already holds `n_rows` finished rows.
+
+    Returns (the previous meta to keep as history, whether the meta must be written before
+    generating, the number of rows of unknown origin to mark). Raises MetaMismatchError for a file
+    with rows whose meta is missing, unreadable or records a different setup, unless `force`. A
+    file without rows has nothing to protect: any old meta is dropped and a new one is written.
+    """
+    if n_rows == 0:
+        return None, True, 0
+    old = read_meta(meta_file, strict=False)
+    if not force:
+        if not meta_file.exists():
+            raise MetaMismatchError(
+                f"{gens_file} already holds {n_rows} row(s) but there is no meta file {meta_file}, so what made "
+                "them is unknown (a run that was killed before the meta existed, or a deleted file). Pass "
+                "--force-new-meta to continue anyway; the rows are then marked as unrecorded in the new meta"
+            )
+        if old is None:
+            read_meta(meta_file, strict=True)  # raises with the reason and the flag
         diffs = meta_differences(old, new)
         if diffs:
             shown = "; ".join(f"{key}: {was!r} -> {now!r}" for key, was, now in diffs)
@@ -188,16 +244,22 @@ def check_meta(meta_file: Path, new: dict[str, Any], *, force: bool) -> dict[str
                 "share a file: use another --out-root, or pass --force-new-meta to accept it (the old setup is kept "
                 "in the new meta file under 'earlier')"
             )
-    return old
+        return old, False, 0
+    if old is None:
+        return None, True, n_rows
+    return old, bool(meta_differences(old, new)), 0
 
 
 def write_meta(meta_file: Path, meta: dict[str, Any], previous: dict[str, Any] | None) -> None:
-    """Write `meta` atomically; the previous meta (minus its own history) is appended under "earlier"."""
+    """Write `meta` atomically (temp file, fsync, rename); `previous` (minus its own history) goes under "earlier"."""
     if previous is not None:
         meta = {**meta, "earlier": [*previous.get("earlier", []), {k: v for k, v in previous.items() if k != "earlier"}]}
     meta_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = meta_file.with_name(meta_file.name + ".tmp")
-    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, meta_file)
 
 
@@ -227,44 +289,69 @@ def _make_backend(args: argparse.Namespace) -> gen.Backend:
     return gen.hf_backend(args.model_path, max_new_tokens=args.max_new_tokens, dtype=args.dtype)
 
 
-def _meta_for(args: argparse.Namespace, lang: str, n_rows: int, root: Path) -> dict[str, Any]:
-    return gen.run_meta(
+def _meta_for(args: argparse.Namespace, lang: str, n_rows: int, root: Path, unrecorded: int = 0) -> dict[str, Any]:
+    meta = gen.run_meta(
         model_path=args.model_path, arm=args.arm, alpha=args.alpha, split=args.split, lang=lang,
         batch_size=args.batch_size, max_new_tokens=args.max_new_tokens, dtype=args.dtype, backend=args.backend,
         n_rows=n_rows, repo_root=root,
     )
+    if unrecorded:
+        meta["unrecorded_rows"] = unrecorded  # rows that were already in the file with no record of their setup
+    return meta
+
+
+@dataclass(frozen=True)
+class _Plan:
+    lang: str
+    prompts: list[Prompt]
+    gens_file: Path
+    meta_file: Path
+    previous: dict[str, Any] | None  # the meta this run replaces (kept as history)
+    record_first: bool  # the meta must be written before the first batch
+    unrecorded: int
+    n_done: int
 
 
 def run(args: argparse.Namespace, available: list[tuple[str, Path]], root: Path) -> int:
-    # Everything that can be refused is refused before the first generation (and before any model load).
-    plans = []
+    # Everything that can be refused is refused here, for every language, before the first generation
+    # and before any model load: duplicate prompt ids, a corrupt or foreign gens file (a dry scan with
+    # the code `generate` uses), a missing or conflicting meta.
+    plans: list[_Plan] = []
     for lang, path in available:
         prompts = load_prompts(path, lang, args.split, args.limit)
         gens_file = gen.gens_path(args.out_root, args.split, args.arm, args.alpha, lang)
         meta_file = gen.meta_path(gens_file)
-        previous = check_meta(meta_file, _meta_for(args, lang, 0, root), force=args.force_new_meta)
-        plans.append((lang, prompts, gens_file, meta_file, previous))
+        n_done = len(gen.scan_existing(prompts, gens_file, arm=args.arm, alpha=args.alpha).done)
+        previous, record_first, unrecorded = check_meta(
+            meta_file, gens_file, _meta_for(args, lang, n_done, root), n_rows=n_done, force=args.force_new_meta
+        )
+        plans.append(_Plan(lang, prompts, gens_file, meta_file, previous, record_first, unrecorded, n_done))
 
     backend = _LazyBackend(lambda: _make_backend(args))
     total_new = 0
-    for lang, prompts, gens_file, meta_file, previous in plans:
-        before = count_rows(gens_file)
+    for plan in plans:
+        if plan.record_first:  # so that even a hard kill leaves the setup on record next to its rows
+            write_meta(plan.meta_file, _meta_for(args, plan.lang, plan.n_done, root, plan.unrecorded), plan.previous)
 
-        def progress(done: int, total: int, lang: str = lang) -> None:
+        def progress(done: int, total: int, lang: str = plan.lang) -> None:
             print(f"  {lang}: {done}/{total}", file=sys.stderr, flush=True)
 
         try:
             new = gen.generate(
-                prompts, backend, gens_file, arm=args.arm, alpha=args.alpha, batch_size=args.batch_size,
+                plan.prompts, backend, plan.gens_file, arm=args.arm, alpha=args.alpha, batch_size=args.batch_size,
                 progress=progress,
             )
         except BaseException:
-            if count_rows(gens_file) > before:  # a crash after some batches: document what those rows were made with
-                write_meta(meta_file, _meta_for(args, lang, count_rows(gens_file), root), previous)
+            rows = count_rows(plan.gens_file)
+            if rows > plan.n_done:  # a crash after some batches: record how many rows exist now
+                write_meta(plan.meta_file, _meta_for(args, plan.lang, rows, root, plan.unrecorded), plan.previous)
             raise
-        write_meta(meta_file, _meta_for(args, lang, count_rows(gens_file), root), previous)
+        if new:
+            write_meta(plan.meta_file, _meta_for(args, plan.lang, count_rows(plan.gens_file), root, plan.unrecorded),
+                       plan.previous)
         total_new += new
-        print(f"{lang}: {len(prompts)} prompts, {new} new, {len(prompts) - new} already done -> {gens_file}")
+        print(f"{plan.lang}: {len(plan.prompts)} prompts, {new} new, {len(plan.prompts) - new} already done "
+              f"-> {plan.gens_file}")
     print(f"done: {total_new} new completions in {len(plans)} language(s)")
     return EXIT_OK
 

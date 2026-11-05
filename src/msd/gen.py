@@ -24,10 +24,13 @@ Files, resuming and crash safety
       share a file), or a row whose id is not among the prompts (a different test set).
     * A rerun after completion generates nothing and leaves the file byte-identical.
     * Result paths are built only by `gens_path`: `<out_root>/<split>/<arm>/<alpha|none>/<lang>.gens.jsonl`.
+    * Single writer per output file. There is no lock: two runs appending to the same `out_path` at
+      the same time duplicate rows, and the rollback of a failed write (a truncate to the size
+      before the batch) could cut off rows the other run appended. Run one stage at a time.
 
 Arm and alpha
-    BASE, A0 and A1 take no alpha; A2 (ReSta) and A2n (naive blend) require one; A3 (a fine-tune)
-    may carry one but does not need to. Alpha is stored rounded to 6 decimals ("canonical") so one
+    BASE, A0, A1 and A3 (Harden, a fine-tune with no blend setting) take no alpha; A2 (ReSta) and
+    A2n (naive blend) require one. Alpha is stored rounded to 6 decimals ("canonical") so one
     setting always means one path and one value in the rows.
 
 Decoding (`hf_backend`)
@@ -49,8 +52,9 @@ import math
 import os
 import re
 import subprocess
+import sys
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -60,9 +64,9 @@ from msd.schema import SPLITS, Generation, Prompt
 
 FINISH_REASONS: frozenset[str] = frozenset({"stop", "length", "error"})
 
-ALPHA_FORBIDDEN_ARMS: frozenset[str] = frozenset({"BASE", "A0", "A1"})  # models with no blend / repair setting
+# BASE, A0, A1 and A3 (Harden, a safety-preserving fine-tune) are single models with no blend / repair setting.
+ALPHA_FORBIDDEN_ARMS: frozenset[str] = frozenset({"BASE", "A0", "A1", "A3"})
 ALPHA_REQUIRED_ARMS: frozenset[str] = frozenset({"A2", "A2n"})  # ReSta alpha, naive blend value
-# Every other arm (A3, a safety-preserving fine-tune) may carry an alpha but does not need one.
 
 DEFAULT_BATCH_SIZE = 32
 ALPHA_DECIMALS = 6
@@ -159,7 +163,7 @@ def _encode_rows(rows: Sequence[Generation]) -> bytes:
     return b"".join((json.dumps(asdict(row), ensure_ascii=False) + "\n").encode("utf-8") for row in rows)
 
 
-_ROW_FIELDS = frozenset({"prompt_id", "arm", "alpha", "text", "finish_reason"})
+_ROW_FIELDS = frozenset(f.name for f in fields(Generation))
 
 
 def _parse_row(raw: bytes) -> Generation | None:
@@ -182,14 +186,37 @@ def _parse_row(raw: bytes) -> Generation | None:
     return Generation(obj["prompt_id"], obj["arm"], alpha, obj["text"], obj["finish_reason"])
 
 
-def _scan_existing(path: Path, arm: str, alpha: float | None, valid_ids: set[str]) -> tuple[set[str], int, int]:
-    """Read an existing gens file: (finished ids, byte length of the good part, file size).
+@dataclass(frozen=True)
+class ExistingGens:
+    """What an existing gens file holds: finished ids, the byte length of its good part, its size."""
+
+    done: frozenset[str]
+    good_bytes: int
+    size: int
+
+    @property
+    def torn_bytes(self) -> int:
+        """Bytes after the last good line: a crash tail that a run would cut off."""
+        return self.size - self.good_bytes
+
+
+def scan_existing(prompts: Sequence[Prompt], path: str | Path, *, arm: str, alpha: float | None) -> ExistingGens:
+    """Read an existing gens file without touching it; the checks `generate` makes before it writes.
 
     Only a torn LAST line is forgiven (the good part then ends before it). Everything else that is
-    wrong raises ResumeError. The file is not modified here.
+    wrong raises ResumeError: a bad or blank middle line, a duplicate id, a row of another arm or
+    alpha, a row whose id is not among `prompts`. Duplicate prompt ids raise ValueError, as does an
+    arm / alpha pair that `check_arm_alpha` refuses. A missing file is an empty one. The CLI calls
+    this for every language before the first generation, so a bad file is found before GPU time is spent.
     """
+    value = check_arm_alpha(arm, alpha)
+    repeated = sorted(pid for pid, n in Counter(p.id for p in prompts).items() if n > 1)
+    if repeated:
+        raise ValueError(f"duplicate prompt ids in the input: {repeated[:5]}")
+    valid_ids = {p.id for p in prompts}
+    path = Path(path)
     if not path.exists():
-        return set(), 0, 0
+        return ExistingGens(frozenset(), 0, 0)
     data = path.read_bytes()
     done: set[str] = set()
     pos = good = lineno = 0
@@ -199,15 +226,15 @@ def _scan_existing(path: Path, arm: str, alpha: float | None, valid_ids: set[str
         row = _parse_row(data[pos:newline]) if newline != -1 else None  # an unterminated line is always torn
         if row is None:
             if newline == -1 or newline + 1 == len(data):
-                break  # the last line, torn by a crash: dropped by the caller
+                break  # the last line, torn by a crash: dropped by `generate`
             raise ResumeError(
                 f"{path}: line {lineno} is not a valid generation record (and it is not the last line, so this "
                 "is not a crash tail). The file was left untouched; fix or move it"
             )
-        if row.arm != arm or canonical_alpha(row.alpha) != alpha:
+        if row.arm != arm or canonical_alpha(row.alpha) != value:
             raise ResumeError(
                 f"{path}: line {lineno} holds a row for arm {row.arm!r} alpha {row.alpha!r}, but this run is arm "
-                f"{arm!r} alpha {alpha!r}; arms and alphas never share a file"
+                f"{arm!r} alpha {value!r}; arms and alphas never share a file"
             )
         if row.prompt_id in done:
             raise ResumeError(f"{path}: line {lineno}: duplicate prompt id {row.prompt_id!r}")
@@ -218,7 +245,7 @@ def _scan_existing(path: Path, arm: str, alpha: float | None, valid_ids: set[str
             )
         done.add(row.prompt_id)
         pos = good = newline + 1
-    return done, good, len(data)
+    return ExistingGens(frozenset(done), good, len(data))
 
 
 def _truncate(path: Path, size: int) -> None:
@@ -287,14 +314,17 @@ def generate(
     value = check_arm_alpha(arm, alpha)
     _check_batch_size(batch_size)
     prompts = list(prompts)
-    repeated = sorted(pid for pid, n in Counter(p.id for p in prompts).items() if n > 1)
-    if repeated:
-        raise ValueError(f"duplicate prompt ids in the input: {repeated[:5]}")
     out_path = Path(out_path)
 
-    done, good, size = _scan_existing(out_path, arm, value, {p.id for p in prompts})
-    if good < size:
-        _truncate(out_path, good)  # drop the torn last line (the scan found nothing else wrong)
+    existing = scan_existing(prompts, out_path, arm=arm, alpha=value)
+    done = existing.done
+    if existing.torn_bytes:
+        _truncate(out_path, existing.good_bytes)  # drop the torn last line (the scan found nothing else wrong)
+        print(
+            f"msd.gen: dropped {existing.torn_bytes} torn byte(s) from the end of {out_path.name} (a crash tail); "
+            "its prompt is generated again",
+            file=sys.stderr,
+        )
 
     todo = [p for p in prompts if p.id not in done]
     written = 0
@@ -357,8 +387,9 @@ def hf_backend(model_path: str, *, max_new_tokens: int = 256, dtype: str = "floa
     rest is decoded with `skip_special_tokens=True`. Rows come back in input order (no sorting by
     length); because padding depends on batch composition, fp16 greedy outputs can differ slightly
     between batch sizes, so record the batch size (see `run_meta`). Runs on CUDA when available,
-    else on the CPU. A gated download takes its token from the HF_TOKEN environment variable, read
-    by transformers itself; nothing here reads, prints or stores it.
+    else on the CPU (float16 on the CPU prints one warning on stderr). A gated download takes its
+    token from the HF_TOKEN environment variable, read by transformers itself; nothing here reads,
+    prints or stores it.
     """
     if dtype not in _TORCH_DTYPES:
         raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(_TORCH_DTYPES)}")
@@ -374,6 +405,11 @@ def hf_backend(model_path: str, *, max_new_tokens: int = 256, dtype: str = "floa
         ) from exc
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu" and dtype == "float16":
+        print(
+            "msd.gen: warning: fp16 on CPU is slow or unsupported; use --dtype float32 for CPU smoke runs",
+            file=sys.stderr,
+        )
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
     tokenizer.padding_side = "left"  # generation continues from the right edge, so pad on the left
     if tokenizer.pad_token is None:
@@ -477,8 +513,10 @@ def run_meta(
     """What a gens file was made with, as a JSON-safe dict, for the `<lang>.gens.meta.json` file.
 
     Holds only the explicit fields below plus the msd version, the git commit of `repo_root` (best
-    effort, None if unavailable) and a UTC timestamp. It never reads or stores the environment, and
-    token-shaped or secret-looking strings are replaced by ***.
+    effort, None if unavailable) and a UTC timestamp. No environment variable is ever stored. The
+    environment is read for one purpose only: to find secret-looking values (a token-shaped string,
+    or the value of a variable whose name contains TOKEN, SECRET, PASSWORD or KEY) so that they can
+    be replaced by *** in the strings that are stored.
     """
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
