@@ -563,6 +563,35 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   `SFTConfig`. Without it the loss would also cover the ~2,000-character safety system preamble the
   template always injects and the question. The byte-identity and the mask are read from text; that the
   swap happens in the installed TRL is UNVERIFIED until the smoke run (its first batch can be inspected).
+- **The template is stored as a named list, and that crashes TRL (review finding C1, fixed in `finetune.py`).**
+  Tiny Aya Global's `tokenizer_config.json` keeps `chat_template` as `[{"name": "default", "template": ...}, ...]`.
+  transformers 5.15 (`tokenization_utils_base.py`, in `__init__`) turns such a list into a dict
+  `{name: template}`, so `tokenizer.chat_template` is a dict. TRL v1.7.1 then calls
+  `has_generation_markers(chat_template)` with it, and that is `re.search(...)` on a dict: a `TypeError`, after
+  the 6.7 GB download. What the sources show: `SFTConfig` has a field `chat_template_path` (`sft_config.py`),
+  read in `sft_trainer.py` before the marker check; when it names an existing `.jinja` or `.j2` file TRL reads
+  the text into `processing_class.chat_template` (a string), and only then calls `has_generation_markers` and
+  the swap to `cohere2_training_chat_template`. AlignTune does not list `chat_template_path` as a parameter,
+  but its backfill copies every extra keyword that is a valid `SFTConfig` field onto the config with `setattr`
+  before the `SFTTrainer` is built, so it reaches TRL. `finetune.py` therefore writes the tokenizer's own
+  **default** template (a str as it is, a dict or a list by the entry named `default`, anything else an error)
+  to `work/finetune/<config stem>[-smoke]/chat_template.jinja` and passes that path as `chat_template_path`.
+  Before training (and in `--dry-run`) it checks that the text has generation markers or equals
+  `trl.chat_template_utils.cohere2_chat_template` (when trl imports; otherwise the plan says the check was
+  skipped). Not run against the installed libraries: that TRL then swaps the template as read.
+- **The labelled-token check.** TRL v1.7.1 builds a `labels` column (`build_labels`; `IGNORE_INDEX` -100 off the
+  assistant turn) and raises if an example has no assistant token, so the useful addition is the upper bound that
+  catches a loss over the whole sequence. `finetune.py` counts, for the first `checks.label_check_rows` tokenised
+  rows, the labels that are not -100 and refuses a row outside `checks.label_tokens_min` to
+  `checks.label_tokens_max` (a one-letter answer plus the two end tokens is about 3). **AlignTune 0.1.31 gives no
+  moment to look at the data first:** `TRLSFTTrainer.train()` (`sft_generation.py`) builds the TRL `SFTTrainer`
+  (which tokenises) and calls `trainer.train()` in one method, so `inner.trainer` does not exist before it. The
+  check is therefore a `transformers.TrainerCallback` whose `on_train_begin` receives `args` and
+  `train_dataloader` (transformers v5.15 `trainer.py`: `_prepare_for_training` sets the dataloader on the callback
+  handler before `callback_handler.on_train_begin`); it is added by wrapping the instance method
+  `get_hf_callbacks`, which `sft_generation.py` passes as `callbacks=`. If the hook, the dataloader or the
+  `labels` column is not there, the summary says `label_check: "unavailable"` and the run goes on. Not run: that
+  the rows in `train_dataloader.dataset` carry `labels` as in TRL's source.
 - `loss_type` is `"nll"` (AlignTune accepts only `nll` and `dft`, so TRL's newer `chunked_nll` is not
   reachable). Full logits over the 262,144-token vocabulary are therefore materialised.
 - No packing (`packing=False`). TRL's `max_length` is AlignTune's `max_seq_length`, truncating from the start
@@ -705,6 +734,7 @@ create_sft_trainer(model_name=<base_model>, dataset_name=<train.jsonl>, backend=
                    use_peft=True, lora_r=..., lora_alpha=..., lora_dropout=..., lora_target_modules=[...],
                    precision="fp16", fp16=True, bf16=False, gradient_checkpointing=True, gradient_accumulation_steps=...,
                    warmup_ratio=..., lr_scheduler=..., weight_decay=..., max_grad_norm=..., assistant_only_loss=True,
+                   chat_template_path="work/finetune/<stem>/chat_template.jinja",
                    seed=..., data_seed=..., logging_steps=..., save_steps=..., save_total_limit=..., loggers=["none"],
                    load_best_model_at_end=False, eval_strategy="no", group_by_length=False, device_map={"": 0})
 ```
@@ -717,7 +747,7 @@ smoke run decides that.
 
 The real call (`scripts/finetune.py` is written against this source and tested with a fake trainer only);
 that `import aligntune` and its install work on Kaggle or Colab without replacing torch; the parquet round
-trip and any dropped row; that TRL swaps in `cohere2_training.jinja` and masks only the answer; fp16 stability
+trip and any dropped row; that TRL swaps in `cohere2_training.jinja` and masks only the answer (the labelled-token check reports about 3 per row if it does); that `chat_template_path` reaches the `SFTTrainer` through the backfill; that `get_hf_callbacks` is honoured and the dataloader rows carry `labels`; fp16 stability
 of Cohere2 on a T4; peak memory and the real token lengths (the 450-token preamble is a guess); the T4 hours;
 the `aligntune advise` output; whether `save_total_limit` and `loggers=["none"]` reach the `SFTConfig`
 through the backfill; the architecture numbers of the gated original; the CPU merge RAM. All of them are

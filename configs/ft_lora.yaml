@@ -77,3 +77,9 @@ output:
 
 checks:
   history_points: 20                     # loss points kept in finetune_summary.json
+  # Labelled-token check, run at the start of training on the first rows the trainer tokenised. The task
+  # answer is a single letter, so a row should have about 3 labelled tokens (letter, end of turn, and so
+  # on). 0 means the assistant mask matched nothing; a large number means the loss covers the whole prompt.
+  label_check_rows: 8                    # rows to inspect
+  label_tokens_min: 1                    # a checked row with fewer labelled tokens stops the run
+  label_tokens_max: 16                   # a checked row with more labelled tokens stops the run

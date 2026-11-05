@@ -13,6 +13,7 @@ import ast
 import hashlib
 import json
 import math
+import re
 import subprocess
 import sys
 import types
@@ -43,13 +44,17 @@ def losses_down(n=6):
 class FakeTrainer:
     """What the AlignTune wrapper hands back: train() writes the adapter files and returns the numbers."""
 
-    def __init__(self, params, owner):
-        self.params, self.owner = params, owner
+    def __init__(self, params, owner, start_check):
+        self.params, self.owner, self.start_check = params, owner, start_check
 
     def train(self):
         owner, p = self.owner, self.params
         if owner.fail_with is not None:
             raise owner.fail_with
+        # what the real trainer's on_train_begin callback does: look at the tokenised rows before the first step
+        if owner.label_counts is not None and self.start_check is not None:
+            counts = owner.label_counts if owner.label_counts != "default" else [3] * self.start_check.rows
+            self.start_check.check_labels(counts)
         out = Path(p["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         rows = sum(1 for line in Path(p["dataset_name"]).read_text(encoding="utf-8").splitlines() if line.strip())
@@ -86,14 +91,20 @@ class FakeFactory:
         self.final_loss = None
         self.steps = None
         self.rows_seen = None
+        self.label_counts = "default"  # None: the trainer never shows its tokenised rows
+        self.start_checks: list = []
+        self.template_texts: list[str] = []
         self.write_adapter = True
         self.adapter_overrides: dict = {}
         for key, value in options.items():
             setattr(self, key, value)
 
-    def __call__(self, params):
+    def __call__(self, params, start_check=None):
         self.calls.append(dict(params))
-        return FakeTrainer(params, self)
+        self.start_checks.append(start_check)
+        path = params.get("chat_template_path")
+        self.template_texts.append(Path(path).read_text(encoding="utf-8") if path and Path(path).is_file() else None)
+        return FakeTrainer(params, self, start_check)
 
 
 class FakeMerge:
@@ -115,8 +126,14 @@ class FakeMerge:
         (out_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
 
 
+TEMPLATE = "{% for m in messages %}{% generation %}{{ m.content }}{% endgeneration %}{% endfor %}"
+
+
 class FakeTokenizer:
     """Word counts stand in for token counts: the user turns in the fixtures are about fifteen words."""
+
+    def __init__(self, chat_template=TEMPLATE):
+        self.chat_template = chat_template
 
     def apply_chat_template(self, messages, tokenize=False):
         assert tokenize is False
@@ -154,6 +171,15 @@ class ApiFactory:
     def __call__(self, token):
         self.tokens.append(token)
         return self.api
+
+
+def install_fake_trl(monkeypatch, *, cohere="COHERE2 CHAT TEMPLATE"):
+    """A stand-in for trl.chat_template_utils with the two names the pre-flight reads (TRL v1.7.1: a regex, a string)."""
+    utils = types.ModuleType("trl.chat_template_utils")
+    utils.has_generation_markers = lambda t: re.search(r"\{%-?\s*generation\s*-?%\}", t) is not None
+    utils.cohere2_chat_template = cohere
+    monkeypatch.setitem(sys.modules, "trl", types.ModuleType("trl"))
+    monkeypatch.setitem(sys.modules, "trl.chat_template_utils", utils)
 
 
 def forbidden(*args, **kwargs):
@@ -402,10 +428,11 @@ def test_four_bit_compute_dtype_follows_the_precision_flags(tmp_path):
 
 def test_build_trainer_params_is_a_plain_function_of_the_config():
     cfg = finetune.load_config(REAL_CONFIG)
-    params = finetune.build_trainer_params(cfg, data_path=Path("d.jsonl"), adapter_dir=Path("a"), seed=cfg.train.seed, max_steps=None)
-    again = finetune.build_trainer_params(cfg, data_path=Path("d.jsonl"), adapter_dir=Path("a"), seed=cfg.train.seed, max_steps=None)
+    params = finetune.build_trainer_params(cfg, data_path=Path("d.jsonl"), adapter_dir=Path("a"), chat_template_path=Path("t.jinja"), seed=cfg.train.seed, max_steps=None)
+    again = finetune.build_trainer_params(cfg, data_path=Path("d.jsonl"), adapter_dir=Path("a"), chat_template_path=Path("t.jinja"), seed=cfg.train.seed, max_steps=None)
     assert params == again
-    smoke = finetune.build_trainer_params(cfg, data_path=Path("d.jsonl"), adapter_dir=Path("a"), seed=cfg.train.seed, max_steps=3)
+    assert params["chat_template_path"] == "t.jinja"
+    smoke = finetune.build_trainer_params(cfg, data_path=Path("d.jsonl"), adapter_dir=Path("a"), chat_template_path=Path("t.jinja"), seed=cfg.train.seed, max_steps=3)
     assert smoke["max_steps"] == 3 and smoke["logging_steps"] == 1  # every step is logged so a decrease can be seen
 
 
@@ -415,6 +442,7 @@ COVERED_BY_OTHER_TESTS = {
     "data.train", "data.heldout", "data.taskdev", "data.pipeline", "data.testset", "data.langs",  # the data tests below
     "output.adapter_dir", "output.merged_dir", "output.merge_dtype", "output.keep_checkpoints",  # the layout tests
     "checks.history_points",  # test_summary_history_is_sampled_to_the_configured_number_of_points
+    "checks.label_check_rows", "checks.label_tokens_min", "checks.label_tokens_max",  # test_the_label_check_settings_reach_the_trainer
 }
 
 
@@ -429,7 +457,7 @@ def test_every_key_of_the_real_config_has_a_test_that_it_reaches_the_code():
 
 def test_no_hyperparameter_literal_in_the_module():
     tree = ast.parse(MODULE.read_text(encoding="utf-8"))
-    allowed = {0, 1, 2}  # exit codes, indices, halves; every training value lives in the YAML
+    allowed = {0, 1, 2, 100}  # exit codes, indices, halves, and the 100 of PyTorch's ignore index -100; every training value lives in the YAML
     found = sorted(
         {
             (node.lineno, node.value)
@@ -791,8 +819,8 @@ def test_rows_the_trainer_did_not_see_fail_the_run(world, capsys):
 
 def test_a_trainer_that_does_not_report_rows_is_noted_not_refused(world):
     class Silent(FakeFactory):
-        def __call__(self, params):
-            trainer = super().__call__(params)
+        def __call__(self, params, start_check=None):
+            trainer = super().__call__(params, start_check)
             original = trainer.train
 
             def train():
@@ -891,7 +919,7 @@ def test_a_merge_that_raises_leaves_nothing_behind(world, capsys):
 
 
 def test_a_trainer_factory_that_cannot_be_built_leaves_nothing_behind(world, capsys):
-    def broken(params):
+    def broken(params, start_check=None):
         raise ImportError("No module named 'aligntune'")
 
     assert world.run(factory=broken) == 1
@@ -1191,6 +1219,172 @@ def test_the_script_runs_a_dry_run_end_to_end_without_any_heavy_library(world, t
     assert not (tmp_path / "scripted-out").exists()
 
 
+# --- the chat template: Tiny Aya stores it as a named list, TRL needs a string ------------------------------------
+
+
+NAMED_LIST = [{"name": "tool_use", "template": "OTHER TEMPLATE"}, {"name": "default", "template": TEMPLATE}]
+NAMED_DICT = {"tool_use": "OTHER TEMPLATE", "default": TEMPLATE}  # what transformers 5 turns the list into
+
+
+@pytest.mark.parametrize("stored", [TEMPLATE, NAMED_DICT, NAMED_LIST], ids=["str", "dict", "list"])
+def test_chat_template_text_takes_the_default_template(stored):
+    assert finetune.chat_template_text(stored) == TEMPLATE
+
+
+@pytest.mark.parametrize(
+    "stored, found",
+    [
+        (None, "None"),
+        ("   ", "empty"),
+        (7, "int"),
+        ({"tool_use": "x"}, "tool_use"),
+        ([{"name": "tool_use", "template": "x"}], "tool_use"),
+        ([{"name": "default", "template": ""}], "default"),
+        ({"default": ["not", "text"]}, "list"),
+        ([], "empty"),
+    ],
+)
+def test_chat_template_text_refuses_anything_else_and_says_what_it_found(stored, found):
+    with pytest.raises(finetune.FinetuneError, match=found):
+        finetune.chat_template_text(stored)
+
+
+@pytest.mark.parametrize("stored", [TEMPLATE, NAMED_DICT, NAMED_LIST], ids=["str", "dict", "list"])
+def test_the_trainer_gets_a_jinja_file_holding_the_default_template(world, stored):
+    assert world.run(tokenizer_loader=lambda name: FakeTokenizer(chat_template=stored)) == 0
+    path = Path(world.factory.calls[0]["chat_template_path"])
+    assert path.suffix == ".jinja" and path.is_absolute()
+    assert path.parent == world.root / "work" / "finetune" / "ft_lora"
+    assert world.factory.template_texts == [TEMPLATE]  # the file as it was when the trainer was built
+
+
+def test_a_smoke_run_uses_its_own_work_folder(world):
+    assert world.run("--max-steps", "3") == 0
+    assert Path(world.factory.calls[0]["chat_template_path"]).parent.name == "ft_lora-smoke"
+
+
+def test_a_tokenizer_template_that_cannot_be_normalised_refuses_before_anything_is_written(world, capsys):
+    assert world.run(tokenizer_loader=lambda name: FakeTokenizer(chat_template={"tool_use": "x"})) == 1
+    err = capsys.readouterr().err
+    assert "default" in err and "tool_use" in err
+    assert world.factory.calls == [] and not (world.root / "work").exists() and not world.out.exists()
+
+
+def test_the_pre_flight_refuses_a_template_trl_cannot_mask(world, monkeypatch, capsys):
+    install_fake_trl(monkeypatch)
+    assert world.run(tokenizer_loader=lambda name: FakeTokenizer(chat_template="{{ messages }}")) == 1
+    err = capsys.readouterr().err
+    assert "generation" in err and "cohere2" in err and "assistant_only_loss" in err
+    assert world.factory.calls == [] and not (world.root / "work").exists() and not world.out.exists()
+
+
+def test_the_pre_flight_refuses_in_a_dry_run_too(world, monkeypatch, capsys):
+    install_fake_trl(monkeypatch)
+    assert world.run("--dry-run", tokenizer_loader=lambda name: FakeTokenizer(chat_template="{{ messages }}")) == 1
+    assert "generation" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("template", [TEMPLATE, "COHERE2 CHAT TEMPLATE"], ids=["generation markers", "trl's cohere2 template"])
+def test_the_pre_flight_accepts_a_template_with_markers_or_trls_own_cohere2_one(world, monkeypatch, template, capsys):
+    install_fake_trl(monkeypatch)
+    assert world.run("--dry-run", tokenizer_loader=lambda name: FakeTokenizer(chat_template=template)) == 0
+    assert "chat template:" in capsys.readouterr().out
+
+
+def test_without_trl_the_pre_flight_is_skipped_and_the_plan_says_so(world, capsys):
+    assert world.run("--dry-run", tokenizer_loader=lambda name: FakeTokenizer(chat_template="{{ messages }}")) == 0
+    out = capsys.readouterr().out
+    assert "chat template:" in out and "trl" in out and "skipped" in out
+
+
+def test_a_dry_run_without_a_tokenizer_says_the_template_was_not_checked(world, capsys):
+    def broken(name):
+        raise OSError("offline")
+
+    assert world.run("--dry-run", tokenizer_loader=broken) == 0
+    assert "chat template: not checked" in capsys.readouterr().out
+
+
+# --- the labelled-token check -----------------------------------------------------------------------------------
+
+
+def test_the_label_check_settings_reach_the_trainer(world):
+    assert world.run() == 0
+    check = world.factory.start_checks[0]
+    raw = world.raw()["checks"]
+    assert (check.rows, check.minimum, check.maximum) == (raw["label_check_rows"], raw["label_tokens_min"], raw["label_tokens_max"])
+
+
+def test_the_label_counts_are_recorded_in_the_summary(world):
+    world.factory.label_counts = [3, 3, 4]
+    assert world.run() == 0
+    raw = world.raw()["checks"]
+    assert world.summary()["label_check"] == {
+        "counts": [3, 3, 4], "allowed_min": raw["label_tokens_min"], "allowed_max": raw["label_tokens_max"]
+    }
+
+
+def test_a_trainer_that_shows_no_rows_is_recorded_as_unavailable_not_refused(world):
+    world.factory.label_counts = None
+    assert world.run() == 0
+    assert world.summary()["label_check"] == "unavailable"
+
+
+@pytest.mark.parametrize("counts, row, found", [([3, 0, 3], "row 2", "0 labelled"), ([3, 100], "row 2", "100 labelled")])
+def test_a_row_with_no_or_too_many_labelled_tokens_stops_the_run(world, capsys, counts, row, found):
+    world.factory.label_counts = counts
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert row in err and found in err and "assistant_only_loss" in err
+    assert world.merge.calls == [] and not world.out.exists()
+
+
+def labels(rows):
+    return types.SimpleNamespace(dataset=rows)
+
+
+def test_start_check_counts_the_labelled_tokens_of_the_first_rows():
+    rows = [{"labels": [-100, -100, 5, 6]}, {"labels": [-100, 7]}, {"labels": [1, 1, 1, 1, 1]}]
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16)
+    check.observe(train_dataloader=labels(rows), args=None)
+    assert check.label_counts == [2, 1]  # only the first `rows` rows are read
+
+
+def test_start_check_reads_tensor_like_labels():
+    class Tensor:
+        def __init__(self, values):
+            self.values = values
+
+        def tolist(self):
+            return self.values
+
+    check = finetune.StartCheck(rows=1, minimum=1, maximum=16)
+    check.observe(train_dataloader=labels([{"labels": Tensor([-100, 4, 4])}]), args=None)
+    assert check.label_counts == [2]
+
+
+def test_start_check_enforces_the_bounds_when_it_observes():
+    check = finetune.StartCheck(rows=1, minimum=1, maximum=16)
+    with pytest.raises(finetune.FinetuneError, match="0 labelled"):
+        check.observe(train_dataloader=labels([{"labels": [-100, -100]}]), args=None)
+
+
+@pytest.mark.parametrize(
+    "loader, why",
+    [
+        (None, "no dataloader"),
+        (types.SimpleNamespace(), "no dataset"),
+        (labels([{"input_ids": [1]}]), "no labels column"),
+        (labels([]), "no rows"),
+        (labels(types.SimpleNamespace()), "cannot be read"),
+    ],
+)
+def test_start_check_that_cannot_see_the_labels_says_why_and_does_not_refuse(loader, why):
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16)
+    check.observe(train_dataloader=loader, args=None)
+    assert check.label_counts is None and why in check.label_note
+
+
 # --- the real AlignTune wrapper, against a fake aligntune module ---------------------------------------------------
 
 
@@ -1210,6 +1404,9 @@ class _FakeAlignTuneTrainer:
             train_dataset=[0] * 38,
         )
         self.trainer = hf
+
+    def get_hf_callbacks(self):
+        return ["aligntune's own adapter"]
 
     def train(self):
         return {"final_loss": 1.25, "steps": 7, "epochs": 2, "metrics": {}, "model_path": "x", "training_time": 3.0}
@@ -1238,6 +1435,43 @@ def test_the_aligntune_wrapper_passes_the_keywords_through_and_reads_the_numbers
     assert result["final_loss"] == 1.25 and result["steps"] == 7 and result["rows_seen"] == 38
     history = result["loss_history"]
     assert history[0] == [1, 2.0] and len(history) == 2 and math.isnan(history[1][1])
+
+
+def install_fake_transformers(monkeypatch):
+    module = types.ModuleType("transformers")
+
+    class TrainerCallback:  # the real base class holds a no-op for every event
+        def on_train_begin(self, args, state, control, **kwargs):
+            pass
+
+    module.TrainerCallback = TrainerCallback
+    monkeypatch.setitem(sys.modules, "transformers", module)
+
+
+def test_the_aligntune_wrapper_adds_a_callback_that_runs_the_start_check(monkeypatch):
+    install_fake_aligntune(monkeypatch)
+    install_fake_transformers(monkeypatch)
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16)
+    trainer = finetune.aligntune_factory({}, check)
+    callbacks = trainer.inner.get_hf_callbacks()
+    assert callbacks[0] == "aligntune's own adapter" and len(callbacks) == 2  # AlignTune's own callback is kept
+    callbacks[1].on_train_begin("args", "state", "control", train_dataloader=labels([{"labels": [-100, 5]}] * 3))
+    assert check.label_counts == [1, 1]
+
+
+def test_the_aligntune_wrapper_without_a_start_check_leaves_the_callbacks_alone(monkeypatch):
+    install_fake_aligntune(monkeypatch)
+    trainer = finetune.aligntune_factory({}, None)
+    assert trainer.inner.get_hf_callbacks() == ["aligntune's own adapter"]
+
+
+def test_an_aligntune_without_the_callback_hook_makes_the_check_unavailable_not_an_error(monkeypatch):
+    install_fake_aligntune(monkeypatch)
+    install_fake_transformers(monkeypatch)
+    monkeypatch.delattr(_FakeAlignTuneTrainer, "get_hf_callbacks")
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16)
+    finetune.aligntune_factory({}, check)
+    assert check.label_counts is None and "get_hf_callbacks" in check.label_note
 
 
 def test_the_aligntune_wrapper_falls_back_on_the_trainer_state_for_the_step_count(monkeypatch):

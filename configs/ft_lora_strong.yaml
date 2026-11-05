@@ -68,3 +68,6 @@ output:
 
 checks:
   history_points: 20
+  label_check_rows: 8
+  label_tokens_min: 1
+  label_tokens_max: 16

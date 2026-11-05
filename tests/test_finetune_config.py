@@ -182,6 +182,12 @@ BAD = [
     ("output.merged_dir", "", "merged_dir"),
     ("output.keep_checkpoints", "no", "keep_checkpoints"),
     ("checks.history_points", 1, "history_points"),
+    ("checks.label_check_rows", 0, "label_check_rows"),
+    ("checks.label_check_rows", "8", "label_check_rows"),
+    ("checks.label_tokens_min", 0, "label_tokens_min"),
+    ("checks.label_tokens_min", 1.5, "label_tokens_min"),
+    ("checks.label_tokens_max", 0, "label_tokens_max"),
+    ("checks.label_tokens_max", True, "label_tokens_max"),
 ]
 
 
@@ -196,6 +202,18 @@ def test_fp16_and_bf16_together_are_refused():
     data = mutated("train.bf16", True)
     with pytest.raises(finetune.ConfigError, match="fp16.*bf16|bf16.*fp16"):
         finetune.parse_config(data)
+
+
+def test_the_label_bounds_must_be_ordered():
+    data = mutated("checks.label_tokens_min", 20)  # the base config's maximum is 16
+    with pytest.raises(finetune.ConfigError, match="label_tokens_min.*label_tokens_max"):
+        finetune.parse_config(data)
+
+
+def test_the_real_configs_carry_the_label_check_values():
+    for path in (BASE_PATH, STRONG_PATH):
+        checks = finetune.load_config(path).checks
+        assert (checks.label_check_rows, checks.label_tokens_min, checks.label_tokens_max) == (8, 1, 16)
 
 
 def test_adapter_and_merged_folders_must_differ():
@@ -223,7 +241,8 @@ def test_an_unknown_nested_key_is_an_error_with_a_suggestion():
 @pytest.mark.parametrize(
     "key",
     ["base_model", "data", "lora.rank", "lora.target_modules", "train.learning_rate", "train.seed", "train.fp16",
-     "aligntune.backend", "output.merge_dtype", "checks.history_points", "quantization.mode"],
+     "aligntune.backend", "output.merge_dtype", "checks.history_points", "quantization.mode",
+     "checks.label_check_rows", "checks.label_tokens_min", "checks.label_tokens_max"],
 )
 def test_a_missing_required_key_is_an_error(key):
     with pytest.raises(finetune.ConfigError, match=key.split(".")[-1]):

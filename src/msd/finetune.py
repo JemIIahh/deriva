@@ -77,6 +77,9 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
 SUMMARY_FILE = "finetune_summary.json"
 ADAPTER_CONFIG = "adapter_config.json"
 SMOKE_SUFFIX = "-smoke"
+TEMPLATE_FILE = "chat_template.jinja"
+DEFAULT_TEMPLATE = "default"
+IGNORE_INDEX = -100  # PyTorch's cross-entropy ignore index: a label with this value takes no part in the loss
 ALIGNTUNE_VERSION = "0.1.31"
 LIBRARIES = (
     "aligntune", "trl", "transformers", "peft", "torch", "bitsandbytes", "datasets", "accelerate", "curatorkit", "huggingface_hub",
@@ -256,7 +259,12 @@ SCHEMA: dict[str, Any] = {
         "merge_dtype": choice("float16", "bfloat16", "float32"),
         "keep_checkpoints": flag,
     },
-    "checks": {"history_points": integer(2)},
+    "checks": {
+        "history_points": integer(2),
+        "label_check_rows": integer(1),
+        "label_tokens_min": integer(1),
+        "label_tokens_max": integer(1),
+    },
 }
 
 
@@ -305,6 +313,8 @@ def parse_config(data: Any, source: str = "config") -> SimpleNamespace:
             errors.append("train.fp16 and train.bf16 cannot both be true")
         if checked["output"]["adapter_dir"] == checked["output"]["merged_dir"]:
             errors.append("output.adapter_dir and output.merged_dir must differ")
+        if checked["checks"]["label_tokens_min"] > checked["checks"]["label_tokens_max"]:
+            errors.append("checks.label_tokens_min must not be above checks.label_tokens_max")
     if errors:
         raise ConfigError(f"{source}: {len(errors)} problem(s) in the config:\n" + "\n".join(f"  - {e}" for e in errors))
     return _to_namespace(SCHEMA, checked)
@@ -446,8 +456,104 @@ def _quantization(cfg: SimpleNamespace) -> dict[str, Any] | None:
     }
 
 
+def chat_template_text(template: Any) -> str:
+    """The text of a tokenizer's default chat template, whatever shape the tokenizer keeps it in.
+
+    Tiny Aya Global stores `chat_template` in tokenizer_config.json as a named list
+    `[{"name": "default", "template": ...}, ...]`; transformers 5 turns that into a dict, and TRL's
+    `has_generation_markers` and its template swap need a string. A string is taken as it is, a dict or a list
+    gives its "default" entry, and anything else is an error that says what was found."""
+    where = "the tokenizer's chat_template"
+    if template is None:
+        raise FinetuneError("the tokenizer has no chat_template (it is None)")
+    if isinstance(template, str):
+        entry, label = template, where
+    elif isinstance(template, (Mapping, list)):
+        kind = "mapping" if isinstance(template, Mapping) else "list"
+        if isinstance(template, Mapping):
+            named = dict(template)
+        else:
+            named = {item.get("name"): item.get("template") for item in template if isinstance(item, Mapping)}
+        if not named:
+            raise FinetuneError(f"{where} is an empty {kind}")
+        if DEFAULT_TEMPLATE not in named:
+            raise FinetuneError(
+                f"{where} holds the named templates {sorted(map(str, named))} but none is called '{DEFAULT_TEMPLATE}'"
+            )
+        entry, label = named[DEFAULT_TEMPLATE], f"the '{DEFAULT_TEMPLATE}' template in {where}"
+    else:
+        raise FinetuneError(f"{where} is {type(template).__name__}, expected text or a named list of templates")
+    if not isinstance(entry, str):
+        raise FinetuneError(f"{label} is a {type(entry).__name__}, not text")
+    if not entry.strip():
+        raise FinetuneError(f"{label} is empty")
+    return entry
+
+
+@dataclass
+class StartCheck:
+    """What to verify on the tokenised training data once the trainer has built it and before its first step.
+
+    The labelled-token check: TRL turns the assistant part of each example into `labels` (everything else is
+    `IGNORE_INDEX`). The task answer is one letter, so a row should have a handful of labelled tokens: none means
+    the assistant mask matched nothing, a great many means the loss covers the prompt too. The real trainer calls
+    `observe` from an `on_train_begin` callback; `label_counts` stays None, with `label_note` saying why, when
+    the rows could not be read."""
+
+    rows: int
+    minimum: int
+    maximum: int
+    label_counts: list[int] | None = None
+    label_note: str | None = None
+
+    def check_labels(self, counts: Sequence[int]) -> None:
+        self.label_counts = [int(n) for n in counts]
+        self.label_note = None
+        for index, n in enumerate(self.label_counts, start=1):
+            if not self.minimum <= n <= self.maximum:
+                raise FinetuneError(
+                    f"row {index} of the tokenised training data has {n} labelled tokens, expected {self.minimum} to "
+                    f"{self.maximum} (checks.label_tokens_min / label_tokens_max): "
+                    + (
+                        "the assistant mask matched nothing, so check that the chat template has generation markers "
+                        "and that train.assistant_only_loss is on"
+                        if n < self.minimum
+                        else "the loss seems to cover more than the answer, so check train.assistant_only_loss and the chat template"
+                    )
+                )
+
+    def observe(self, *, train_dataloader: Any, args: Any) -> None:
+        """Called with what the Hugging Face trainer passes to `on_train_begin`; raises `FinetuneError` on a bad row."""
+        counts = self._read_label_counts(train_dataloader)
+        if counts is not None:
+            self.check_labels(counts)
+
+    def _read_label_counts(self, loader: Any) -> list[int] | None:
+        if loader is None:
+            self.label_note = "no dataloader was passed to the callback"
+            return None
+        dataset = getattr(loader, "dataset", None)
+        if dataset is None:
+            self.label_note = "the dataloader has no dataset"
+            return None
+        try:
+            rows = [dataset[i] for i in range(min(self.rows, len(dataset)))]
+        except Exception as exc:
+            self.label_note = f"the tokenised rows cannot be read ({type(exc).__name__}: {exc})"
+            return None
+        if not rows:
+            self.label_note = "the dataset has no rows"
+            return None
+        try:
+            values = [row["labels"] for row in rows]
+        except Exception:
+            self.label_note = "the tokenised rows have no labels column"
+            return None
+        return [sum(1 for v in (x.tolist() if hasattr(x, "tolist") else x) if v != IGNORE_INDEX) for x in values]
+
+
 def build_trainer_params(
-    cfg: SimpleNamespace, *, data_path: Path, adapter_dir: Path, seed: int, max_steps: int | None
+    cfg: SimpleNamespace, *, data_path: Path, adapter_dir: Path, chat_template_path: Path, seed: int, max_steps: int | None
 ) -> dict[str, Any]:
     """The keyword arguments of AlignTune's `create_sft_trainer`, all taken from the config.
 
@@ -481,6 +587,7 @@ def build_trainer_params(
         "weight_decay": t.weight_decay,
         "max_grad_norm": t.max_grad_norm,
         "assistant_only_loss": t.assistant_only_loss,
+        "chat_template_path": str(chat_template_path),  # a SFTConfig field AlignTune copies on; see chat_template_text
         "seed": seed,
         "data_seed": seed,
         "logging_steps": 1 if max_steps is not None else t.logging_steps,
@@ -526,7 +633,30 @@ class _AlignTuneRun:
         return {"final_loss": result.get("final_loss"), "steps": steps, "loss_history": history, "rows_seen": rows_seen}
 
 
-def aligntune_factory(params: Mapping[str, Any]) -> _AlignTuneRun:
+def _hook_start_check(inner: Any, start_check: StartCheck) -> None:
+    """Make the Hugging Face trainer AlignTune builds inside `train()` call `start_check.observe` before its first step.
+
+    AlignTune's `train()` creates the TRL trainer and runs it in one method, so there is no moment in between to
+    look at the data; its SFT trainer passes `callbacks=self.get_hf_callbacks()` to TRL, which is wrapped here."""
+    hook = getattr(inner, "get_hf_callbacks", None)
+    if hook is None:
+        start_check.label_note = "this AlignTune has no get_hf_callbacks hook"
+        return
+    try:
+        from transformers import TrainerCallback
+    except ImportError as exc:
+        start_check.label_note = f"transformers could not be imported ({exc})"
+        return
+
+    class _StartCheckCallback(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            start_check.observe(train_dataloader=kwargs.get("train_dataloader"), args=args)
+
+    callback = _StartCheckCallback()
+    inner.get_hf_callbacks = lambda: [*hook(), callback]
+
+
+def aligntune_factory(params: Mapping[str, Any], start_check: StartCheck | None = None) -> _AlignTuneRun:
     """Build AlignTune's SFT trainer from `params` (nothing is loaded until `train()`); the only AlignTune import."""
     try:
         from aligntune.core.backend_factory import create_sft_trainer
@@ -535,7 +665,10 @@ def aligntune_factory(params: Mapping[str, Any]) -> _AlignTuneRun:
             f"AlignTune could not be imported ({exc}). Install it with `pip install aligntune=={ALIGNTUNE_VERSION}` on "
             "the runtime that trains (it needs Python 3.11 or newer; docs/runtime.md, section 5)."
         ) from exc
-    return _AlignTuneRun(create_sft_trainer(**params))
+    inner = create_sft_trainer(**params)
+    if start_check is not None:
+        _hook_start_check(inner, start_check)
+    return _AlignTuneRun(inner)
 
 
 def default_merge(base_model: str, adapter_dir: Path, out_dir: Path, *, dtype: str) -> None:
@@ -864,14 +997,19 @@ def _check_adapter(adapter_dir: Path, cfg: SimpleNamespace, name: str) -> None:
 
 
 def _train_and_check(
-    hooks: Hooks, cfg: SimpleNamespace, args: argparse.Namespace, check: DataCheck, seed: int, folder: Path
+    hooks: Hooks, cfg: SimpleNamespace, args: argparse.Namespace, check: DataCheck, seed: int, folder: Path, template_path: Path
 ) -> dict[str, Any]:
     adapter_dir = folder / cfg.output.adapter_dir
-    params = build_trainer_params(cfg, data_path=check.path, adapter_dir=adapter_dir, seed=seed, max_steps=args.max_steps)
-    trainer = hooks.trainer_factory(params)
+    params = build_trainer_params(
+        cfg, data_path=check.path, adapter_dir=adapter_dir, chat_template_path=template_path, seed=seed, max_steps=args.max_steps
+    )
+    start_check = StartCheck(rows=cfg.checks.label_check_rows, minimum=cfg.checks.label_tokens_min, maximum=cfg.checks.label_tokens_max)
+    trainer = hooks.trainer_factory(params, start_check)
     result = trainer.train()
     del trainer
     _release_memory()
+    if start_check.label_counts is None:
+        print(f"note: the labelled-token check could not run ({start_check.label_note or 'the trainer never reported its rows'})", file=sys.stderr)
 
     _check_adapter(adapter_dir, cfg, cfg.output.adapter_dir)
     rows_seen = result.get("rows_seen")
@@ -912,12 +1050,17 @@ def _train_and_check(
         "final_loss": float(format(float(final), _FLOAT)),
         "history": history,
         "loss_reason": reason,
+        "label_check": (
+            "unavailable"
+            if start_check.label_counts is None
+            else {"counts": start_check.label_counts, "allowed_min": start_check.minimum, "allowed_max": start_check.maximum}
+        ),
     }
 
 
 def _summary(
     cfg: SimpleNamespace, args: argparse.Namespace, config_path: Path, check: DataCheck, seed: int, trained: dict[str, Any],
-    merged: bool, seconds: float, hooks: Hooks, root: Path,
+    merged: bool, seconds: float, hooks: Hooks, root: Path, template_sha256: str,
 ) -> dict[str, Any]:
     return {
         "schema": 1,
@@ -950,6 +1093,8 @@ def _summary(
         "loss_history": _tidy(sample_history(trained["history"], cfg.checks.history_points)),
         "loss_ok": True,
         "loss_reason": trained["loss_reason"],
+        "label_check": trained["label_check"],
+        "chat_template_sha256": template_sha256,
         "wall_clock_seconds": float(format(seconds, _FLOAT)),
         "device": hooks.device_info(),
         "libraries": dict(hooks.versions()),
@@ -962,7 +1107,7 @@ def _summary(
 
 def _plan_lines(
     cfg: SimpleNamespace, args: argparse.Namespace, config_path: Path, check: DataCheck, seed: int, out: Path, root: Path,
-    length_line: str,
+    length_line: str, template_line: str,
 ) -> list[str]:
     t = cfg.train
     effective = t.per_device_batch_size * t.gradient_accumulation_steps
@@ -988,6 +1133,7 @@ def _plan_lines(
     else:
         lines.append(f"output: {where}")
     lines.append(length_line)
+    lines.append(template_line)
     lines.append(f"seed: {seed}; merge: {'yes' if args.merge_effective else 'no'} ({cfg.output.merge_dtype})")
     if args.push_to:
         lines.append(
@@ -997,17 +1143,21 @@ def _plan_lines(
     return lines
 
 
-def _measure(hooks: Hooks, cfg: SimpleNamespace, check: DataCheck, *, required: bool) -> str:
-    """The token-length line; refuses when an example is longer than `train.max_seq_length`.
-
-    A dry run does without a tokenizer (the line says so); a real run needs one."""
-    limit = cfg.train.max_seq_length
+def _load_tokenizer(hooks: Hooks, cfg: SimpleNamespace, *, required: bool) -> tuple[Any, str | None]:
+    """The base model's tokenizer and None, or None and why it could not be loaded (a dry run does without one)."""
     try:
-        tokenizer = hooks.tokenizer_loader(cfg.base_model)
+        return hooks.tokenizer_loader(cfg.base_model), None
     except Exception as exc:
         if required:
             raise FinetuneError(f"cannot load the tokenizer of {cfg.base_model} ({type(exc).__name__}: {exc})") from None
-        return f"token lengths: not estimated (no tokenizer: {type(exc).__name__}: {scrub(str(exc))})"
+        return None, f"{type(exc).__name__}: {scrub(str(exc))}"
+
+
+def _measure(tokenizer: Any, why: str | None, cfg: SimpleNamespace, check: DataCheck) -> str:
+    """The token-length line; refuses when an example is longer than `train.max_seq_length`."""
+    limit = cfg.train.max_seq_length
+    if tokenizer is None:
+        return f"token lengths: not estimated (no tokenizer: {why})"
     lengths = token_lengths(tokenizer, check.records)
     line, over = _length_line(lengths, limit)
     if over:
@@ -1017,6 +1167,36 @@ def _measure(hooks: Hooks, cfg: SimpleNamespace, check: DataCheck, *, required: 
             "nothing. Raise train.max_seq_length or drop those rows."
         )
     return line
+
+
+def _template_verdict(text: str) -> str:
+    """Whether TRL can mask the assistant part with this template; refuses when it cannot (checked when trl imports)."""
+    try:
+        from trl.chat_template_utils import cohere2_chat_template, has_generation_markers
+    except Exception as exc:  # not installed off the GPU runtime, or a broken install: a note, never a reason to stop
+        return f"TRL check skipped (trl could not be imported here: {type(exc).__name__}); the GPU runtime makes it"
+    if has_generation_markers(text):
+        return "has generation markers, so TRL can mask everything but the answer"
+    if text == cohere2_chat_template:
+        return "is TRL's cohere2 template, which TRL swaps for its training variant with generation markers"
+    raise FinetuneError(
+        f"the tokenizer's default chat template ({len(text)} characters) has no generation markers and is not TRL's "
+        "cohere2 template, so train.assistant_only_loss could not mask the prompt and TRL would stop (or train on the "
+        "whole sequence). Use a model whose template TRL knows, or supply a template with {% generation %} markers."
+    )
+
+
+def _prepare_template(tokenizer: Any) -> tuple[str | None, str | None, str]:
+    """The normalised template text, its sha256 and the plan line; refuses an unusable template."""
+    if tokenizer is None:
+        return None, None, "chat template: not checked (no tokenizer)"
+    text = chat_template_text(getattr(tokenizer, "chat_template", None))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return text, digest, f"chat template: {len(text)} characters, sha256 {digest}; {_template_verdict(text)}"
+
+
+def _work_dir(root: Path, stem: str, smoke: bool) -> Path:
+    return Path(root) / "work" / "finetune" / (stem + (SMOKE_SUFFIX if smoke else ""))
 
 
 def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
@@ -1031,12 +1211,19 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     except (FileExistsError, ValueError) as exc:
         raise UsageError(str(exc)) from None
     note_stale_partials(out)
+    work = _work_dir(root, stem, args.smoke)
+    try:
+        check_out_dir(work)
+    except (FileExistsError, ValueError) as exc:
+        raise UsageError(f"{exc}; it is what an earlier run left: move or delete it, then run again") from None
 
     check = check_data(cfg, train_path, root)
     for note in check.notes:
         print(note, file=sys.stderr)
-    length_line = _measure(hooks, cfg, check, required=not args.dry_run)
-    for line in _plan_lines(cfg, args, args.config, check, seed, out, root, length_line):
+    tokenizer, why = _load_tokenizer(hooks, cfg, required=not args.dry_run)
+    length_line = _measure(tokenizer, why, cfg, check)
+    template_text, template_sha256, template_line = _prepare_template(tokenizer)
+    for line in _plan_lines(cfg, args, args.config, check, seed, out, root, length_line, template_line):
         print(line)
     if args.dry_run:
         return EXIT_OK
@@ -1047,8 +1234,11 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
         check_push_target(api, args.push_to)  # before the hours of training, not after
 
     started = hooks.clock()
+    work.mkdir(parents=True, exist_ok=True)
+    template_path = work / TEMPLATE_FILE
+    template_path.write_text(template_text, encoding="utf-8")
     with atomic_output_dir(out) as folder:
-        trained = _train_and_check(hooks, cfg, args, check, seed, folder)
+        trained = _train_and_check(hooks, cfg, args, check, seed, folder, template_path)
         merged = False
         if args.merge_effective:
             merged_dir = folder / cfg.output.merged_dir
@@ -1057,9 +1247,10 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
                 raise FinetuneError(f"the merge left no {cfg.output.merged_dir} folder")
             merged = True
         seconds = hooks.clock() - started
-        summary = _summary(cfg, args, args.config, check, seed, trained, merged, seconds, hooks, root)
+        summary = _summary(cfg, args, args.config, check, seed, trained, merged, seconds, hooks, root, template_sha256)
         text = scrub(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
         (folder / SUMMARY_FILE).write_text(text, encoding="utf-8")
+    shutil.rmtree(work, ignore_errors=True)
 
     print(f"wrote {shown(out, root)} ({'smoke run, ' if args.smoke else ''}{trained['steps']} steps, final loss {trained['final_loss']:{_FLOAT}}; {trained['loss_reason']})")
     if args.smoke:
