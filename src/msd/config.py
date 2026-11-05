@@ -7,8 +7,13 @@ NON_ENGLISH: tuple[str, ...] = tuple(lang for lang in LANGS if lang != "en")
 # Model arms: base model, then fine-tuned variants.
 ARMS: tuple[str, ...] = ("BASE", "A0", "A1", "A2", "A2n", "A3")
 
-# Default interpolation grid (builder may change).
-ALPHAS: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+# The ReSta sweep (arm A2) ONLY. The naive blend (arm A2n) uses t in (0.25, 0.5, 0.75), not this grid.
+# Why it is dense at the low end: SafeTune's own docs page for ReSta (docs/user-guide/recover/layer/resta.md)
+# says "On Tiny Aya, alpha=1 breaks the model; use alpha~0.25 (sweep: 0.1/0.25 restore refusal with normal
+# answers, >=0.5 breaks it)", and our A1 already holds the Base-to-Global step once, so ReSta adds a second
+# copy. 0.0 is the no-op check, 1.0 stays as a deliberate break control. Runtime staging and the evidence:
+# docs/toolkit-notes.md, "The alpha grid".
+ALPHAS: tuple[float, ...] = (0.0, 0.05, 0.1, 0.15, 0.25, 0.35, 0.5, 1.0)
 
 # Sample sizes.
 PROBE_N = 150

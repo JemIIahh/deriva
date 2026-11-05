@@ -315,9 +315,33 @@ by ReSta and left alone by the blend. SafeTune's own pages say the same in words
 on Tiny Aya (the `ReStaTrainer` docstring and the ReSta guide, both quoted as read): "On Tiny Aya,
 alpha=1 breaks the model; use alpha~0.25 (sweep: 0.1/0.25 restore refusal with normal answers, >=0.5
 breaks it)". We have not reproduced that; which Tiny Aya model, drift and test it comes from is not
-stated (UNVERIFIED). It matters for us because `config.ALPHAS` is (0, 0.25, 0.5, 0.75, 1.0): three of
-five grid points are in the range SafeTune reports as breaking. Read the benign answers and the task
-accuracy of every ReSta arm before reading its safety numbers; the grid may need 0.1 and 0.15.
+stated (UNVERIFIED). It matters for us because the first grid, (0, 0.25, 0.5, 0.75, 1.0), had three of five
+points in the range SafeTune reports as breaking; the grid was changed (next section). Read the benign
+answers and the task accuracy of every ReSta arm before reading its safety numbers.
+
+### The alpha grid
+
+`config.ALPHAS` is the ReSta sweep (arm A2) only: `(0.0, 0.05, 0.1, 0.15, 0.25, 0.35, 0.5, 1.0)`. The naive
+blend (arm A2n) keeps its own settings, t in (0.25, 0.5, 0.75), which are not this grid.
+
+- **Evidence.** SafeTune's ReSta guide (`docs/user-guide/recover/layer/resta.md`, read 2026-11-05) says: "On Tiny
+  Aya, alpha=1 breaks the model; use alpha~0.25 (sweep: 0.1/0.25 restore refusal with normal answers, >=0.5
+  breaks it)". It is SafeTune's report, not our measurement, and which Tiny Aya model and drift it used is not
+  stated.
+- **Reasoning.** Our A1 already contains the Base-to-Global step once (A1 = A0 + L), and ReSta adds
+  `alpha * (A0 - BASE)` on top of it, so every alpha above zero over-applies that step; a model-breaking
+  alpha of 0.5 or more is what that arithmetic would lead one to expect. The useful range is therefore the
+  low end, and the old grid had one point (0.25) there and three above the reported break.
+- **The grid.** Dense below 0.5 (0.05, 0.1, 0.15, 0.25, 0.35), 0.5 as the first reported-broken point, 0 as the
+  no-op check, and 1.0 kept as a deliberate break control, so the article can show the break instead of
+  asserting it. The folder names (`gen.format_alpha`) read back exactly: 0.0, 0.05, 0.1, 0.15, 0.25, 0.35, 0.5,
+  1.0 (tested).
+- **Staging at the runtime (plan Task 16, Step 7).** Eight ReSta runs plus three blends, each generated and judged
+  in five languages, is a lot for free GPU quotas. Run alpha 0 (the Step 6 sanity check), then 0.1, 0.25 and
+  0.5 first, with a benign-answer sanity check on each (read some non-harmful answers: the failure SafeTune
+  describes is a model that still refuses but talks garbage). Add 0.05, 0.15 and 0.35 only if the first
+  three leave a gap in the safety-against-task-quality curve; run 1.0 last, as the control. Pick the featured
+  alpha on the dev split only.
 
 ### Memory and device
 
@@ -377,7 +401,8 @@ On a runtime that has the three models, enough RAM (about 20 GB for bf16) and `p
 export HF_TOKEN=...      # in the shell; there is no token flag
 python scripts/run_resta.py --drifted A1 --base CohereLabs/tiny-aya-base --aligned CohereLabs/tiny-aya-global --alpha 0 --out A2_alpha_0.00
 # Step 6: the tensors of A2_alpha_0.00 must equal A1's bit for bit, and greedy outputs must match on 5 prompts.
-# Only then: --alpha 0.25 and the rest of config.ALPHAS (each run reloads the three models).
+# Only then: --alpha 0.1, 0.25, 0.5 with a benign-answer check, then the rest of config.ALPHAS as needed
+# ("The alpha grid" above; each run reloads the three models).
 python -c "from pathlib import Path; from msd.blend import blend_state_dicts; blend_state_dicts(Path('A1'), Path('A0'), 0.5, Path('A2n_0.50'))"
 ```
 

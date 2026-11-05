@@ -455,7 +455,8 @@ def test_generate_applies_the_arm_alpha_rules(tmp_path):
 @pytest.mark.parametrize(
     "alpha, text",
     [(None, "none"), (0.25, "0.25"), (0.5, "0.5"), (1.0, "1.0"), (0.0, "0.0"), (0.75, "0.75"),
-     (0.1 + 0.2, "0.3"), (0.125, "0.125"), (-0.0, "0.0"), (1e-7, "0.0")],
+     (0.1 + 0.2, "0.3"), (0.125, "0.125"), (-0.0, "0.0"), (1e-7, "0.0"),
+     (0.05, "0.05"), (0.1, "0.1"), (0.15, "0.15"), (0.35, "0.35"), (0.05 + 0.1, "0.15")],  # the ReSta grid's low end
 )
 def test_format_alpha_is_stable(alpha, text):
     assert gen.format_alpha(alpha) == text
