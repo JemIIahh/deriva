@@ -232,3 +232,171 @@ Not done (DEFERRED-RUNTIME): the brief's "ten items per language on the GPU runt
 GPU runtime exists yet. It is the first thing to run once one does: the judge stage of
 `scripts/run_eval.py` with `--judge hf:Qwen/Qwen3-4B --limit 10` on a runtime with `torch` and
 `transformers`, reading the verdicts for plain `judge_error` counts before anything else.
+
+## SafeTune ReSta (read from source)
+
+Checked 2026-11-05. Nothing was run: SafeTune is not installed in any project venv, there is no GPU
+here and no weights were downloaded. Everything below is read from source text. The source files
+are the `safetune` 0.1.12 wheel from PyPI (sha256 `91de846c2e0e386f52009a93371a065185e261bce4c39fef7bbedb3ee12534d7`,
+unpacked, not installed) and the same paths at the head of `github.com/Lexsi-Labs/SafeTune` (commit
+`3901a9f48a`, 2026-11-03). The ReSta files are byte-identical in both. Files read:
+`src/safetune/runner/recover/_layer.py` (`ReStaTrainer`), `.../_base.py` (`_RecoverBase`),
+`src/safetune/interventions/recover/resta.py` (`apply_resta`), `src/safetune/core/optim/resta.py`
+(`RESTAWrapper`), `.../recover/_invariant.py`, `src/safetune/runner/utils/model_utils.py`,
+`src/safetune/config.py`, and the pages `docs/user-guide/recover/layer/resta.md`,
+`docs/reference/api/recover.md`. Anything I could not read directly is marked UNVERIFIED.
+
+Package facts (PyPI JSON): needs Python >=3.12, `torch>=2.7.0`, `transformers>=5.15,<6`, and drags in
+bitsandbytes, trl, peft, wandb, lm-eval and others. `from safetune.runner import recover` also imports
+the harden, steer and unlearn pillars (`runner/__init__.py`), so the import is heavy; whether it
+imports cleanly on Kaggle or Colab is UNVERIFIED.
+
+### Constructor and call
+
+```python
+from safetune.runner import recover
+recover.ReStaTrainer(model=None, *, base_model=None, aligned_model=None, alpha=1.0, dare=True,
+                     dare_drop_rate=None, dare_seed=0, device=None, **kwargs)   # kwargs: model_id, results_dir, drift_task
+patched = trainer.apply()        # apply(*, alpha=None, dare=None, dare_drop_rate=None, dare_seed=None, device=None)
+```
+
+- **It takes loaded `nn.Module` objects, not paths or ids.** If `model` is omitted, the base class
+  loads `model_id` itself with SafeTune's `load_model`, which is not what we want (next bullets).
+- **`apply()` mutates the drifted model in place and returns that same object. It never writes to
+  disk** (`_RecoverBase.apply` docstring: "Never write to disk here; the caller calls
+  `save_checkpoint` separately"). A sweep over alphas therefore needs a fresh drifted model per
+  alpha (reload or deepcopy); applying twice stacks the patch.
+- **Saving** is a separate call, `trainer.save_checkpoint(patched, tokenizer, name)`. It writes to
+  `<results_dir>/checkpoints/<name>` (the default `results_dir` is inside the installed package), calls
+  `save_pretrained(..., safe_serialization=True)`, the tokenizer's `save_pretrained`, and adds a
+  `lexsi_provenance.json`. Our wrapper does not use it: it saves with `save_pretrained` itself, into a
+  temporary folder it renames into place, so the output path and the tokenizer source are ours.
+- The loaders SafeTune ships (`load_model`, `load_model_cpu`) default their dtype to the runtime
+  config: fp32 on CPU, bf16 on a bf16-capable GPU. Used as is, they would load A1 as fp32 and save
+  an fp32 A2 next to a bf16 A1. Our wrapper loads the three models itself with `dtype="auto"` (each
+  in the dtype its own config says), so a patched model is saved in the dtype of the drifted one. That
+  `dtype="auto"` keeps the stored dtype in the transformers version we get is UNVERIFIED.
+
+### What `alpha` multiplies
+
+```
+safety vector    v = theta_aligned - theta_base                      (fp32, one tensor at a time)
+no DARE          theta_safe = theta_drifted + alpha * v
+DARE (default)   theta_safe = theta_drifted + alpha * dare(v)        dare keeps each entry with prob 1-p, scaled by 1/(1-p)
+```
+
+The code, per tensor: `val.copy_((val.float() + alpha * delta).to(val.dtype))`. So:
+
+- `alpha = 0` adds exactly zero: the result is the drifted model, entry by entry, bit for bit, because
+  the fp32 round trip of a bf16 or fp16 value is exact. It is NOT a no-op in code (it still computes
+  every delta, so it costs the same time), and `assert_mutates` logs a WARNING that "model weights
+  appear unchanged" (a log line, not an exception; expected at alpha 0).
+- `alpha = 1` adds the whole `aligned - base` vector. It is not a "restore A0" setting; see the next section.
+- `v` is the whole post-training step that turned Tiny Aya Base into Tiny Aya Global, not a
+  safety-only vector. Nothing in the code separates safety from the rest of post-training.
+- **DARE is on by default in `ReStaTrainer`** (`dare=True`, `dare_drop_rate=None` meaning p = 0.3, the
+  paper's value, `dare_seed=0`), and off by default in the lower-level `apply_resta` (`dare=False`). The
+  docs page states both. With DARE the mask is drawn per tensor in the order of `aligned.state_dict()`
+  from a CPU generator seeded with `dare_seed`, so a fixed seed repeats on the same library and
+  transformers version, and the draw order is UNVERIFIED across versions. With `dare_seed=None` the
+  global RNG is used (not repeatable). The mask applies to every tensor in the vector, embeddings and
+  norms included; `ReStaTrainer` does not expose `param_filter`.
+- The docs report that at p = 0.9 (the old default, "legacy") a 0.5B Qwen model broke (garbled answers)
+  while p = 0.3 restored refusal; the default is now 0.3. Not reproduced here (UNVERIFIED).
+
+### Reading it against our two arms (arithmetic, not a measurement)
+
+Write A1 = A0 + L for the merged fine-tune step L (zero outside the LoRA target modules). Then
+ReSta gives `A1 + alpha*(A0 - BASE)`, which at alpha = 1 is `2*A0 - BASE + L`: it adds a second copy of
+the Base-to-Global step on top of a model that already contains one, and leaves L in place. The naive blend
+`(1-t)*A1 + t*A0` is `A0 + (1-t)*L`: it removes L, and t = 1 returns A0 exactly. So ReSta at alpha = 1 is
+not A0 and not near it, and tensors the fine-tune did not touch (embeddings, norms) are moved past A0
+by ReSta and left alone by the blend. SafeTune's own pages say the same in words, as a measurement
+on Tiny Aya (the `ReStaTrainer` docstring and the ReSta guide, both quoted as read): "On Tiny Aya,
+alpha=1 breaks the model; use alpha~0.25 (sweep: 0.1/0.25 restore refusal with normal answers, >=0.5
+breaks it)". We have not reproduced that; which Tiny Aya model, drift and test it comes from is not
+stated (UNVERIFIED). It matters for us because `config.ALPHAS` is (0, 0.25, 0.5, 0.75, 1.0): three of
+five grid points are in the range SafeTune reports as breaking. Read the benign answers and the task
+accuracy of every ReSta arm before reading its safety numbers; the grid may need 0.1 and 0.15.
+
+### Memory and device
+
+- The three models must be loaded in full. In bf16 that is about 3 x 6.7 GB = 20 GB for a 3.35B model
+  (the plan's figure, Task 16, Step 6; `docs/runtime.md` has no RAM number for either free runtime); in
+  fp32 it would be 3 x 13.4 GB = 40 GB. The safety vector itself is streamed: the extra memory is a few
+  fp32 copies of the largest tensor (probably the embedding matrix, size UNVERIFIED), which with DARE
+  includes the random mask and the masked product. SafeTune's docs say earlier versions instead held about
+  three fp32 copies of the whole model for the vector, "about 40 GB for a 3.35B model", on top of the loaded
+  models; the streaming change removed that.
+- `device=None` computes each delta on the drifted weight's device, so with the drifted model on a
+  16 GB GPU and the two references on CPU it moves tensors across per step; `device="cpu"` with all
+  three on CPU needs the 20 GB of RAM and no GPU. Our wrapper loads all three on CPU and passes
+  `device="cpu"`. Whether a free Kaggle or Colab runtime has that much RAM is UNVERIFIED (`docs/runtime.md`).
+
+### Things that could make `alpha = 0` differ from the drifted model
+
+The source offers no reason when the three state dicts line up. These are the ways it could still differ,
+and why the wrapper's sanity step (greedy outputs at alpha 0 equal A1 on 5 prompts) stays mandatory:
+
+1. **Key mismatch is silent.** The vector covers `[k for k in aligned if k in base]`, and a tensor whose
+   name is missing from either reference is simply skipped, with only an INFO log line (the count). If
+   Tiny Aya Base and Global name their tensors differently (UNVERIFIED), ReSta would patch fewer
+   tensors and say nothing. Our wrapper refuses unless all three state dicts have the same names and shapes.
+2. **Load and save round trip.** `apply()` is exact, but the model is loaded and saved by transformers:
+   a dtype cast on load, a renamed or fused key, tied weights written once. The bits can change before
+   ReSta touches them. Compare the tensors of the alpha-0 output with those of `--drifted`, name by name
+   and bit by bit (a few lines with `safetensors`; no such helper exists in the repo yet); the 5-prompt check alone would not catch a small dtype change.
+3. **Non-finite entries.** `0 * inf` and `0 * nan` are NaN. If `aligned - base` held an inf or nan, alpha 0
+   would corrupt that entry. Not expected in released bf16 weights; not checked.
+4. **Tied weights.** If the embedding and the output head are tied, the name that wins is the last
+   one in the drifted state dict (the code says so); at alpha 0 that changes nothing.
+5. **DARE with a fresh seed** does not matter at alpha 0 (the delta is multiplied by zero).
+
+### How `scripts/run_resta.py` calls it (written from the source above, never run against it)
+
+`src/msd/restarun.py` does, in this order: check the arguments (exit 2: `--alpha` finite in [0, 1], `--out`
+missing or empty, `--drifted` a folder, `--base` and `--aligned` not the same model); import SafeTune (exit 1 with
+one line if it is missing, before any weight is read); load the drifted, base and aligned models with
+`AutoModelForCausalLM.from_pretrained(name, dtype="auto")` on the CPU; refuse unless the three have the same
+tensor names and shapes; build `recover.ReStaTrainer(drifted, base_model=..., aligned_model=..., alpha=...,
+dare=..., dare_drop_rate=..., dare_seed=..., device="cpu")` and call `apply()`; save with `save_pretrained`
+plus the drifted model's tokenizer into a temporary folder renamed to `--out`, with `resta_patch.json`
+recording alpha, the DARE settings, the three sources, the SafeTune version and the dtypes.
+
+One decision the brief did not make: **DARE is on by default** because `ReStaTrainer` has it on, with
+`dare_drop_rate=0.3` and `dare_seed=0` passed explicitly (`--no-dare`, `--dare-drop-rate`, `--dare-seed` change
+them). The brief's call `ReStaTrainer(..., alpha=alpha).apply()` leaves all of this to the library's defaults, so an
+article that says "ReSta" should say whether DARE was on. The `ReStaTrainer` page in the SafeTune docs shows
+`dare=False` in its example while the class default is `True`.
+
+### Running it (DEFERRED-RUNTIME: plan Task 16, Steps 5 to 7)
+
+On a runtime that has the three models, enough RAM (about 20 GB for bf16) and `pip install safetune`:
+
+```
+export HF_TOKEN=...      # in the shell; there is no token flag
+python scripts/run_resta.py --drifted A1 --base CohereLabs/tiny-aya-base --aligned CohereLabs/tiny-aya-global --alpha 0 --out A2_alpha_0.00
+# Step 6: the tensors of A2_alpha_0.00 must equal A1's bit for bit, and greedy outputs must match on 5 prompts.
+# Only then: --alpha 0.25 and the rest of config.ALPHAS (each run reloads the three models).
+python -c "from pathlib import Path; from msd.blend import blend_state_dicts; blend_state_dicts(Path('A1'), Path('A0'), 0.5, Path('A2n_0.50'))"
+```
+
+The naive blend needs no SafeTune and no GPU: `msd.blend` reads shard headers first (names, shapes, dtypes),
+then streams one tensor at a time, so it fits a laptop.
+
+### Fallback, if SafeTune will not install
+
+Without DARE the method is plain arithmetic, `drifted + alpha * (aligned - base)`, tensor by tensor in fp32
+and cast back, which is what `src/msd/blend.py` already does for a different formula. Our own streaming
+implementation of it would be a valid substitute (plan Task 16, Step 6 allows it) and would need no
+torch model objects: three safetensors directories in, one out. It would not reproduce SafeTune's
+default, which has DARE on (p = 0.3, seed 0), because the mask depends on SafeTune's draw order. If the
+study falls back, say "ReSta without DARE" in the article. That fallback is NOT built; the formula above is
+what it would implement.
+
+### What is still UNVERIFIED
+
+The real call (`scripts/run_resta.py` is written against this source and tested with a fake trainer
+only), the key names of Tiny Aya Base against Global, the stored dtype and what `dtype="auto"` gives,
+peak memory, SafeTune's Tiny Aya alpha claim, and a clean `import safetune` on Kaggle or Colab. All of
+them are settled by the first GPU-runtime sanity run (plan Task 16, Step 6).
