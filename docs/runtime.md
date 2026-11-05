@@ -266,6 +266,7 @@ STAGE_ARGS = "--config configs/ft_lora.yaml --max-steps 20 --merge"
 #    tokens per row (0 or a large number means the assistant mask is wrong), args_check listing the 13 trainer
 #    arguments it compared, chat_template_sha256, peak memory in the log (UNVERIFIED how it is shown; watch
 #    nvidia-smi). If the adapter check, the keyword names or the assistant-only mask are wrong this is where it shows.
+#    READ label_check BEFORE THE FULL RUN: see "Reading label_check" below the commands.
 
 #    Do not read too much into the smoke run's loss. The task answer is one letter, so each example has only about 3
 #    labelled tokens (the letter and the two end tokens), so a logged step averages only about 48 labelled tokens
@@ -282,6 +283,24 @@ STAGE_ARGS = "--config configs/ft_lora.yaml --push-to <hf-user>/<private-model-r
 # 4. Only if step 3's held-out accuracy (below) shows the model barely moved: the strong retry, 3 epochs = 1,125 steps.
 STAGE_ARGS = "--config configs/ft_lora_strong.yaml"
 ```
+
+**Reading `label_check`** (in `finetune_summary.json` of the smoke run, before the full run). The label mask is what
+makes the experiment valid: without it the loss also covers the chat template's long safety preamble and the question,
+a confound. The check runs at step 0 of training (a callback on `on_train_begin`) and has three outcomes:
+
+1. **Counts, about 3 each** (`label_check: {counts: [...], allowed_min, allowed_max}`; `label_check_note` null). The
+   mask works: the letter and the two end tokens are the only labelled tokens. Go on to the full run.
+2. **`label_check: "unavailable"`** (with `label_check_note` saying why, and a WARNING on stdout and stderr). The
+   callback could not read the labelled rows: the mask was NOT verified. Do not start the full run. A real run
+   without the check stops at step 0 (exit 1) and tells you so. Inspect the first batch by hand in the notebook
+   (build the same `SFTTrainer` or tokenise a few rows with the template saved in the work folder, and look at
+   `labels` against `input_ids`) and find out why the callback saw nothing, for example a `labels` column that the
+   dataloader removed. Only after that, if you decide to accept an unverified mask, run the full run with
+   `--allow-unchecked-labels`: it prints a WARNING and records `label_check_waived: true` in the summary.
+3. **Out of bounds** (the run exits 1 at step 0, naming the row and the count, in a smoke run as in a real one; no summary is written).
+   0 labelled tokens: the assistant mask matched nothing (the template has no generation markers, or
+   `assistant_only_loss` did not reach TRL). A large count: the loss covers more than the answer. Fix the cause;
+   `--allow-unchecked-labels` never waives this.
 
 The notebook then uploads `results/finetune/` to the private workspace repo, **without weights**: its upload skips
 `*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `work/**` and any `merged/` folder, so the summary and logs travel but the

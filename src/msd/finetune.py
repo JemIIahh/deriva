@@ -32,6 +32,11 @@ written last. `--max-steps N` is a smoke run: N steps, every step logged, merge 
 pushed. `--merge-only --adapter PATH` trains nothing: it checks that adapter against the config, merges it into
 `<out>/merged` and adds a `merge` section to the summary (the recovery after a failed merge).
 
+The label mask is checked at step 0 (labelled tokens of the first rows, and the trainer's arguments). When the
+rows cannot be read the check is "unavailable": a smoke run records that and prints a WARNING on both streams, a
+real run stops at step 0 (exit 1), and `--allow-unchecked-labels` (real run only) lets it go on with a WARNING and
+`label_check_waived: true` in the summary. An out-of-bounds count is never waived.
+
 `--push-to ORG/NAME` uploads the merged folder after a successful full run, but only to a repo that already
 exists and for which `HfApi.repo_info(...).private is True` (checked before training starts). The token is read
 from HF_TOKEN only (there is no token flag), is never printed, and no repo is ever created. Without the flag
@@ -45,10 +50,11 @@ for Tiny Aya's template, fp16 stability on a T4 and the memory use.
 Exit codes:
   0  done: a full or smoke run finished and passed its checks, or a dry run found nothing wrong
   1  a data or config problem, a failed quality check (validation, overlap, a loss that is NaN or did not fall,
-     rows missing, an adapter that is not the configured one), a failure while training, merging or uploading,
+     rows missing, an adapter that is not the configured one, a label mask that is out of bounds or, on a real
+     run without --allow-unchecked-labels, could not be verified), a failure while training, merging or uploading,
      or a Hub repo that is missing or not private
   2  usage error: bad or missing arguments, --push-to without HF_TOKEN or with --max-steps or --no-merge,
-     --merge-only without --adapter or with a training option, a non-empty --out (or --out/merged for
+     --merge-only without --adapter or with a training option, --allow-unchecked-labels with --max-steps, a non-empty --out (or --out/merged for
      --merge-only), an --out that is, or is inside, a data folder, a smoke --out equal to the real run's folder,
      or a work folder an earlier run left
 """
@@ -551,6 +557,7 @@ class StartCheck:
     minimum: int
     maximum: int
     expected_args: Mapping[str, tuple[str, Any]] = field(default_factory=dict)  # TrainingArguments attribute -> (config key, value)
+    required: bool = False  # a real run: rows that cannot be read are an error, not a note
     label_counts: list[int] | None = None
     label_note: str | None = None
     args_compared: list[str] | None = None
@@ -573,11 +580,28 @@ class StartCheck:
                     )
                 )
 
+    def unverified_why(self) -> str:
+        return self.label_note or "the trainer never reported its tokenised rows"
+
+    def unverified_message(self) -> str:
+        why = self.unverified_why()
+        return (
+            f"the labelled-token mask could not be verified ({why}). Without it the loss may include the chat template's "
+            "preamble and the question, which confounds the experiment, so a real run does not start without the check. "
+            "The smoke run's finetune_summary.json (label_check, label_check_note) shows why; inspect the first batch by "
+            "hand (docs/runtime.md, 'Reading label_check'), and only then, if you accept running unverified, add "
+            "--allow-unchecked-labels"
+        )
+
     def observe(self, *, train_dataloader: Any, args: Any) -> None:
-        """Called with what the Hugging Face trainer passes to `on_train_begin`; raises `FinetuneError` on a bad row."""
+        """Called with what the Hugging Face trainer passes to `on_train_begin`; raises `FinetuneError` on a bad row.
+
+        On a real run (`required`) rows that cannot be read raise too, so that training stops at step 0."""
         counts = self._read_label_counts(train_dataloader)
         if counts is not None:
             self.check_labels(counts)
+        elif self.required:
+            raise FinetuneError(self.unverified_message())
         self.check_args(args)
 
     def check_args(self, args: Any) -> None:
@@ -717,11 +741,14 @@ def _hook_start_check(inner: Any, start_check: StartCheck) -> None:
     hook = getattr(inner, "get_hf_callbacks", None)
     if hook is None:
         start_check.label_note = "this AlignTune has no get_hf_callbacks hook"
-        return
-    try:
-        from transformers import TrainerCallback
-    except ImportError as exc:
-        start_check.label_note = f"transformers could not be imported ({exc})"
+    else:
+        try:
+            from transformers import TrainerCallback
+        except ImportError as exc:
+            hook, start_check.label_note = None, f"transformers could not be imported ({exc})"
+    if hook is None:
+        if start_check.required:  # before any model is loaded: nothing is lost
+            raise FinetuneError(start_check.unverified_message())
         return
 
     class _StartCheckCallback(TrainerCallback):
@@ -996,6 +1023,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--push-to", type=_repo_id, metavar="ORG/NAME",
                     help="after a successful full run upload the merged folder to this PRIVATE Hub repo (HF_TOKEN from the environment)")
     ap.add_argument("--seed", type=_seed, help="seed (default: train.seed of the config)")
+    ap.add_argument("--allow-unchecked-labels", action="store_true",
+                    help="real run only: go on when the labelled-token check is unavailable (the mask could not be read at step 0); "
+                         "recorded in the summary as label_check_waived and printed as a WARNING; never waives an out-of-bounds count")
     ap.add_argument("--merge-only", action="store_true",
                     help="train nothing: merge the adapter given by --adapter into <out>/merged and add a merge section to the summary")
     ap.add_argument("--adapter", type=Path, help="with --merge-only: the adapter folder to merge (e.g. <out>/adapter left by a failed merge)")
@@ -1013,12 +1043,15 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         given = (
             ("--max-steps", args.smoke), ("--no-merge", args.merge is False), ("--seed", args.seed is not None),
             ("--dry-run", args.dry_run), ("--push-to", bool(args.push_to)), ("--data", args.data is not None),
+            ("--allow-unchecked-labels", args.allow_unchecked_labels),
         )
         clash = [name for name, on in given if on]
         if clash:
             ap.error(f"--merge-only cannot be combined with {', '.join(clash)}: it merges an existing adapter and trains nothing")
     elif args.adapter is not None:
         ap.error("--adapter is only for --merge-only")
+    if args.allow_unchecked_labels and args.smoke:
+        ap.error("--allow-unchecked-labels is for the real run only: a smoke run just warns when the labels cannot be checked")
     args.merge_effective = args.merge if args.merge is not None else not args.smoke
     if args.push_to:
         if args.smoke:
@@ -1100,13 +1133,14 @@ def _train_and_check(
     start_check = StartCheck(
         rows=cfg.checks.label_check_rows, minimum=cfg.checks.label_tokens_min, maximum=cfg.checks.label_tokens_max,
         expected_args=expected_trainer_args(cfg, seed),
+        required=not args.smoke and not args.allow_unchecked_labels,  # a smoke run or a waiver may go on unverified
     )
     trainer = hooks.trainer_factory(params, start_check)
     result = trainer.train()
     del trainer
     _release_memory()
-    if start_check.label_counts is None:
-        print(f"note: the labelled-token check could not run ({start_check.label_note or 'the trainer never reported its rows'})", file=sys.stderr)
+    if start_check.label_counts is None and start_check.required:  # the callback never ran: after the fact, but never silent
+        raise FinetuneError(start_check.unverified_message())
     if start_check.args_compared is None:
         print(f"note: the trainer-argument check could not run ({start_check.args_note or 'no argument was found to compare'})", file=sys.stderr)
 
@@ -1154,6 +1188,8 @@ def _train_and_check(
             if start_check.label_counts is None
             else {"counts": start_check.label_counts, "allowed_min": start_check.minimum, "allowed_max": start_check.maximum}
         ),
+        "label_check_note": None if start_check.label_counts is not None else start_check.unverified_why(),
+        "label_check_waived": start_check.label_counts is None and args.allow_unchecked_labels,
     }
 
 
@@ -1170,6 +1206,7 @@ def _summary(
             "data": shown(args.data, root) if args.data else None,
             "max_steps": args.max_steps,
             "seed": args.seed,
+            "allow_unchecked_labels": args.allow_unchecked_labels,
         },
         "base_model": cfg.base_model,
         "data": {
@@ -1195,6 +1232,8 @@ def _summary(
         "loss_reason": trained["loss_reason"],
         "args_check": trained["args_check"],
         "label_check": trained["label_check"],
+        "label_check_note": trained["label_check_note"],
+        "label_check_waived": trained["label_check_waived"],
         "chat_template_sha256": template_sha256,
         "wall_clock_seconds": float(format(seconds, _FLOAT)),
         "device": hooks.device_info(),
@@ -1236,6 +1275,8 @@ def _plan_lines(
     lines.append(f"work folder: {shown(work, root)} (AlignTune writes its checkpoints here; kept if the run fails)")
     lines.append(length_line)
     lines.append(template_line)
+    if args.allow_unchecked_labels:
+        lines.append("label check: --allow-unchecked-labels is on, so a real run goes on if the mask cannot be read (an out-of-bounds count still stops it)")
     lines.append(f"seed: {seed}; merge: {'yes' if args.merge_effective else 'no'} ({cfg.output.merge_dtype})")
     if args.push_to:
         lines.append(
@@ -1381,6 +1422,18 @@ def _data_folders(cfg: SimpleNamespace, train_path: Path, root: Path) -> list[tu
     return [("data", d) for d in sorted(folders)]
 
 
+def _unverified_warning(args: argparse.Namespace, why: str) -> str:
+    if args.smoke:
+        return (
+            f"WARNING: the labelled-token mask was NOT verified ({why}). Do not start the full run until the first batch "
+            "has been checked by hand (docs/runtime.md, 'Reading label_check')."
+        )
+    return (
+        f"WARNING: --allow-unchecked-labels: this run trained with the labelled-token mask NOT verified ({why}). "
+        "The summary says label_check_waived: true; the loss may include the template preamble."
+    )
+
+
 def execute_merge_only(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     """`--merge-only --adapter PATH`: merge an adapter that is already on disk; nothing is trained, no data is read."""
     cfg = load_config(args.config)
@@ -1495,6 +1548,10 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     else:
         shutil.rmtree(work, ignore_errors=True)
 
+    if trained["label_check"] == "unavailable":
+        warning = _unverified_warning(args, trained["label_check_note"])
+        print(warning)
+        print(warning, file=sys.stderr)
     print(f"wrote {shown(out, root)} ({'smoke run, ' if args.smoke else ''}{trained['steps']} steps, mean train loss {_loss_text(trained['mean_train_loss'])}, last logged loss {trained['last_logged_loss']:{_FLOAT}}; {trained['loss_reason']})")
     if args.smoke:
         print("smoke run only: this model is not A1; run without --max-steps for the real fine-tune", file=sys.stderr)

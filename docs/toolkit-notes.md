@@ -591,8 +591,12 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   `train_dataloader` (transformers v5.15 `trainer.py`: `_prepare_for_training` sets the dataloader on the callback
   handler before `callback_handler.on_train_begin`); it is added by wrapping the instance method
   `get_hf_callbacks`, which `sft_generation.py` passes as `callbacks=`. If the hook, the dataloader or the
-  `labels` column is not there, the summary says `label_check: "unavailable"` and the run goes on. Not run: that
-  the rows in `train_dataloader.dataset` carry `labels` as in TRL's source.
+  `labels` column is not there the check is `unavailable`. **A smoke run records that**
+  (`label_check: "unavailable"`, `label_check_note`) and prints a WARNING on stdout and stderr; **a real run
+  stops at step 0** (the callback raises; with no hook or no transformers, before anything is loaded), exit 1,
+  unless `--allow-unchecked-labels` is given, which goes on with a WARNING and `label_check_waived: true`. A
+  trainer that finishes without ever calling the callback is refused after the fact. An out-of-bounds count is
+  always refused. Not run: that the rows in `train_dataloader.dataset` carry `labels` as in TRL's source.
 - **The trainer-argument check.** The same `on_train_begin` callback receives `args`, the trainer's own
   `TrainingArguments` (an `SFTConfig`), and `finetune.py` compares thirteen attributes with the config:
   `fp16`, `bf16`, `learning_rate`, `num_train_epochs`, `per_device_train_batch_size`,

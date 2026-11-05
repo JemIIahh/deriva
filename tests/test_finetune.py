@@ -66,12 +66,12 @@ class FakeTrainer:
         owner, p = self.owner, self.params
         if owner.fail_with is not None:
             raise owner.fail_with
-        # what the real trainer's on_train_begin callback does: look at the tokenised rows before the first step
-        if owner.label_counts is not None and self.start_check is not None:
-            counts = owner.label_counts if owner.label_counts != "default" else [3] * self.start_check.rows
-            self.start_check.check_labels(counts)
-        if owner.trainer_args is not None and self.start_check is not None:
-            self.start_check.check_args(trainer_args_for(p, owner.arg_overrides))
+        # what the real trainer's on_train_begin callback does: hand the dataloader and the arguments to the start check
+        # (it may raise, and then training never gets past step 0)
+        if owner.show_rows and self.start_check is not None:
+            args = trainer_args_for(p, owner.arg_overrides) if owner.trainer_args is not None else None
+            self.start_check.observe(train_dataloader=owner.dataloader(self.start_check.rows), args=args)
+        owner.past_begin += 1
         out = Path(p["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         rows = sum(1 for line in Path(p["dataset_name"]).read_text(encoding="utf-8").splitlines() if line.strip())
@@ -112,7 +112,9 @@ class FakeFactory:
         self.mean_train_loss = None
         self.steps = None
         self.rows_seen = None
-        self.label_counts = "default"  # None: the trainer never shows its tokenised rows
+        self.label_counts = "default"  # None: the dataloader it shows has no labels column
+        self.show_rows = True  # False: the callback is never called at all
+        self.past_begin = 0  # trainings that got past on_train_begin
         self.trainer_args = "default"  # None: the trainer never shows its TrainingArguments
         self.arg_overrides: dict = {}  # attribute -> value the Hugging Face trainer ended up with instead
         self.start_checks: list = []
@@ -122,6 +124,13 @@ class FakeFactory:
         self.adapter_overrides: dict = {}
         for key, value in options.items():
             setattr(self, key, value)
+
+    def dataloader(self, rows):
+        """A dataloader whose first rows have the configured number of labelled tokens each (-100 elsewhere)."""
+        if self.label_counts is None:
+            return types.SimpleNamespace(dataset=[{"input_ids": [1, 2, 3]}] * rows)  # tokenised, but no labels column
+        counts = [3] * rows if self.label_counts == "default" else self.label_counts
+        return types.SimpleNamespace(dataset=[{"labels": [-100, -100] + [7] * n} for n in counts])
 
     def __call__(self, params, start_check=None):
         self.calls.append(dict(params))
@@ -802,7 +811,7 @@ def test_seed_override_reaches_the_trainer_and_the_summary(world):
 def test_seed_default_comes_from_the_config(world):
     assert world.run() == 0
     assert world.summary()["seed"] == world.raw()["train"]["seed"]
-    assert world.summary()["overrides"] == {"data": None, "max_steps": None, "seed": None}
+    assert world.summary()["overrides"] == {"allow_unchecked_labels": False, "data": None, "max_steps": None, "seed": None}
 
 
 @pytest.mark.parametrize("value", ["-1", "x", "1.5"])
@@ -1546,10 +1555,12 @@ def test_the_label_counts_are_recorded_in_the_summary(world):
     }
 
 
-def test_a_trainer_that_shows_no_rows_is_recorded_as_unavailable_not_refused(world):
+def test_a_smoke_run_that_cannot_see_the_labels_records_it_and_goes_on(world, capsys):
     world.factory.label_counts = None
-    assert world.run() == 0
-    assert world.summary()["label_check"] == "unavailable"
+    assert world.run("--max-steps", "3") == 0
+    summary = world.summary(world.root / "results" / "finetune" / "ft_lora-smoke")
+    assert summary["label_check"] == "unavailable" and summary["label_check_waived"] is False
+    assert "no labels column" in summary["label_check_note"]
 
 
 @pytest.mark.parametrize("counts, row, found", [([3, 0, 3], "row 2", "0 labelled"), ([3, 100], "row 2", "100 labelled")])
@@ -1782,6 +1793,130 @@ def test_observe_checks_the_arguments_the_callback_receives():
     other = finetune.StartCheck(rows=1, minimum=1, maximum=16, expected_args={"seed": ("train.seed", 1)})
     other.observe(train_dataloader=labels([{"labels": [-100, 5]}]), args=None)
     assert other.args_compared is None and "no TrainingArguments" in other.args_note
+
+
+# --- the label check must not pass silently on a real run ----------------------------------------------------------
+
+UNVERIFIED = "could not be verified"
+
+
+def test_a_real_run_that_cannot_see_the_labels_stops_at_step_zero(world, capsys):
+    world.factory.label_counts = None
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert UNVERIFIED in err and "no labels column" in err
+    assert "smoke run" in err and "finetune_summary.json" in err and "--allow-unchecked-labels" in err
+    assert world.factory.past_begin == 0  # training never got past on_train_begin
+    assert world.merge.calls == [] and not world.out.exists()
+    assert world.work.is_dir() and "work/finetune/ft_lora" in err
+
+
+def test_a_real_run_whose_callback_is_never_called_is_refused_too(world, capsys):
+    world.factory.show_rows = False  # a trainer that never calls on_train_begin's check
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert UNVERIFIED in err and "never" in err and world.merge.calls == [] and not world.out.exists()
+
+
+def test_a_smoke_run_whose_callback_is_never_called_warns_and_succeeds(world, capsys):
+    world.factory.show_rows = False
+    assert world.run("--max-steps", "3") == 0
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_a_smoke_run_that_cannot_see_the_labels_warns_loudly_on_both_streams(world, capsys):
+    world.factory.label_counts = None
+    assert world.run("--max-steps", "3") == 0
+    captured = capsys.readouterr()
+    for stream in (captured.out, captured.err):
+        assert "WARNING" in stream and "NOT verified" in stream and "by hand" in stream
+        assert "full run" in stream
+
+
+def test_a_smoke_run_with_a_verified_mask_prints_no_warning(world, capsys):
+    assert world.run("--max-steps", "3") == 0
+    captured = capsys.readouterr()
+    assert "WARNING" not in captured.out and "WARNING" not in captured.err
+    summary = world.summary(world.root / "results" / "finetune" / "ft_lora-smoke")
+    assert summary["label_check_note"] is None and summary["label_check_waived"] is False
+
+
+def test_the_waiver_lets_a_real_run_proceed_and_is_recorded(world, capsys):
+    world.factory.label_counts = None
+    assert world.run("--allow-unchecked-labels") == 0
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err and "WARNING" in captured.out and "--allow-unchecked-labels" in captured.err
+    summary = world.summary()
+    assert summary["label_check"] == "unavailable" and summary["label_check_waived"] is True
+    assert "no labels column" in summary["label_check_note"]
+    assert summary["overrides"]["allow_unchecked_labels"] is True
+    assert world.factory.past_begin == 1
+
+
+def test_the_waiver_is_not_recorded_when_the_check_ran(world, capsys):
+    assert world.run("--allow-unchecked-labels") == 0
+    summary = world.summary()
+    assert summary["label_check"]["counts"] and summary["label_check_waived"] is False
+    assert "WARNING" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("counts", [[3, 0, 3], [3, 100]])
+def test_the_waiver_never_covers_an_out_of_bounds_count(world, capsys, counts):
+    world.factory.label_counts = counts
+    assert world.run("--allow-unchecked-labels") == 1
+    assert "labelled tokens" in capsys.readouterr().err
+    assert world.factory.past_begin == 0 and not world.out.exists()
+
+
+@pytest.mark.parametrize("other", [["--max-steps", "3"]])
+def test_the_waiver_is_for_a_real_run_only(world, capsys, other):
+    assert world.run("--allow-unchecked-labels", *other) == 2
+    assert "--allow-unchecked-labels" in capsys.readouterr().err and world.factory.calls == []
+
+
+def test_the_waiver_with_merge_only_is_a_usage_error(world, capsys):
+    assert merge_only(world, make_adapter(world), "--allow-unchecked-labels") == 2
+    assert "--allow-unchecked-labels" in capsys.readouterr().err and world.merge.calls == []
+
+
+def test_a_dry_run_says_when_the_waiver_is_on(world, capsys):
+    assert world.run("--dry-run", "--allow-unchecked-labels") == 0
+    assert "--allow-unchecked-labels" in capsys.readouterr().out
+
+
+def test_help_documents_the_waiver(capsys):
+    assert finetune.main(["--help"]) == 0
+    flat = " ".join(capsys.readouterr().out.split())
+    assert "--allow-unchecked-labels" in flat and "unavailable" in flat and "never waives" in flat
+
+
+def test_a_required_start_check_refuses_when_it_cannot_see_the_rows():
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16, required=True)
+    with pytest.raises(finetune.FinetuneError, match="could not be verified.*no dataloader"):
+        check.observe(train_dataloader=None, args=None)
+
+
+def test_a_required_start_check_still_passes_when_it_can_see_the_rows():
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16, required=True)
+    check.observe(train_dataloader=labels([{"labels": [-100, 5]}] * 2), args=None)
+    assert check.label_counts == [1, 1]
+
+
+def test_the_real_wrapper_refuses_before_training_when_the_hook_is_missing_and_the_check_is_required(monkeypatch):
+    install_fake_aligntune(monkeypatch)
+    install_fake_transformers(monkeypatch)
+    monkeypatch.delattr(_FakeAlignTuneTrainer, "get_hf_callbacks")
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16, required=True)
+    with pytest.raises(finetune.FinetuneError, match="could not be verified.*get_hf_callbacks"):
+        finetune.aligntune_factory({}, check)
+
+
+def test_the_real_wrapper_refuses_before_training_when_transformers_is_missing_and_the_check_is_required(monkeypatch):
+    install_fake_aligntune(monkeypatch)
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    check = finetune.StartCheck(rows=2, minimum=1, maximum=16, required=True)
+    with pytest.raises(finetune.FinetuneError, match="could not be verified.*transformers"):
+        finetune.aligntune_factory({}, check)
 
 
 # --- the real AlignTune wrapper, against a fake aligntune module ---------------------------------------------------
