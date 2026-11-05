@@ -331,7 +331,9 @@ def test_alpha_curve_copes_with_missing_intervals_and_partial_points(tmp_path):
     for r in rows:
         if r["alpha"] == 0.25:
             r["lo"] = r["hi"] = None
-    rows = [r for r in rows if not (r["alpha"] == 0.75 and r["metric"] == "task_acc")]
+    before = len(rows)
+    rows = [r for r in rows if not (r["alpha"] == 0.35 and r["metric"] == "task_acc")]
+    assert len(rows) == before - 1, "the filter must really drop one task_acc point (the alpha must be on the grid)"
     out = tmp_path / "curve.png"
     alpha_curve(rows, langs=["en"], out_path=out)
     _assert_png(out)
