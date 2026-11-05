@@ -14,18 +14,28 @@ What the report holds:
   hf_access                        HEAD check per Tiny Aya repo: {"status", "result", "error"}
 
 HEAD check. We send `HEAD https://huggingface.co/<repo>/resolve/main/config.json`, with the token
-as a bearer header when one exists. Redirects are not followed (a redirect to the download CDN is
-"ok", and the token must not travel to another host). `result` is one of:
-  ok            2xx/3xx: the file is reachable with this token (licence accepted)
-  unauthorized  401: no token, a bad token, or a repo Hugging Face hides. Seen without a token
-                on 2026-11-05 for both Tiny Aya repos, which are gated.
-  forbidden     403: the token works but access is not granted (licence not accepted, or a
-                fine-grained token without access to the repo)
+as a bearer header when one exists. Redirects are not followed, so the token never travels to
+another host; the Location header of a redirect is only read. `result` is one of:
+  ok            2xx; or a 3xx whose Location is HF's resolve-cache of the same repo
+                (`/api/resolve-cache/models/<repo>/...` on huggingface.co), which is HF's normal
+                answer for a reachable file. Seen without a token on 2026-11-05 for public repos
+                (openai-community/gpt2 -> 307 to its resolve-cache, gpt2 -> 200).
+  unexpected_redirect  any other 3xx (a renamed repo, another host, no Location): never "ok", so it
+                cannot be mistaken for "licence accepted"
+  unauthorized  401: no token, a bad or expired token, or a repo Hugging Face hides. Seen without
+                a token on 2026-11-05 for both Tiny Aya repos, which are gated. With a token
+                present it can also mean the licence is not accepted yet: check both.
+  forbidden     403: the token works but access is not granted. Expected when the licence is not
+                accepted or a fine-grained token lacks the repo; NOT yet seen with a real token, so
+                treat that reading as UNVERIFIED (as docs/runtime.md does)
   not_found     404
   http_error    any other status
   timeout       no answer within the short timeout
   error         DNS, connection or other failure; `error` holds the text
   skipped_offline  --offline
+
+A token that is not plain printable ASCII without spaces (for example an internal newline from a
+multi-line quoted `.env` value) is treated as absent: nothing is sent and `hf_token_present` is false.
 """
 
 from __future__ import annotations
@@ -39,6 +49,7 @@ import re
 import shutil
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -66,6 +77,9 @@ ERROR_TEXT_LIMIT = 200
 NVIDIA_SMI_TIMEOUT = 10
 
 _SMI_LINE = re.compile(r"^(?P<name>[^,]+),\s*(?P<mib>\d+)\s*MiB$")
+_TOKEN_OK = re.compile(r"[\x21-\x7e]+")  # printable ASCII, no whitespace: safe as an HTTP header value
+_TOKEN_JUNK = re.compile(r"[^\x21-\x7e]+")
+MIN_SCRUB_FRAGMENT = 6
 
 
 # --- packages -----------------------------------------------------------------------------------
@@ -163,32 +177,56 @@ def _default_open(request: urllib.request.Request, timeout: float | None = None)
     return _OPENER.open(request, timeout=timeout)
 
 
+def _clean_token(value: Any) -> str | None:
+    """The stripped token if it is plain printable ASCII without spaces, else None."""
+    token = value.strip() if isinstance(value, str) else ""
+    return token if token and _TOKEN_OK.fullmatch(token) else None
+
+
 def find_hf_token(environ: Mapping[str, str] | None = None, env_file: Path | str | None = None) -> str | None:
-    """HF_TOKEN from the environment, else from `env_file` (python-dotenv). None if absent or blank."""
+    """HF_TOKEN from the environment, else from `env_file` (python-dotenv). None if absent, blank,
+    unreadable or malformed (whitespace or control characters inside); never raises."""
     env = os.environ if environ is None else environ
-    token = (env.get("HF_TOKEN") or "").strip()
+    token = _clean_token(env.get("HF_TOKEN"))
     if token:
         return token
-    if env_file is not None and Path(env_file).is_file():
+    if env_file is not None:
         try:
-            from dotenv import dotenv_values
+            if Path(env_file).is_file():
+                from dotenv import dotenv_values
 
-            token = (dotenv_values(env_file).get("HF_TOKEN") or "").strip()
+                return _clean_token(dotenv_values(env_file).get("HF_TOKEN"))
         except Exception:
-            token = ""
-    return token or None
+            pass
+    return None
 
 
 def _scrub(text: str, token: str | None) -> str:
+    """Remove the token, every printable fragment of it, and anything token-shaped, from error text."""
     if token:
         text = text.replace(token, "***")
+        for fragment in _TOKEN_JUNK.split(token):
+            if len(fragment) >= MIN_SCRUB_FRAGMENT:
+                text = text.replace(fragment, "***")
     text = re.sub(r"hf_[A-Za-z0-9]{20,}", "***", text)  # any token-shaped string, ours or not
     return text[:ERROR_TEXT_LIMIT]
 
 
-def _status_result(status: int) -> str:
-    if 200 <= status < 400:
+def _is_resolve_cache_of(location: Any, repo_id: str) -> bool:
+    """True if a redirect Location is HF's resolve-cache of this same repo, on huggingface.co."""
+    if not location:
+        return False
+    parts = urllib.parse.urlsplit(str(location))
+    if parts.scheme not in ("", "https") or parts.netloc.lower() not in ("", "huggingface.co"):
+        return False
+    return parts.path.lower().startswith(f"/api/resolve-cache/models/{repo_id}/".lower())
+
+
+def _status_result(status: int, location: Any = None, repo_id: str = "") -> str:
+    if 200 <= status < 300:
         return "ok"
+    if 300 <= status < 400:
+        return "ok" if _is_resolve_cache_of(location, repo_id) else "unexpected_redirect"
     return {401: "unauthorized", 403: "forbidden", 404: "not_found"}.get(status, "http_error")
 
 
@@ -201,6 +239,9 @@ def hf_head(
 ) -> dict[str, Any]:
     """HEAD the probe file of a repo. Returns {"status", "result", "error"}; never raises."""
     open_url = opener or _default_open
+    secret = token  # kept for scrubbing even if it turns out unusable
+    if token and not _TOKEN_OK.fullmatch(token):
+        token = None  # never send a malformed token
     try:
         request = urllib.request.Request(
             f"{HF_HOST}/{repo_id}/resolve/main/{PROBE_FILE}", method="HEAD"
@@ -213,16 +254,18 @@ def hf_head(
         _attempt(response.close)
         return {"status": status, "result": _status_result(status), "error": None}
     except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        location = _attempt(lambda: exc.headers.get("Location"))
         _attempt(exc.close)
-        return {"status": int(exc.code), "result": _status_result(int(exc.code)), "error": None}
+        return {"status": status, "result": _status_result(status, location, repo_id), "error": None}
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, TimeoutError):
             return {"status": None, "result": "timeout", "error": f"timed out after {timeout:g}s"}
-        return {"status": None, "result": "error", "error": _scrub(f"URLError: {exc.reason}", token)}
+        return {"status": None, "result": "error", "error": _scrub(f"URLError: {exc.reason}", secret)}
     except TimeoutError:
         return {"status": None, "result": "timeout", "error": f"timed out after {timeout:g}s"}
     except Exception as exc:
-        return {"status": None, "result": "error", "error": _scrub(f"{type(exc).__name__}: {exc}", token)}
+        return {"status": None, "result": "error", "error": _scrub(f"{type(exc).__name__}: {exc}", secret)}
 
 
 def tiny_aya_repos() -> list[str]:

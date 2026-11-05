@@ -92,6 +92,9 @@ class FakeOpener:
         plan = self.plan[request.full_url] if isinstance(self.plan, dict) else self.plan
         if isinstance(plan, BaseException):
             raise plan
+        if isinstance(plan, tuple):  # (status, Location header): a redirect answer
+            status, location = plan
+            raise urllib.error.HTTPError(request.full_url, status, "msg", {"Location": location}, None)
         if plan >= 300:  # urllib raises HTTPError for every non-2xx answer (redirects are not followed)
             raise urllib.error.HTTPError(request.full_url, plan, "msg", {}, None)
         return FakeResponse(plan)
@@ -283,7 +286,11 @@ def test_query_nvidia_smi_returns_stdout_and_uses_the_documented_query(monkeypat
     "status, result",
     [
         (200, "ok"),
-        (302, "ok"),
+        (204, "ok"),
+        (301, "unexpected_redirect"),
+        (302, "unexpected_redirect"),
+        (307, "unexpected_redirect"),
+        (308, "unexpected_redirect"),
         (401, "unauthorized"),
         (403, "forbidden"),
         (404, "not_found"),
@@ -343,6 +350,46 @@ def test_default_opener_does_not_follow_redirects():
     assert handler.redirect_request(request, None, 302, "Found", {}, "https://cdn.example/x") is None
 
 
+def test_default_opener_is_wired_with_the_no_redirect_handler():
+    handlers = envcheck._OPENER.handlers
+    assert any(isinstance(h, envcheck._NoRedirect) for h in handlers)
+    # build_opener drops the stock redirect handler when a subclass is given; make sure it is gone
+    assert not any(type(h) is urllib.request.HTTPRedirectHandler for h in handlers)
+
+
+CACHE_PATH = "/api/resolve-cache/models/CohereLabs/tiny-aya-global/607a30d783/config.json?etag=%22abc%22"
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        CACHE_PATH,  # HF's normal answer for a reachable file: same host, resolve-cache of the same repo
+        "https://huggingface.co" + CACHE_PATH,
+        CACHE_PATH.replace("CohereLabs/tiny-aya-global", "coherelabs/Tiny-Aya-Global"),  # case differs
+    ],
+)
+def test_same_repo_resolve_cache_redirect_counts_as_ok(location):
+    out = envcheck.hf_head(GLOBAL_ID, "tok", opener=FakeOpener((307, location)))
+    assert (out["status"], out["result"]) == (307, "ok")
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "/CohereLabs/tiny-aya-global-renamed/resolve/main/config.json",  # the repo was renamed
+        "/api/resolve-cache/models/CohereLabs/tiny-aya-base/607a30d783/config.json",  # another repo
+        "/api/resolve-cache/models/CohereLabs/tiny-aya-global-v2/607a30d783/config.json",  # name prefix only
+        "https://cdn-lfs.example.org" + CACHE_PATH,  # another host
+        "https://huggingface.co.evil.example" + CACHE_PATH,  # look-alike host
+        "",
+        None,
+    ],
+)
+def test_other_redirects_are_not_ok(location):
+    out = envcheck.hf_head(GLOBAL_ID, "tok", opener=FakeOpener((307, location)))
+    assert (out["status"], out["result"]) == (307, "unexpected_redirect")
+
+
 # --- token lookup -------------------------------------------------------------------------------
 
 
@@ -364,6 +411,63 @@ def test_token_absent_or_blank_is_none(tmp_path):
     assert envcheck.find_hf_token(environ={"HF_TOKEN": "  "}, env_file=env_file) is None
     assert envcheck.find_hf_token(environ={}, env_file=tmp_path / "missing.env") is None
     assert envcheck.find_hf_token(environ={}) is None
+
+
+def test_unreadable_env_file_cannot_escape(monkeypatch):
+    def deny(self):
+        raise PermissionError("no access to .env")
+
+    monkeypatch.setattr(envcheck.Path, "is_file", deny)
+    assert envcheck.find_hf_token(environ={}, env_file="/somewhere/.env") is None
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setattr(envcheck, "query_nvidia_smi", lambda: None)
+    report = envcheck.collect(offline=True, environ={}, env_file="/somewhere/.env")
+    assert report["hf_token_present"] is False
+
+
+BAD_TOKENS = {
+    "newline": "hf_FIRSTPART0123456789abcdefghij\nTAILSECRETFRAGMENT",
+    "crlf": "hf_FIRSTPART0123456789abcdefghij\r\nTAILSECRETFRAGMENT",
+    "space": "hf_FIRSTPART0123456789abcdefghij TAILSECRETFRAGMENT",
+    "tab": "hf_FIRSTPART0123456789abcdefghij\tTAILSECRETFRAGMENT",
+    "nul": "hf_FIRSTPART0123456789abcdefghij" + chr(0) + "TAILSECRETFRAGMENT",
+    "escape": "hf_FIRSTPART0123456789abcdefghij" + chr(27) + "TAILSECRETFRAGMENT",
+    "non_ascii": "hf_FIRSTPART0123456789abcdefghij" + chr(0xE9) + "TAILSECRETFRAGMENT",
+}
+
+
+@pytest.mark.parametrize("bad", list(BAD_TOKENS.values()), ids=list(BAD_TOKENS))
+def test_token_with_whitespace_or_control_characters_is_treated_as_absent(bad, capsys, hermetic):
+    assert envcheck.find_hf_token(environ={"HF_TOKEN": bad}) is None
+    opener = FakeOpener(401)
+    result = envcheck.main([], environ={"HF_TOKEN": bad}, opener=opener)
+    out = capsys.readouterr()
+    assert result["hf_token_present"] is False
+    assert all(call[0].get_header("Authorization") is None for call in opener.calls)
+    assert "TAILSECRETFRAGMENT" not in out.out + out.err + json.dumps(result)
+    assert "FIRSTPART" not in out.out + out.err + json.dumps(result)
+
+
+def test_multi_line_quoted_value_in_env_file_is_treated_as_absent(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text('HF_TOKEN="hf_FIRSTPART0123456789abcdefghij\nTAILSECRETFRAGMENT"\n', encoding="utf-8")
+    assert envcheck.find_hf_token(environ={}, env_file=env_file) is None
+
+
+def test_hf_head_sends_no_header_for_a_bad_token_and_scrubs_its_fragments():
+    bad = BAD_TOKENS["newline"]
+    opener = FakeOpener(ValueError("Invalid header value b'hf_FIRSTPART0123456789abcdefghij\\nTAILSECRETFRAGMENT'"))
+    out = envcheck.hf_head(GLOBAL_ID, bad, opener=opener)
+    assert opener.calls[0][0].get_header("Authorization") is None
+    assert out["result"] == "error"
+    assert "TAILSECRETFRAGMENT" not in json.dumps(out)
+    assert "FIRSTPART" not in json.dumps(out)
+
+
+def test_main_stays_strict_about_unknown_flags():
+    with pytest.raises(SystemExit) as info:
+        envcheck.main(["-f", "/x/kernel.json"], environ={})
+    assert info.value.code == 2
 
 
 # --- the report ---------------------------------------------------------------------------------

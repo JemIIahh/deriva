@@ -37,10 +37,14 @@ Labels used below: **UNVERIFIED** = I could not confirm it from a page I read. *
      `KAGGLE_USERNAME` / `KAGGLE_KEY`. Put into `.env` whichever the settings page gives you
      (`.env.example` has all three names); I check which one works the first time we use it.
    - **Colab:** nothing to create beyond your Google login.
-5. **Add `HF_TOKEN` as a secret inside the notebook site, once** (Kaggle cannot do this from the
-   command line, see section 2):
-   - Kaggle: open a notebook > Add-ons > Secrets > add a secret labelled `HF_TOKEN`. Also switch
-     Internet on and pick the GPU in the notebook settings.
+5. **Add `HF_TOKEN` as a secret inside the notebook site** (Kaggle cannot do this from the
+   command line, see section 2). Do it after the first notebook exists, because the secret is
+   attached to a notebook:
+   - Kaggle: create a notebook (New Notebook), then in it open Add-ons > Secrets and add a secret
+     labelled `HF_TOKEN`. Also switch Internet on and pick the GPU in that notebook's settings. A
+     notebook that I later push from the command line is a different notebook, so it probably needs
+     the secret attached too (UNVERIFIED). Until it is, its first run stops at the first cell with
+     the message "HF_TOKEN not found". That is expected and harmless.
    - Colab: the key icon in the left bar (Secrets) > add `HF_TOKEN` and switch "Notebook access"
      on (exact Colab menu wording from memory, UNVERIFIED).
 6. **Later, when I ask:** say yes to creating the private Hugging Face dataset repo
@@ -53,15 +57,23 @@ One **private Hugging Face dataset repo**, `<owner>/msd-workspace`, holds everyt
 need, and both Kaggle and Colab pull from it and push to it with `HF_TOKEN`:
 
 ```
-wheels/msd-<version>-py3-none-any.whl   the code (keep exactly one wheel here)
+wheels/msd-<version>-py3-none-any.whl   the code in src/msd (keep exactly one wheel here)
 scripts/                                copy of this repo's scripts/ (the stage scripts)
-data/                                   test set, fine-tune data
+pipelines/                              copy of this repo's pipelines/ (CuratorKIT YAML the scripts read)
+data/                                   test set, fine-tune data (only what a stage needs)
 results/<stage>/                        per-item JSONL, logs, written by the notebooks
 ```
 
+**Known gap, stated plainly:** the wheel contains only the `msd` package from `src/`. It does NOT
+contain `scripts/` or `pipelines/`. So the workspace repo must also carry `scripts/` and
+`pipelines/` (and `data/` when a stage needs it), and they must be uploaded again whenever they
+change; a stale copy there means the runtime runs old code. A sync helper does not exist yet (a
+later task adds it).
+
 Two thin notebooks live in `kaggle/` (they work on Colab too, nothing is Kaggle-only):
-`00_env_check.ipynb` (install the wheel, print the environment JSON) and `10_run_stage.ipynb` (set
-`STAGE`, run `python scripts/<STAGE>.py`, push `results/<STAGE>/`). Later tasks add the stage
+`00_env_check.ipynb` (install the wheel, print the environment JSON and save it as `env_check.json`) and `10_run_stage.ipynb` (set
+`STAGE`, pull `scripts/`, `pipelines/` and `data/`, run `python scripts/<STAGE>.py`, push
+`results/<STAGE>/`). Later tasks add the stage
 scripts; the notebooks do not change. They take the token from `HF_TOKEN` in the environment, a
 Kaggle secret, or a Colab secret, and never print it.
 
@@ -83,11 +95,12 @@ Then `kaggle kernels status <id>` to watch it. Sources: Kaggle's metadata docs
 
 **Can the command line attach the secret? No.** The same Kaggle docs page says, under "Using
 Secrets in Kernels": "Define Secrets on Kaggle.com (no CLI support)", and the metadata file has no
-secrets field. So the `HF_TOKEN` secret is added once in the Kaggle web page (checklist step 5).
-UNVERIFIED: whether the secret stays attached to the notebook after a later `kaggle kernels push`
-(one third-party search snippet claimed it may not; I could not open that page). The first cell of
-both notebooks stops with the message "HF_TOKEN not found" if it is missing, so a failed push shows
-up in seconds.
+secrets field. So the `HF_TOKEN` secret is added in the Kaggle web page, inside a notebook that
+already exists (checklist step 5). UNVERIFIED: whether a notebook created by `kaggle kernels push`
+gets the secret too, or keeps it across later pushes (one third-party search snippet claimed it may
+not; I could not open that page). Expect to attach it by hand once to the pushed notebook. The first
+cell of both notebooks stops with the message "HF_TOKEN not found" if it is missing, so a missing
+secret shows up in seconds.
 
 ## 3. Free GPU limits (read 2026-11-05)
 
@@ -143,24 +156,37 @@ python scripts/env_check.py              # adds the Hugging Face HEAD check of b
 ```
 
 Without a token the HEAD check reports `401 unauthorized` for both repos (seen 2026-11-05). With a
-token it reports `200 ok` once the license is accepted, or `403 forbidden` if it is not (403 is the
-usual Hugging Face answer for "token fine, license not accepted"; not seen yet: UNVERIFIED).
+token it should report `ok` once the license is accepted (Hugging Face answers either 200 or a 307
+to its own cache for the same repo; both count as `ok`; any other redirect shows as
+`unexpected_redirect`, for example a renamed repo). A `403 forbidden` is the likely answer for
+"token fine, license not accepted", but I have not seen it with a real token: UNVERIFIED.
+
+If the report shows `hf_token_present: true` and still `401 unauthorized`, there are two possible
+causes: the token is wrong or expired, or the license for that repo is not accepted yet. Check both:
+make a fresh token (step 2) and open these two pages again to see that you have access:
+https://huggingface.co/CohereLabs/tiny-aya-global and https://huggingface.co/CohereLabs/tiny-aya-base
 
 Waiting for the owner (all DEFERRED-RUNTIME):
 
 ```
-# 1. Create the private workspace repo and upload the wheel + scripts (needs the owner's yes and HF_TOKEN):
+# 1. Create the private workspace repo and upload the wheel + scripts + pipelines (needs the owner's yes and HF_TOKEN).
+#    HfApi() reads HF_TOKEN from the shell environment, not from .env, so load .env into this shell first
+#    (prints nothing; values with spaces need quotes in .env):
+set -a; . ./.env; set +a
 python -c "from huggingface_hub import HfApi; a=HfApi(); r='<hf-user>/msd-workspace'; \
 a.create_repo(r, repo_type='dataset', private=True); \
 a.upload_file(path_or_fileobj='dist/msd-0.1.0-py3-none-any.whl', path_in_repo='wheels/msd-0.1.0-py3-none-any.whl', repo_id=r, repo_type='dataset'); \
-a.upload_folder(folder_path='scripts', path_in_repo='scripts', repo_id=r, repo_type='dataset')"
+[a.upload_folder(folder_path=d, path_in_repo=d, repo_id=r, repo_type='dataset', ignore_patterns=['__pycache__', '*.pyc']) for d in ('scripts', 'pipelines')]"
+# Repeat the upload_folder part whenever scripts/ or pipelines/ change (see the known gap in section 2).
 # (huggingface_hub is not installed in envs/core; the exact call signatures are from memory: UNVERIFIED.)
 
 # 2. Kaggle: put the WORKSPACE_REPO name into a copy of kaggle/00_env_check.ipynb, add kernel-metadata.json
 #    (template in section 2, code_file 00_env_check.ipynb), then
 kaggle kernels push -p <folder-with-notebook-and-metadata>
 kaggle kernels status <kaggle-username>/<slug>
-kaggle kernels output <kaggle-username>/<slug> -p <outdir>      # the JSON is in the notebook log
+kaggle kernels output <kaggle-username>/<slug> -p <outdir>      # downloads the files the notebook wrote, i.e. env_check.json
+#    (the notebook saves the report to env_check.json in its working folder; that this folder is what
+#    `kernels output` downloads is UNVERIFIED until the first run; the JSON is also printed in the notebook log)
 
 # 3. Colab: https://colab.research.google.com > File > Upload notebook > kaggle/00_env_check.ipynb;
 #    Runtime > Change runtime type > GPU; add the HF_TOKEN secret; Run all.

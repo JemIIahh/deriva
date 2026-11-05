@@ -98,3 +98,77 @@ def test_token_cell_reads_the_environment_and_fails_clearly_without_one(name, mo
     monkeypatch.delenv("HF_TOKEN")
     with pytest.raises(AssertionError, match="HF_TOKEN not found"):
         exec(compile(src, name, "exec"), {})
+
+
+# --- cells run inside a Jupyter/Colab/Kaggle kernel, whose sys.argv is not ours -----------------------
+
+KERNEL_ARGV = ["ipykernel_launcher.py", "-f", "/x/kernel.json"]
+
+
+def _cells_calling_envcheck(name):
+    """Code cells that call main() or use msd.envcheck (the ones that could parse sys.argv)."""
+    sources = [source_of(c) for c in load(name)["cells"] if c["cell_type"] == "code"]
+    return [src for src in sources if "main(" in src or "envcheck" in src]
+
+
+@pytest.fixture
+def kernel_runtime(monkeypatch, tmp_path):
+    """A kernel-like process: kernel argv, no torch/GPU, a fake 401 from Hugging Face, scratch cwd."""
+    import sys
+    import urllib.error
+
+    from msd import envcheck
+
+    def fake_open(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(sys, "argv", list(KERNEL_ARGV))
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setattr(envcheck, "query_nvidia_smi", lambda: None)
+    monkeypatch.setattr(envcheck, "_default_open", fake_open)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _run_cell(src, name):
+    namespace = {}
+    try:
+        exec(compile(src, name, "exec"), namespace)
+    except SystemExit as exc:  # argparse exits instead of raising
+        pytest.fail(f"{name}: cell called sys.exit({exc.code}) under a kernel argv")
+    return namespace
+
+
+def test_at_least_one_cell_calls_envcheck():
+    assert _cells_calling_envcheck("00_env_check.ipynb")
+
+
+@pytest.mark.parametrize("name", NOTEBOOKS)
+def test_cells_calling_envcheck_survive_a_kernel_argv(name, kernel_runtime, capsys):
+    for src in _cells_calling_envcheck(name):
+        namespace = _run_cell(src, name)
+        if "main(" in src:
+            report = namespace["report"]
+            assert isinstance(report, dict)
+            assert report["hf_token_present"] is False
+            assert report["hf_access"]["CohereLabs/tiny-aya-global"]["result"] == "unauthorized"
+
+
+def test_env_check_notebook_also_writes_the_report_to_a_file(kernel_runtime, capsys):
+    for src in _cells_calling_envcheck("00_env_check.ipynb"):
+        namespace = _run_cell(src, "00_env_check.ipynb")
+    written = json.loads((kernel_runtime / "env_check.json").read_text(encoding="utf-8"))
+    assert written == namespace["report"]
+
+
+@pytest.mark.parametrize("name", NOTEBOOKS)
+def test_token_cell_survives_a_kernel_argv(name, kernel_runtime, monkeypatch, capsys):
+    monkeypatch.setenv("HF_TOKEN", "dummy-value-for-test")
+    _run_cell(_token_cell(name), name)
+    assert capsys.readouterr().out.strip() == "HF_TOKEN found"
+
+
+def test_run_stage_notebook_pulls_pipelines_as_well_as_scripts():
+    text = "\n".join(source_of(c) for c in load("10_run_stage.ipynb")["cells"])
+    assert '"pipelines/*"' in text and '"scripts/*"' in text
