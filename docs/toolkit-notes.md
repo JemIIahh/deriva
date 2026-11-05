@@ -640,8 +640,12 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   `finetune.py` therefore gives AlignTune a persistent, non-atomic work folder
   `work/finetune/<config stem>[-smoke]/` as `output_dir` (kept on any failure and named in the error), then
   copies only the adapter's files (no checkpoints, no provenance file, not its own template file) into
-  `<out>/adapter`, merges into `<out>/merged`, and writes `finetune_summary.json` last, each part atomically.
-  `--merge-only --adapter PATH` repeats just the merge from a kept adapter.
+  `<out>/adapter` (plus a small `finetune_marker.json` that says whether a smoke run saved it), writes a
+  provisional `finetune_summary.json` (`merged: false`, `merge_pending: true`) and then merges into `<out>/merged`;
+  the final summary (`merged: true`) replaces the provisional one after the merge, each part atomically.
+  `--merge-only --adapter PATH --out OUT` repeats just the merge from a kept adapter and completes the provisional
+  summary; the marker makes a smoke adapter merge as a smoke model (`SMOKE.txt`, `smoke: true`) and keeps it out of
+  the real run's folder.
 - `train()` returns a dict with `final_loss`, `steps`, `epochs`, `metrics`, `model_path` and `training_time`.
   **`final_loss` is `train_result.training_loss`, the mean of the loss over the whole run, not the last loss**; the
   summary calls it `mean_train_loss` and adds `last_logged_loss` from `log_history`.

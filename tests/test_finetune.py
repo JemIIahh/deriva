@@ -14,6 +14,8 @@ import hashlib
 import json
 import math
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import types
@@ -275,7 +277,7 @@ class World:
             merge_fn=merge if merge is not None else self.merge,
             tokenizer_loader=tokenizer_loader if tokenizer_loader is not None else (lambda name: FakeTokenizer()),
             hf_api_factory=api_factory if api_factory is not None else forbidden,
-            clock=clock if clock is not None else iter([100.0, 112.5]).__next__,
+            clock=clock if clock is not None else iter([100.0, 105.0, 112.5]).__next__,  # start, trained, finished
             versions=versions if versions is not None else (lambda: {"aligntune": "0.0-fake", "trl": None}),
             device_info=device_info if device_info is not None else (lambda: "FakeGPU"),
             root=self.root,
@@ -726,7 +728,8 @@ def test_the_trainer_writes_into_the_work_folder_and_the_adapter_is_copied_out(w
     assert Path(world.factory.calls[0]["output_dir"]) == world.work
     assert (world.out / "adapter" / "adapter_model.safetensors").read_bytes() == b"fake adapter weights"
     names = sorted(p.name for p in (world.out / "adapter").iterdir())
-    assert names == ["adapter_config.json", "adapter_model.safetensors"]  # no checkpoints, no provenance file with paths
+    # no checkpoints, no provenance file with paths; the marker says which kind of run the adapter came from
+    assert names == ["adapter_config.json", "adapter_model.safetensors", "finetune_marker.json"]
 
 
 def test_work_folder_comes_from_the_config_stem_and_the_smoke_flag(tmp_path):
@@ -1002,22 +1005,25 @@ def test_a_merge_that_raises_keeps_the_adapter_and_the_work_folder(world, capsys
     assert "not enough RAM" in err and "work/finetune/ft_lora" in err
     assert "results/finetune/ft_lora/adapter" in err and "--merge-only" in err  # how to finish the job
     assert (world.out / "adapter" / "adapter_config.json").is_file() and world.work.is_dir()
-    assert not (world.out / "merged").exists() and not (world.out / "finetune_summary.json").exists()
+    assert not (world.out / "merged").exists()
+    assert world.summary()["merged"] is False  # the provisional summary: the training record survives the failed merge
     assert partials(world.root) == []
 
 
-def test_the_summary_is_written_last_after_the_merge(world):
+def test_the_final_summary_replaces_the_provisional_one_after_the_merge(world):
     seen = []
 
     class Spy(FakeMerge):
         def __call__(self, base_model, adapter_dir, out_dir, *, dtype):
-            seen.append((world.out / "finetune_summary.json").exists())
+            seen.append(world.summary())  # what is on disk while the merge runs
             super().__call__(base_model, adapter_dir, out_dir, dtype=dtype)
 
     world.merge = Spy()
     assert world.run() == 0
-    assert seen == [False]  # no summary while the merge runs: its presence means the run finished
-    assert (world.out / "finetune_summary.json").is_file()
+    (during,) = seen
+    assert during["merged"] is False and during["merge_pending"] is True  # provisional: the merge has not finished
+    after = world.summary()
+    assert after["merged"] is True and "merge_pending" not in after  # final: only a finished run says merged
 
 
 def test_a_trainer_factory_that_cannot_be_built_does_not_block_the_next_run(world, capsys):
@@ -1187,9 +1193,10 @@ def test_merge_only_merges_the_adapter_a_failed_merge_left_behind(world, capsys)
     (call,) = world.merge.calls
     assert call["adapter_dir"] == kept and call["dtype"] == "float16" and call["base_model"] == "CohereLabs/tiny-aya-global"
     assert partials(world.root) == []
-    summary = world.summary()  # the failed run wrote none: merge-only writes a minimal one
+    summary = world.summary()  # the failed run left a provisional one: merge-only completes it
     assert summary["merged"] is True and summary["merge"]["adapter"] == "results/finetune/ft_lora/adapter"
     assert summary["merge"]["dtype"] == "float16" and summary["config"]["path"] == "configs/ft_lora.yaml"
+    assert summary["loss_history"] and "merge_pending" not in summary
 
 
 def test_merge_only_appends_a_merge_section_to_an_existing_summary(world):
@@ -1264,6 +1271,283 @@ def test_merge_only_needs_an_adapter_and_an_adapter_needs_merge_only(world, caps
     assert world.run("--merge-only") == 2
     assert world.run("--adapter", str(make_adapter(world))) == 2
     assert world.merge.calls == [] and world.factory.calls == []
+
+
+# --- a smoke adapter can never become an unmarked model in the real A1 folder ---------------------------------------
+
+
+def the_hint(err):
+    """The arguments a failure message tells the user to run, split as the shell would split them (the line ends there)."""
+    key = "with these arguments: "
+    assert key in err, err
+    return shlex.split(err.split(key, 1)[1].splitlines()[0])
+
+
+def option(argv, name):
+    return argv[argv.index(name) + 1]
+
+
+def run_hint(world, argv, **kwargs):
+    kwargs.setdefault("factory", forbidden)  # a hint merges, it never trains
+    kwargs.setdefault("tokenizer_loader", forbidden)
+    return world.run(*argv, config=False, **kwargs)
+
+
+def smoke_out_of(world):
+    return world.root / "results" / "finetune" / "ft_lora-smoke"
+
+
+def smoke_adapter(world):
+    """The adapter of a smoke run, marker included (a smoke run does not merge unless asked)."""
+    assert world.run("--max-steps", "3") == 0
+    return smoke_out_of(world) / "adapter"
+
+
+def test_the_hint_after_a_failed_smoke_merge_gives_a_smoke_marked_merge_when_run_verbatim(world, capsys, monkeypatch):
+    monkeypatch.chdir(world.root)  # where the notebook runs: a default folder is then spelled relative to the root
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run("--max-steps", "3", "--merge") == 1
+    argv = the_hint(capsys.readouterr().err)
+    assert option(argv, "--out") == "results/finetune/ft_lora-smoke" and "--merge-only" in argv
+    world.merge = FakeMerge()
+    assert run_hint(world, argv) == 0
+    merged = smoke_out_of(world) / "merged"
+    assert "not A1" in (merged / "SMOKE.txt").read_text(encoding="utf-8")
+    summary = world.summary(smoke_out_of(world))
+    assert summary["smoke"] is True and summary["merged"] is True
+    assert not world.out.exists()  # nothing reached the real run's folder
+
+
+def test_the_hint_after_a_failed_real_merge_merges_into_the_real_folder_when_run_verbatim(world, capsys, monkeypatch):
+    monkeypatch.chdir(world.root)
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run() == 1
+    argv = the_hint(capsys.readouterr().err)
+    assert option(argv, "--out") == "results/finetune/ft_lora" and option(argv, "--config") == str(world.config)
+    world.merge = FakeMerge()
+    assert run_hint(world, argv) == 0
+    assert (world.out / "merged" / "model.safetensors").is_file() and not (world.out / "merged" / "SMOKE.txt").exists()
+    assert world.summary()["smoke"] is False and world.summary()["merged"] is True
+
+
+def test_the_hint_names_a_custom_out_exactly(world, capsys, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "some where" / "a1"  # outside the repository, with a space: the hint must quote it
+    monkeypatch.chdir(tmp_path)  # and the command is not run from the repository root
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run("--out", str(elsewhere)) == 1
+    argv = the_hint(capsys.readouterr().err)
+    assert option(argv, "--out") == str(elsewhere) and option(argv, "--adapter") == str(elsewhere / "adapter")
+    world.merge = FakeMerge()
+    assert run_hint(world, argv) == 0
+    assert (elsewhere / "merged" / "model.safetensors").is_file() and not world.out.exists()
+
+
+def test_the_hint_for_a_non_empty_out_gives_the_whole_command(world, capsys, monkeypatch):
+    monkeypatch.chdir(world.root)
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run() == 1
+    capsys.readouterr()
+    assert world.run() == 2  # the run is started again into the folder that holds the adapter
+    argv = the_hint(capsys.readouterr().err)
+    assert option(argv, "--out") == "results/finetune/ft_lora" and option(argv, "--config") == str(world.config)
+    world.merge = FakeMerge()
+    assert run_hint(world, argv) == 0 and (world.out / "merged" / "config.json").is_file()
+
+
+def test_merge_only_on_a_smoke_adapter_with_the_default_out_is_refused(world, capsys, monkeypatch):
+    adapter = smoke_adapter(world)
+    monkeypatch.chdir(world.root)
+    assert merge_only(world, adapter) == 2
+    err = capsys.readouterr().err
+    assert "smoke" in err and "--out results/finetune/ft_lora-smoke" in err  # it names the right folder
+    assert merge_only(world, adapter, "--out", str(world.out)) == 2  # the same folder, given explicitly
+    assert world.merge.calls == [] and not world.out.exists()
+
+
+def test_merge_only_on_a_smoke_adapter_with_a_smoke_out_marks_the_merge(world):
+    adapter = smoke_adapter(world)
+    assert merge_only(world, adapter, "--out", str(smoke_out_of(world))) == 0
+    merged = smoke_out_of(world) / "merged"
+    assert "smoke run of 3 steps" in (merged / "SMOKE.txt").read_text(encoding="utf-8")
+    summary = world.summary(smoke_out_of(world))
+    assert summary["smoke"] is True and summary["merged"] is True and summary["merge"]["dtype"] == "float16"
+    assert not world.out.exists()
+
+
+def test_merge_only_on_a_smoke_adapter_may_use_any_other_smoke_out(world, tmp_path):
+    adapter = smoke_adapter(world)
+    elsewhere = tmp_path / "elsewhere"
+    assert merge_only(world, adapter, "--out", str(elsewhere)) == 0
+    assert (elsewhere / "merged" / "SMOKE.txt").is_file() and world.summary(elsewhere)["smoke"] is True
+
+
+def test_merge_only_on_a_real_adapter_is_unaffected(world):
+    assert world.run("--no-merge") == 0
+    assert merge_only(world, world.out / "adapter") == 0
+    assert (world.out / "merged" / "model.safetensors").is_file() and not (world.out / "merged" / "SMOKE.txt").exists()
+    assert world.summary()["smoke"] is False
+
+
+def test_a_real_adapter_with_a_smoke_out_is_refused_as_inconsistent(world, capsys):
+    assert world.run("--no-merge") == 0
+    out = smoke_out_of(world)
+    assert merge_only(world, world.out / "adapter", "--out", str(out)) == 2
+    assert "smoke" in capsys.readouterr().err and world.merge.calls == [] and not out.exists()
+    assert merge_only(world, make_adapter(world), "--out", str(out)) == 2  # no marker, no smoke folder: not a smoke adapter
+    assert world.merge.calls == []
+
+
+def test_a_marker_less_adapter_in_a_smoke_folder_is_treated_as_smoke(world, capsys):
+    moved = smoke_out_of(world) / "adapter"
+    moved.parent.mkdir(parents=True)
+    shutil.move(str(make_adapter(world)), str(moved))  # an adapter from before the marker existed
+    assert not (moved / "finetune_marker.json").exists()
+    assert merge_only(world, moved) == 2  # the default out is the real run's folder
+    assert "ft_lora-smoke" in capsys.readouterr().err and not world.out.exists()
+    assert merge_only(world, moved, "--out", str(smoke_out_of(world))) == 0
+    assert (smoke_out_of(world) / "merged" / "SMOKE.txt").is_file()
+    assert world.summary(smoke_out_of(world))["smoke"] is True  # even the thin summary says so
+
+
+def test_the_marker_decides_not_the_folder_name(world, tmp_path, capsys):
+    adapter = smoke_adapter(world)
+    durable = tmp_path / "durable" / "adapter"  # copied by hand to somewhere with an innocent name
+    shutil.copytree(adapter, durable)
+    assert merge_only(world, durable) == 2 and not world.out.exists()  # still a smoke adapter
+    capsys.readouterr()
+    real = World(tmp_path, name="other")
+    assert real.run("--no-merge") == 0
+    named = real.root / "x-smoke" / "adapter"  # a real adapter in a folder that merely sounds like a smoke one
+    shutil.copytree(real.out / "adapter", named)
+    assert merge_only(real, named) == 0
+    assert not (real.out / "merged" / "SMOKE.txt").exists() and real.summary()["smoke"] is False
+
+
+def test_a_corrupt_adapter_marker_is_an_error_not_a_guess(world, capsys):
+    adapter = smoke_adapter(world)
+    (adapter / "finetune_marker.json").write_text("{not json", encoding="utf-8")
+    assert merge_only(world, adapter, "--out", str(smoke_out_of(world))) == 1
+    assert "finetune_marker.json" in capsys.readouterr().err and world.merge.calls == []
+
+
+def test_an_adapter_and_a_summary_that_disagree_about_smoke_are_refused(world, tmp_path, capsys):
+    real = tmp_path / "real"
+    assert world.run("--no-merge", "--out", str(real)) == 0  # summary: smoke false
+    marker = real / "adapter" / "finetune_marker.json"
+    marker.write_text(marker.read_text(encoding="utf-8").replace("false", "true"), encoding="utf-8")
+    assert merge_only(world, real / "adapter", "--out", str(real)) == 1
+    assert "smoke" in capsys.readouterr().err and world.merge.calls == []
+
+
+def test_the_adapter_marker_records_the_kind_of_run(world):
+    assert world.run() == 0
+    marker = json.loads((world.out / "adapter" / "finetune_marker.json").read_text(encoding="utf-8"))
+    assert marker == {"config_stem": "ft_lora", "max_steps": None, "schema": 1, "smoke": False}
+    smoke = json.loads((smoke_adapter(World(world.root.parent, name="second")) / "finetune_marker.json").read_text(encoding="utf-8"))
+    assert smoke == {"config_stem": "ft_lora", "max_steps": 3, "schema": 1, "smoke": True}
+
+
+# --- the summary exists from the end of training, before the merge starts -------------------------------------------
+
+
+def test_a_failed_merge_leaves_a_provisional_summary_with_the_training_record(world, capsys):
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run() == 1
+    s = world.summary()
+    assert s["merged"] is False and s["merge_pending"] is True and s["smoke"] is False
+    losses = [loss for _, loss in s["loss_history"]]
+    assert losses and s["mean_train_loss"] == pytest.approx(sum(losses) / len(losses))
+    assert s["last_logged_loss"] == pytest.approx(losses[-1]) and s["loss_ok"] is True
+    assert isinstance(s["label_check"], dict) and s["args_check"] and s["rows_seen"] == 40 and s["steps"] == 5
+    assert s["data"]["train"]["sha256"] == hashlib.sha256((world.root / "data" / "ft" / "train.jsonl").read_bytes()).hexdigest()
+    assert s["config"]["sha256"] == hashlib.sha256(world.config.read_bytes()).hexdigest()
+    assert s["libraries"] == {"aligntune": "0.0-fake", "trl": None} and s["device"] == "FakeGPU"
+    assert s["wall_clock_seconds"] == 5.0  # up to the end of training: the merge had not started
+    assert sorted(p.name for p in world.out.iterdir()) == ["adapter", "finetune_summary.json"]  # no temp file left behind
+
+
+def test_a_smoke_run_whose_merge_failed_says_smoke_in_the_provisional_summary(world):
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run("--max-steps", "3", "--merge") == 1
+    s = world.summary(smoke_out_of(world))
+    assert s["smoke"] is True and s["merged"] is False and s["merge_pending"] is True
+
+
+def test_merge_only_completes_the_provisional_summary(world):
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run() == 1
+    before = world.summary()
+    world.merge = FakeMerge()
+    assert merge_only(world, world.out / "adapter", "--out", str(world.out)) == 0
+    after = world.summary()
+    assert after["merged"] is True and "merge_pending" not in after
+    assert after["merge"]["adapter"] == "results/finetune/ft_lora/adapter" and after["merge"]["wall_clock_seconds"] == 5.0
+    for key in before:
+        if key not in ("merged", "merge_pending"):
+            assert after[key] == before[key], key  # the whole training record is kept as it was
+    assert "config" in after and "base_model" in after and "note" in after
+
+
+def test_a_run_without_a_merge_has_a_final_summary_not_a_provisional_one(world):
+    assert world.run("--no-merge") == 0
+    s = world.summary()
+    assert s["merged"] is False and "merge_pending" not in s
+
+
+def test_merge_only_stops_before_merging_when_the_summary_cannot_be_read(world, capsys):
+    world.merge = FakeMerge(error=MemoryError("not enough RAM"))
+    assert world.run() == 1
+    capsys.readouterr()
+    (world.out / "finetune_summary.json").write_text("{broken", encoding="utf-8")
+    world.merge = FakeMerge()
+    assert merge_only(world, world.out / "adapter", "--out", str(world.out)) == 1
+    assert "finetune_summary.json" in capsys.readouterr().err
+    assert world.merge.calls == []  # found out before the long merge, not after it
+
+
+# --- the adapter folder is published whole or not at all ------------------------------------------------------------
+
+
+def test_a_failure_in_the_middle_of_the_adapter_copy_leaves_no_adapter_folder(world, monkeypatch, capsys):
+    real_copy = shutil.copyfile
+    copied = []
+
+    def dies_on_the_second_file(src, dst, *args, **kwargs):
+        if copied:
+            raise OSError("disk full")
+        copied.append(src)
+        return real_copy(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(finetune.shutil, "copyfile", dies_on_the_second_file)
+    assert world.run() == 1
+    assert "disk full" in capsys.readouterr().err
+    assert len(copied) == 1  # the first file was written before the failure
+    assert not (world.out / "adapter").exists() and partials(world.root) == []  # no half-copied adapter, no hidden leftover
+    assert world.work.is_dir() and (world.work / "adapter_config.json").is_file()  # the trainer's files are still there
+    assert world.merge.calls == []
+
+
+# --- the leftover work folder: the exact command to clear it -------------------------------------------------------
+
+
+def test_the_leftover_work_folder_error_gives_the_exact_delete_command(world, capsys):
+    world.work.mkdir(parents=True)
+    (world.work / "checkpoint-250").mkdir()
+    assert world.run() == 2
+    assert "rm -r work/finetune/ft_lora" in capsys.readouterr().err.replace("ft_lora-smoke", "")
+
+
+def test_the_leftover_smoke_work_folder_error_names_the_smoke_folder(world, capsys):
+    world.factory = FakeFactory(losses=[[1, 2.0], [2, 3.0], [3, 4.0]])  # a loss that did not fall: the smoke run fails
+    assert world.run("--max-steps", "3") == 1
+    capsys.readouterr()
+    work = world.root / "work" / "finetune" / "ft_lora-smoke"
+    assert work.is_dir()
+    assert world.run("--max-steps", "3") == 2  # refused until the folder is cleared
+    assert "rm -r work/finetune/ft_lora-smoke" in capsys.readouterr().err
+    shutil.rmtree(work)
+    world.factory = FakeFactory()
+    assert world.run("--max-steps", "3") == 0
 
 
 # --- pushing to the Hub -------------------------------------------------------------------------------------------

@@ -4,7 +4,7 @@
     python scripts/finetune.py --config configs/ft_lora.yaml --max-steps 20 --merge     # smoke run, then
     python scripts/finetune.py --config configs/ft_lora.yaml                             # the real run
     python scripts/finetune.py --config configs/ft_lora_strong.yaml                     # the strong retry
-    python scripts/finetune.py --config configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter
+    python scripts/finetune.py --config configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter --out results/finetune/ft_lora
 
 Every training value (model, data paths, LoRA, quantisation, learning rate, epochs, batches, sequence length,
 precision, seed, loss masking, saving) is in the YAML config; this program holds no default for any of them and
@@ -26,11 +26,16 @@ configured one, that the trainer saw every row and that the loss is finite and f
 fresh fp16 copy of the base model, and writes `finetune_summary.json` (config and data hashes, library versions,
 steps, sampled loss history, wall-clock seconds, seed, `smoke`, device, `loss_ok`; never a token or an absolute
 path). AlignTune trains into a persistent work folder `work/finetune/<config stem>[-smoke]/`, kept (and named
-in the error) on any failure; after training the adapter is copied into `<out>/adapter`, the merged weights go
-into `<out>/merged`, each under a hidden partial name that is renamed only when whole, and the summary is
-written last. `--max-steps N` is a smoke run: N steps, every step logged, merge only with `--merge`, never
-pushed. `--merge-only --adapter PATH` trains nothing: it checks that adapter against the config, merges it into
-`<out>/merged` and adds a `merge` section to the summary (the recovery after a failed merge).
+in the error) on any failure; after training the adapter is copied into `<out>/adapter` (with a small
+`finetune_marker.json` saying whether a smoke run saved it), a provisional summary (`merged: false`,
+`merge_pending: true`, everything known after training) is written, and the merged weights go into `<out>/merged`,
+the adapter and the merge each under a hidden partial name that is renamed only when whole; the final summary then
+replaces the provisional one. `--max-steps N` is a smoke run: N steps, every step logged, merge only with `--merge`,
+never pushed. `--merge-only --adapter PATH` trains nothing: it checks that adapter against the config, merges it
+into `<out>/merged` and completes the summary the failed run left (the recovery after a failed merge; the message
+of the failure prints the whole command, `--out` included). The adapter's marker decides whether it is a smoke
+adapter: then the merge carries SMOKE.txt and `smoke: true`, and the real run's folder is refused as `--out`;
+a real adapter is refused with a `*-smoke` `--out`; a missing marker falls back on a `*-smoke` folder name.
 
 The label mask is checked at step 0 (labelled tokens of the first rows, and the trainer's arguments). When the
 rows cannot be read the check is "unavailable": a smoke run records that and prints a WARNING on both streams, a
@@ -56,7 +61,8 @@ Exit codes:
   2  usage error: bad or missing arguments, --push-to without HF_TOKEN or with --max-steps or --no-merge,
      --merge-only without --adapter or with a training option, --allow-unchecked-labels with --max-steps, a non-empty --out (or --out/merged for
      --merge-only), an --out that is, or is inside, a data folder, a smoke --out equal to the real run's folder,
-     or a work folder an earlier run left
+     a --merge-only of a smoke adapter into the real run's folder (or of a real adapter into a *-smoke folder),
+     or a work folder an earlier run left (the message prints the rm -r command that clears it)
 """
 
 from __future__ import annotations
@@ -70,6 +76,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -78,7 +85,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -95,6 +102,7 @@ ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")
 SMOKE_SUFFIX = "-smoke"
 TEMPLATE_FILE = "default_chat_template.jinja"  # not chat_template.jinja: the trainer saves its own under that name
 SMOKE_MARKER = "SMOKE.txt"
+ADAPTER_MARKER = "finetune_marker.json"  # inside <out>/adapter: which kind of run saved it (smoke or real)
 NOT_PUBLISHED = ("lexsi_provenance.json",)  # AlignTune's provenance file records absolute paths
 DEFAULT_TEMPLATE = "default"
 IGNORE_INDEX = -100  # PyTorch's cross-entropy ignore index: a label with this value takes no part in the loss
@@ -1027,7 +1035,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="real run only: go on when the labelled-token check is unavailable (the mask could not be read at step 0); "
                          "recorded in the summary as label_check_waived and printed as a WARNING; never waives an out-of-bounds count")
     ap.add_argument("--merge-only", action="store_true",
-                    help="train nothing: merge the adapter given by --adapter into <out>/merged and add a merge section to the summary")
+                    help="train nothing: merge the adapter given by --adapter into <out>/merged and complete the summary; pass the --out of the run that saved the adapter (a failure prints the whole command)")
     ap.add_argument("--adapter", type=Path, help="with --merge-only: the adapter folder to merge (e.g. <out>/adapter left by a failed merge)")
     return ap
 
@@ -1358,11 +1366,25 @@ def _check_work_dir(work: Path, root: Path) -> None:
     if left:
         raise UsageError(
             f"the work folder {shown(work, root)} is not empty ({', '.join(left)}): it is what an earlier run left for "
-            "recovery. Move or delete it, then run again"
+            f"recovery. Move it away, or delete it with: rm -r {shlex.quote(shown(work, root))} (then run again)"
         )
 
 
-def _kept_note(work: Path, root: Path, adapter: Path | None) -> str:
+def _out_text(typed: Path | None, out: Path, root: Path) -> str:
+    """The output folder as the command to copy must spell it: as typed; a default folder relative to the repository
+    root when the command will be run from there (as every command in docs/runtime.md is), whole anywhere else."""
+    if typed:
+        return str(typed)
+    return shown(out, root) if Path.cwd().resolve() == Path(root).resolve() else str(out)
+
+
+def _merge_arguments(config: Path, out_text: str, adapter_dir: str) -> str:
+    """The whole `--merge-only` command for this run's adapter, `--out` included, so that copying it is always safe."""
+    adapter = str(Path(out_text) / adapter_dir)
+    return f"--config {shlex.quote(str(config))} --merge-only --adapter {shlex.quote(adapter)} --out {shlex.quote(out_text)}"
+
+
+def _kept_note(work: Path, root: Path, adapter: Path | None, merge_arguments: str) -> str:
     left = _work_contents(work)
     text = (
         f"the work folder {shown(work, root)} was kept, holding {', '.join(left)} (AlignTune cannot resume from it by "
@@ -1371,7 +1393,7 @@ def _kept_note(work: Path, root: Path, adapter: Path | None) -> str:
         else f"the work folder {shown(work, root)} was kept, empty apart from the chat template file"
     )
     if adapter is not None:
-        text += f"; the finished adapter is in {shown(adapter, root)}: merge it with --merge-only --adapter {shown(adapter, root)}"
+        text += f"; the finished adapter is in {shown(adapter, root)}: merge it with these arguments: {merge_arguments}"
     return text
 
 
@@ -1380,6 +1402,45 @@ def _copy_adapter(work: Path, folder: Path) -> None:
     for item in sorted(work.iterdir()):
         if item.is_file() and item.name != TEMPLATE_FILE and item.name not in NOT_PUBLISHED:
             shutil.copyfile(item, folder / item.name)
+
+
+def _write_adapter_marker(folder: Path, args: argparse.Namespace, stem: str) -> None:
+    """Say inside the adapter which kind of run saved it, so that `--merge-only` can tell without guessing from a name."""
+    marker = {"schema": 1, "smoke": args.smoke, "max_steps": args.max_steps, "config_stem": stem}
+    (folder / ADAPTER_MARKER).write_text(_json_text(marker), encoding="utf-8")
+
+
+class AdapterOrigin(NamedTuple):
+    smoke: bool
+    max_steps: int | None
+    why: str  # how it is known, for the message of a refusal
+
+
+def _adapter_origin(adapter: Path, root: Path) -> AdapterOrigin:
+    """Whether `adapter` came from a smoke run: its own marker first, the folder name only when there is none."""
+    path = adapter / ADAPTER_MARKER
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            smoke, steps = data["smoke"], data.get("max_steps")
+            if not isinstance(smoke, bool) or not (steps is None or (isinstance(steps, int) and not isinstance(steps, bool))):
+                raise ValueError("smoke must be true or false and max_steps a whole number or null")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise FinetuneError(
+                f"{ADAPTER_MARKER} in {shown(adapter, root)} cannot be read ({exc}): it says whether this adapter comes from "
+                "a smoke run, so it is not guessed. Restore the file from the run's own adapter folder"
+            ) from None
+        return AdapterOrigin(smoke, steps, f"its {ADAPTER_MARKER} says smoke: {str(smoke).lower()}")
+    resolved = adapter.resolve()
+    named = [p.name for p in (resolved, resolved.parent) if p.name.endswith(SMOKE_SUFFIX)]
+    if named:
+        return AdapterOrigin(True, None, f"it has no {ADAPTER_MARKER}, and it sits in the folder {named[0]}")
+    return AdapterOrigin(False, None, f"it has no {ADAPTER_MARKER} and does not sit in a folder named *{SMOKE_SUFFIX}")
+
+
+def _smoke_marker_text(max_steps: int | None) -> str:
+    steps = f" of {max_steps} steps" if max_steps else ""
+    return f"smoke run{steps}: this model is not A1 and must not be used for the study"
 
 
 def _write_atomically(path: Path, text: str) -> None:
@@ -1434,11 +1495,47 @@ def _unverified_warning(args: argparse.Namespace, why: str) -> str:
     )
 
 
+def _read_summary(path: Path, root: Path) -> dict[str, Any] | None:
+    """The summary a run left (provisional or final), or None when there is none; an unreadable one is an error."""
+    if not path.is_file():
+        return None
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FinetuneError(f"{shown(path, root)} cannot be read ({exc}); move it away or repair it, then merge again") from None
+    if not isinstance(summary, dict):
+        raise FinetuneError(f"{shown(path, root)} is not a JSON object; move it away or repair it, then merge again")
+    return summary
+
+
+def _check_merge_target(origin: AdapterOrigin, adapter: Path, out: Path, stem: str, root: Path) -> None:
+    """A smoke adapter never goes into the real run's folder, and a real adapter never into a smoke folder."""
+    real, smoke = _default_out(root, stem, False), _default_out(root, stem, True)
+    if origin.smoke and out.resolve() == real.resolve():
+        raise UsageError(
+            f"{shown(adapter, root)} is the adapter of a smoke run ({origin.why}); it cannot be merged into "
+            f"{shown(out, root)}, the folder of the real run. Use --out {shlex.quote(_out_text(None, smoke, root))} "
+            "(or another folder)"
+        )
+    if not origin.smoke and out.resolve().name.endswith(SMOKE_SUFFIX):
+        raise UsageError(
+            f"{shown(adapter, root)} is not the adapter of a smoke run ({origin.why}) but --out {shlex.quote(str(out))} is a "
+            f"smoke folder; leave --out out (the default is {shlex.quote(_out_text(None, real, root))}) "
+            "or choose another folder"
+        )
+
+
 def execute_merge_only(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
-    """`--merge-only --adapter PATH`: merge an adapter that is already on disk; nothing is trained, no data is read."""
+    """`--merge-only --adapter PATH`: merge an adapter that is already on disk; nothing is trained, no data is read.
+
+    The adapter's own marker says whether it came from a smoke run; then the merge is marked as one (SMOKE.txt, `smoke:
+    true`) and the real run's folder is refused. The summary the failed run left is completed, not replaced."""
     cfg = load_config(args.config)
-    out = args.out if args.out else Path(root) / "results" / "finetune" / args.config.stem
-    adapter = _resolve(args.adapter, root)
+    stem = args.config.stem
+    out = args.out if args.out else _default_out(root, stem, False)
+    adapter = Path(args.adapter)  # typed paths are relative to where the command runs, like --out and --data
+    origin = _adapter_origin(adapter, root)
+    _check_merge_target(origin, adapter, out, stem, root)
     merged_out = out / cfg.output.merged_dir
     try:
         check_out_dir(merged_out, sources=_data_folders(cfg, _resolve(cfg.data.train, root), root))
@@ -1446,9 +1543,16 @@ def execute_merge_only(args: argparse.Namespace, root: Path, hooks: Hooks) -> in
         raise UsageError(str(exc)) from None
     note_stale_partials(merged_out)
     _check_adapter(adapter, cfg, "adapter")  # the adapter must be the configured one, base model included
+    summary_path = out / SUMMARY_FILE
+    summary = _read_summary(summary_path, root)  # before the long merge, not after it
+    if summary is not None and isinstance(summary.get("smoke"), bool) and summary["smoke"] != origin.smoke:
+        raise FinetuneError(
+            f"{shown(summary_path, root)} says smoke: {str(summary['smoke']).lower()} but the adapter {shown(adapter, root)} "
+            f"is{'' if origin.smoke else ' not'} from a smoke run ({origin.why}); they do not belong together"
+        )
 
     started = hooks.clock()
-    _merge(hooks, cfg, adapter, merged_out)
+    _merge(hooks, cfg, adapter, merged_out, _smoke_marker_text(origin.max_steps) if origin.smoke else None)
     seconds = hooks.clock() - started
     section = {
         "adapter": shown(adapter, root),
@@ -1456,15 +1560,7 @@ def execute_merge_only(args: argparse.Namespace, root: Path, hooks: Hooks) -> in
         "wall_clock_seconds": float(format(seconds, _FLOAT)),
         "libraries": dict(hooks.versions()),
     }
-    summary_path = out / SUMMARY_FILE
-    if summary_path.is_file():
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise FinetuneError(f"the merged model is in {shown(merged_out, root)} but {SUMMARY_FILE} cannot be read: {exc}") from None
-        if not isinstance(summary, dict):
-            raise FinetuneError(f"the merged model is in {shown(merged_out, root)} but {SUMMARY_FILE} is not a JSON object")
-    else:
+    if summary is None:
         summary = {
             "schema": 1,
             "config": {"path": shown(args.config, root), "sha256": hashlib.sha256(args.config.read_bytes()).hexdigest()},
@@ -1472,7 +1568,9 @@ def execute_merge_only(args: argparse.Namespace, root: Path, hooks: Hooks) -> in
             "merge_dtype": cfg.output.merge_dtype,
             "note": NOTE,
         }
+    summary["smoke"] = origin.smoke
     summary["merged"] = True
+    summary.pop("merge_pending", None)  # the provisional summary of a run whose merge failed said it was waiting
     summary["merge"] = section
     _write_atomically(summary_path, _json_text(summary))
     print(f"merged {shown(adapter, root)} into {shown(merged_out, root)} ({cfg.output.merge_dtype}); {SUMMARY_FILE} has the merge section")
@@ -1495,8 +1593,12 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     try:
         check_out_dir(out, sources=_data_folders(cfg, train_path, root))
     except (FileExistsError, ValueError) as exc:
-        hint = f" (an adapter a failed run left there can be merged: --merge-only --adapter {shown(out / cfg.output.adapter_dir, root)})"
-        raise UsageError(str(exc) + (hint if (out / cfg.output.adapter_dir).is_dir() else "")) from None
+        left = out / cfg.output.adapter_dir
+        hint = (
+            "; an adapter a failed run left there can be merged with these arguments: "
+            f"{_merge_arguments(args.config, _out_text(args.out, out, root), cfg.output.adapter_dir)}"
+        )
+        raise UsageError(str(exc) + (hint if left.is_dir() else "")) from None
     note_stale_partials(out)
     work = _work_dir(root, stem, args.smoke)
     _check_work_dir(work, root)
@@ -1521,27 +1623,33 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     work.mkdir(parents=True, exist_ok=True)
     (work / TEMPLATE_FILE).write_text(template_text, encoding="utf-8")
     adapter_out = out / cfg.output.adapter_dir
+    merge_arguments = _merge_arguments(args.config, _out_text(args.out, out, root), cfg.output.adapter_dir)  # --out included
     published = False
     try:
         trained = _train_and_check(hooks, cfg, args, check, seed, work)
         with atomic_output_dir(adapter_out) as folder:
             _copy_adapter(work, folder)
+            _write_adapter_marker(folder, args, stem)
         published = True
         merged = False
         if args.merge_effective:
-            marker = (
-                f"smoke run of {args.max_steps} steps: this model is not A1 and must not be used for the study"
-                if args.smoke else None
+            # Everything known after training goes to disk BEFORE the long merge: if the merge dies, the loss history
+            # and the checks survive, and `--merge-only` completes this file. The final summary replaces it.
+            provisional = _summary(
+                cfg, args, args.config, check, seed, trained, False, hooks.clock() - started, hooks, root, template_sha256
             )
+            provisional["merge_pending"] = True
+            _write_atomically(out / SUMMARY_FILE, _json_text(provisional))
+            marker = _smoke_marker_text(args.max_steps) if args.smoke else None
             _merge(hooks, cfg, adapter_out, out / cfg.output.merged_dir, marker)
             merged = True
         seconds = hooks.clock() - started
         summary = _summary(cfg, args, args.config, check, seed, trained, merged, seconds, hooks, root, template_sha256)
-        _write_atomically(out / SUMMARY_FILE, _json_text(summary))  # last: its presence means the run finished
+        _write_atomically(out / SUMMARY_FILE, _json_text(summary))  # final: only a finished run says merged (or no merge)
     except FinetuneError as exc:
-        raise FinetuneError(f"{exc}; {_kept_note(work, root, adapter_out if published else None)}") from None
+        raise FinetuneError(f"{exc}; {_kept_note(work, root, adapter_out if published else None, merge_arguments)}") from None
     except BaseException:  # a CUDA error, Ctrl-C: the traceback stays, and the recovery folder is named
-        print(f"note: {_kept_note(work, root, adapter_out if published else None)}", file=sys.stderr)
+        print(f"note: {_kept_note(work, root, adapter_out if published else None, merge_arguments)}", file=sys.stderr)
         raise
     if cfg.output.keep_checkpoints:
         print(f"kept the work folder {shown(work, root)} (output.keep_checkpoints): AlignTune's checkpoints are in it")

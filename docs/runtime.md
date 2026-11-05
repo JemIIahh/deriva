@@ -312,23 +312,47 @@ and stops the notebook before the upload.
 error names it; a later run refuses to start while it holds anything but the chat-template file, so a failed run
 cannot silently overwrite its own recovery files. After training the adapter is copied (without checkpoints) into its
 own folder `<out>/adapter`, then the merged weights go into `<out>/merged`, each written under a hidden `.partial`
-name and renamed only when whole, and `finetune_summary.json` is written last, so its presence means the run
-finished. A successful run deletes the work folder (`output.keep_checkpoints: true` keeps it). A killed session
+name and renamed only when whole. The adapter folder also holds a small `finetune_marker.json` (`smoke`,
+`max_steps`, the config stem): it says which kind of run saved the adapter, so that `--merge-only` never has to guess.
+`finetune_summary.json` is written twice: right after training, before the merge starts, as a provisional file
+(`merged: false`, `merge_pending: true`, with the loss history and every check), and again after the merge succeeds
+as the final one (`merged: true`, no `merge_pending`). So `merged: true` is what means the run finished, and a merge
+that dies leaves the training record behind. A successful run deletes the work folder (`output.keep_checkpoints: true` keeps it). A killed session
 (SIGKILL, a dropped runtime) cannot clean up: a hidden `.<name>.<8 hex>.partial` folder stays and is named at the
 start of the next run, never deleted.
 
 **After a failure.** AlignTune itself has no resume: it has no switch to continue from a checkpoint, so a dropped run
-starts again. What is kept is for recovery by hand.
+starts again. What is kept is for recovery by hand, and **only within the SAME live session**: everything below sits
+on the runtime's disk, the notebook uploads neither adapter weights nor `work/`, and a failed stage stops before its
+upload step, so a session that ends takes the adapter, the work folder and the provisional summary with it. Two
+habits make that survivable. Run the 20-step smoke with `--merge` first (step 2 above), so that a merge problem
+(CPU RAM, the tokenizer save) shows up in minutes, not after the long run. And if a merge fails and the session has
+to end anyway, copy `<out>/adapter` somewhere durable by hand first (it is only the adapter, not the 6.7 GB model;
+keep `finetune_marker.json` in it, which says whether it came from a smoke run).
 
-- The merge failed (out of RAM, say): the error names `<out>/adapter`. Finish without training again:
-  `STAGE_ARGS = "--config configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter"`. It
-  checks that adapter against the config (base model, rank, alpha, dropout, bias, target modules, and that the weights file is there), merges into
-  `<out>/merged` and adds a `merge` section to `finetune_summary.json` (it writes a small one when the failed run
-  left none). It trains nothing and reads no data; it takes no `--data`, `--seed`, `--max-steps`, `--no-merge`,
-  `--dry-run` or `--push-to`.
+- The merge failed (out of RAM, say): the error (for an out-of-memory error the `note:` line above the traceback)
+  names `<out>/adapter` and prints the whole command, `--out` of the failed run included. Copy it as it is, for a smoke
+  run as for the real one:
+  `STAGE_ARGS = "--config configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter --out results/finetune/ft_lora"`
+  (a failed smoke run prints `results/finetune/ft_lora-smoke/adapter` and `--out results/finetune/ft_lora-smoke`). It
+  checks that adapter against the config (base model, rank, alpha, dropout, bias, target modules, and that the weights
+  file is there), merges into `<out>/merged` and completes the provisional `finetune_summary.json` the failed run left:
+  the training record stays, `merged` becomes true, `merge_pending` goes, and a `merge` section is added (a small
+  summary is written when there was none). It trains nothing and reads no data; it takes no `--data`, `--seed`,
+  `--max-steps`, `--no-merge`, `--dry-run` or `--push-to`.
+  It reads `finetune_marker.json` in the adapter folder to tell a smoke adapter from a real one. A smoke adapter is
+  merged with a `SMOKE.txt` beside the weights and `smoke: true` in the summary, and is refused (exit 2) with the real
+  run's folder `results/finetune/ft_lora` as `--out`, given or by default; a real adapter is refused with a folder
+  named `*-smoke` as `--out`. An adapter without a marker (saved before it existed) counts as a smoke adapter only if
+  its own folder or its parent is named `*-smoke`; a damaged marker is an error, never a guess.
 - Training failed or the session was interrupted: look in the named work folder for `checkpoint-<step>/`. Continuing
   one needs your own script (`Trainer.train(resume_from_checkpoint=<folder>)`; UNVERIFIED that it works through
   AlignTune's objects). Otherwise move or delete the work folder and run again.
+- A smoke run that fails the "loss fell" rule by chance (the 20-step loss is noisy, see step 2) keeps its work
+  folder `work/finetune/ft_lora-smoke`, and a rerun of the smoke is refused (exit 2) until that folder is gone. The
+  error prints the command: `rm -r work/finetune/ft_lora-smoke` (in a notebook cell: `!rm -r work/finetune/ft_lora-smoke`
+  from the repository folder). Delete it only after you have read what you need from it; the real run has its own
+  folder, `work/finetune/ft_lora`, and the same rule.
 
 **Held-out accuracy check, A0 against A1** (the task items only; no judge and no API key). `run_eval.py` reads
 `data/ft/taskdev.jsonl` for `--split dev` and `data/ft/heldout.jsonl` for `--split report` and scores the bare answer
@@ -343,8 +367,9 @@ STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out
 # then the same two with --split report
 ```
 
-(A later notebook run starts from a fresh working folder and the workspace repo holds no weights, so pass the
-`--push-to` repo id as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
+(`--model results/finetune/ft_lora/merged` works only in the same live session that made it: merged weights are never
+uploaded to the workspace repo and a later notebook run starts from a fresh working folder, so in a later run pass the
+`--push-to` repo id (`<hf-user>/<private-model-repo>`) as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
 `accuracy` (one file per language). Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
 heldout split). What A1 must show is that it answers the bare letter more often than A0 does (the point of the
 task); how much is a result, not a gate here.
