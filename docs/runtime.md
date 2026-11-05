@@ -228,20 +228,21 @@ python scripts/finetune.py --config configs/ft_lora.yaml --dry-run
 python scripts/finetune.py --config configs/ft_lora_strong.yaml --dry-run
 ```
 
-**Before the first run on Kaggle or Colab** (three gaps, stated plainly; `kaggle/10_run_stage.ipynb` is not changed):
+**Before the first run on Kaggle or Colab** (three steps, stated plainly):
 
 1. The wheel in the workspace repo must be rebuilt and replaced (`uv build --wheel --out-dir dist .`, upload, keep
    exactly one): `msd.finetune` is new. `scripts/finetune.py`, `pipelines/` and `data/` (with `data/ft/` and
    `data/testset/`) must be current there as well.
-2. The stage notebook pulls only `scripts/*`, `pipelines/*` and `data/**`, **not `configs/`**. Upload the two
-   YAML files into the workspace repo as `data/configs/ft_lora.yaml` and `data/configs/ft_lora_strong.yaml`
-   (the `data/**` pattern pulls them) and pass `--config data/configs/ft_lora.yaml`. The summary records that
-   path and the file's sha256, which is the same as the one in `configs/`.
-3. The notebook installs no toolkit. In the pushed copy of the notebook (not in the repo file) add a code cell
-   above the run cell: `!pip install -q aligntune==0.1.31` (needs Python 3.11 or newer; 0.1.31 was published
-   2026-11-05). It pulls torch/transformers/trl/peft pins (`transformers>=5.15,<6`, `trl==1.7.1`,
-   `torch>=2.4,<2.14`) and may replace the preinstalled torch: run `python scripts/env_check.py` again afterwards
-   (UNVERIFIED either way). Use this runtime only for the fine-tune, not for SafeTune (one environment per toolkit).
+2. The stage notebook now pulls `configs/*` as well as `scripts/*`, `pipelines/*` and `data/**`. Upload the two
+   YAML files into the workspace repo at `configs/ft_lora.yaml` and `configs/ft_lora_strong.yaml` (no workaround
+   under `data/` is needed any more) and pass `--config configs/ft_lora.yaml`. The summary records that path and the
+   file's sha256. Use the updated `kaggle/10_run_stage.ipynb` (Kaggle and Colab keep their own copy of a notebook).
+3. The notebook installs a toolkit only when you ask: set `EXTRA_PIP = "aligntune==0.1.31"` in its settings cell
+   (default empty; installed with `pip install -q` before the stage runs; needs Python 3.11 or newer; 0.1.31 was
+   published 2026-11-05). It pulls torch/transformers/trl/peft pins (`transformers>=5.15,<6`, `trl==1.7.1`,
+   `torch>=2.4,<2.14`) and may replace the preinstalled torch: run `env_check` again afterwards (UNVERIFIED either
+   way). Use this runtime only for the fine-tune, not for SafeTune (one environment per toolkit); leave `EXTRA_PIP`
+   empty for the other stages.
 
 The token: the notebook already puts `HF_TOKEN` into the environment; the gated base model
 (`CohereLabs/tiny-aya-global`, licence accepted on its page) is downloaded with it. `finetune.py` never prints it.
@@ -253,29 +254,39 @@ Run these in order, each as a separate run of the stage notebook (`STAGE`, `STAG
 # 1. Plan on the runtime (a tokenizer can be loaded here, so the token lengths and the longest example are printed;
 #    check that max_seq_length 2048 covers it). Writes nothing.
 STAGE = "finetune"
-STAGE_ARGS = "--config data/configs/ft_lora.yaml --dry-run"
+EXTRA_PIP = "aligntune==0.1.31"  # settings cell; it brings transformers and trl, which give the dry run its token lengths and template check
+STAGE_ARGS = "--config configs/ft_lora.yaml --dry-run"
 
 # 2. Smoke run: 20 steps, every step logged, merges once so the merge path (CPU RAM, tokenizer save) is proven
 #    BEFORE the long run. Output goes to results/finetune/ft_lora-smoke, its merged/ holds a SMOKE.txt marker, it is
 #    not A1 and is never pushed; a smoke run refuses --out results/finetune/ft_lora (the real run's folder).
-STAGE_ARGS = "--config data/configs/ft_lora.yaml --max-steps 20 --merge"
+STAGE_ARGS = "--config configs/ft_lora.yaml --max-steps 20 --merge"
 #    Read the printed lines and results/finetune/ft_lora-smoke/finetune_summary.json: rows_seen must be 6000 (a lower
-#    number means AlignTune/CuratorKIT dropped rows), loss_ok true, steps 20, peak memory in the log (UNVERIFIED how it
-#    is shown; watch nvidia-smi). If the adapter check, the keyword names or the assistant-only mask are wrong this is
-#    where it shows.
+#    number means AlignTune/CuratorKIT dropped rows), loss_ok true, steps 20, label_check with about 3 labelled
+#    tokens per row (0 or a large number means the assistant mask is wrong), args_check listing the 13 trainer
+#    arguments it compared, chat_template_sha256, peak memory in the log (UNVERIFIED how it is shown; watch
+#    nvidia-smi). If the adapter check, the keyword names or the assistant-only mask are wrong this is where it shows.
+
+#    Do not read too much into the smoke run's loss. The task answer is one letter, so each example has only about 3
+#    labelled tokens (the letter and the two end tokens), so a logged step averages only about 48 labelled tokens
+#    (an effective batch of 16 examples): with 20 steps the loss is noisy, and a chance failure of the "loss fell" rule is NOT proof of a bug. Look at the printed
+#    per-step losses, label_check and args_check, and run the smoke once more before deciding.
 
 # 3. The real run: 2 epochs = 750 optimizer steps. Writes results/finetune/ft_lora/{adapter,merged,finetune_summary.json}.
-STAGE_ARGS = "--config data/configs/ft_lora.yaml"
-#    Optional, after a successful run only: add  --push-to <hf-user>/<private-repo>  (the repo must already exist and be
-#    PRIVATE; HF_TOKEN from the environment; nothing is created, nothing is uploaded without the flag; privacy is
-#    checked before training and again right before the upload).
+STAGE_ARGS = "--config configs/ft_lora.yaml --push-to <hf-user>/<private-model-repo>"
+#    --push-to is how the merged weights leave the runtime (the notebook's own upload never sends weights, below): the
+#    repo must already exist and be a PRIVATE MODEL repo you made by hand, HF_TOKEN must be allowed to write to it;
+#    nothing is created, nothing is uploaded without the flag, and privacy is checked before training and again right
+#    before the upload. Without it the merged model stays on the runtime's disk and is gone with the session.
 
 # 4. Only if step 3's held-out accuracy (below) shows the model barely moved: the strong retry, 3 epochs = 1,125 steps.
-STAGE_ARGS = "--config data/configs/ft_lora_strong.yaml"
+STAGE_ARGS = "--config configs/ft_lora_strong.yaml"
 ```
 
-The notebook then uploads `results/finetune/` to the private workspace repo, merged weights included
-(about 6.7 GB in fp16 plus the adapter); a failed run exits non-zero and uploads nothing it did not finish.
+The notebook then uploads `results/finetune/` to the private workspace repo, **without weights**: its upload skips
+`*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `work/**` and any `merged/` folder, so the summary and logs travel but the
+adapter and the 6.7 GB merged model do not (they go only through `--push-to`, above). A failed run exits non-zero
+and stops the notebook before the upload.
 
 **Where things are written.** AlignTune trains into a persistent work folder, `work/finetune/<config stem>[-smoke]/`
 (checkpoints every `save_steps`, the adapter files at the end). It is kept on ANY failure, including Ctrl-C, and the
@@ -291,7 +302,7 @@ start of the next run, never deleted.
 starts again. What is kept is for recovery by hand.
 
 - The merge failed (out of RAM, say): the error names `<out>/adapter`. Finish without training again:
-  `STAGE_ARGS = "--config data/configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter"`. It
+  `STAGE_ARGS = "--config configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter"`. It
   checks that adapter against the config (base model, rank, alpha, dropout, bias, target modules, and that the weights file is there), merges into
   `<out>/merged` and adds a `merge` section to `finetune_summary.json` (it writes a small one when the failed run
   left none). It trains nothing and reads no data; it takes no `--data`, `--seed`, `--max-steps`, `--no-merge`,
@@ -313,10 +324,8 @@ STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out
 # then the same two with --split report
 ```
 
-(A later notebook run starts from a fresh working folder and the notebook pulls only scripts, pipelines and data,
-so fetch the merged model first in an extra cell, `snapshot_download(WORKSPACE_REPO, repo_type="dataset",
-local_dir=".", token=token, allow_patterns=["results/finetune/ft_lora/merged/*"])`, or pass the `--push-to` repo id
-as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
+(A later notebook run starts from a fresh working folder and the workspace repo holds no weights, so pass the
+`--push-to` repo id as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
 `accuracy` (one file per language). Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
 heldout split). What A1 must show is that it answers the bare letter more often than A0 does (the point of the
 task); how much is a result, not a gate here.

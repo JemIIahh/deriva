@@ -174,6 +174,53 @@ def test_run_stage_notebook_pulls_pipelines_as_well_as_scripts():
     assert '"pipelines/*"' in text and '"scripts/*"' in text
 
 
+def test_run_stage_notebook_pulls_the_configs_too():
+    text = "\n".join(source_of(c) for c in load("10_run_stage.ipynb")["cells"])
+    assert '"configs/*"' in text and '"data/**"' in text  # the fine-tune configs live in configs/, not under data/
+
+
+# --- EXTRA_PIP: a toolkit installed on the runtime, in the same notebook ---------------------------------------
+
+
+def _code_cells():
+    return [source_of(c) for c in load("10_run_stage.ipynb")["cells"] if c["cell_type"] == "code"]
+
+
+def _run_cell_source():
+    return next(src for src in _code_cells() if "scripts/{STAGE}.py" in src)
+
+
+def test_extra_pip_is_a_setting_that_defaults_to_nothing():
+    namespace = {}
+    settings = next(src for src in _code_cells() if re.search(r"^STAGE\s*=", src, re.M))
+    exec(compile(settings, "10_run_stage.ipynb", "exec"), namespace)
+    assert namespace["EXTRA_PIP"] == ""
+
+
+def _run_stage_cell(extra_pip, monkeypatch):
+    import subprocess
+
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kwargs: calls.append((list(cmd), kwargs)))
+    namespace = {"STAGE": "finetune", "STAGE_ARGS": "--config configs/ft_lora.yaml --dry-run", "EXTRA_PIP": extra_pip}
+    exec(compile(_run_cell_source(), "10_run_stage.ipynb", "exec"), namespace)
+    return calls
+
+
+def test_extra_pip_is_installed_before_the_stage_runs(monkeypatch):
+    calls = _run_stage_cell("aligntune==0.1.31", monkeypatch)
+    assert len(calls) == 2
+    install, stage = (c[0] for c in calls)
+    assert install[1:4] == ["-m", "pip", "install"] and "aligntune==0.1.31" in install
+    assert stage[1] == "scripts/finetune.py" and stage[2:] == ["--config", "configs/ft_lora.yaml", "--dry-run"]
+    assert all(kwargs.get("check") is True for _, kwargs in calls)  # a failed install stops the notebook
+
+
+def test_an_empty_extra_pip_installs_nothing(monkeypatch):
+    calls = _run_stage_cell("   ", monkeypatch)
+    assert [c[0][1] for c in calls] == ["scripts/finetune.py"]
+
+
 # --- the upload cell only ever sends completions to a private repo ---------------------------------------
 
 
@@ -215,6 +262,35 @@ def test_upload_cell_refuses_a_repo_that_is_not_private_and_uploads_nothing(priv
     with pytest.raises(RuntimeError, match="private"):
         _run_upload_cell(private, tmp_path, monkeypatch, log)
     assert [entry[0] for entry in log] == ["repo_info"]  # asked, then refused: upload_folder was never called
+
+
+def test_upload_cell_never_sends_weights_or_the_work_folder(tmp_path, monkeypatch):
+    import fnmatch
+
+    log = []
+    _run_upload_cell(True, tmp_path, monkeypatch, log)
+    patterns = log[1][1]["ignore_patterns"]
+    for needed in ("*.safetensors", "*.bin", "*.pt", "*.pth", "work/**", "**/merged/**"):
+        assert needed in patterns, needed
+    # huggingface_hub matches the path relative to folder_path with fnmatch, where * also matches a slash
+    weights = ["ft_lora/merged/model.safetensors", "ft_lora/merged/config.json", "ft_lora/adapter/adapter_model.safetensors",
+               "ft_lora/adapter/adapter_model.bin", "ft_lora/checkpoint-250/optimizer.pt", "ft_lora/checkpoint-250/rng.pth",
+               "work/finetune/ft_lora/checkpoint-250/scheduler.pt", "ft_lora-smoke/merged/SMOKE.txt"]
+    for path in weights:
+        assert any(fnmatch.fnmatch(path, pattern) for pattern in patterns), path
+    for path in ("ft_lora/finetune_summary.json", "ft_lora/adapter/adapter_config.json", "run.log"):
+        assert not any(fnmatch.fnmatch(path, pattern) for pattern in patterns), path
+
+
+def test_upload_cell_keeps_its_privacy_guard_before_the_upload():
+    text = _upload_cell()
+    assert text.index(".private") < text.index("upload_folder")
+    assert "is not a private dataset repo" in text and "nothing was uploaded" in text
+
+
+def test_the_markdown_says_weights_travel_only_by_push_to():
+    intro = source_of(load("10_run_stage.ipynb")["cells"][0])
+    assert "--push-to" in intro and "weights" in intro and "EXTRA_PIP" in intro
 
 
 def test_upload_cell_says_why_in_plain_words():
