@@ -498,11 +498,47 @@ def chat_template_text(template: Any) -> str:
     return entry
 
 
+def _same_value(have: Any, want: Any) -> bool:
+    """A flag is compared as a flag, a number as a number (epochs are a float in transformers), an enum by its value."""
+    if isinstance(want, bool):
+        return have is want
+    if isinstance(want, (int, float)):
+        if isinstance(have, bool):
+            return False
+        try:
+            return float(have) == float(want)
+        except (TypeError, ValueError):
+            return False
+    return str(getattr(have, "value", have)) == str(want)
+
+
+def expected_trainer_args(cfg: SimpleNamespace, seed: int) -> dict[str, tuple[str, Any]]:
+    """The Hugging Face TrainingArguments attributes that must come out as the config says, with the config key of each."""
+    t = cfg.train
+    return {
+        "fp16": ("train.fp16", t.fp16),
+        "bf16": ("train.bf16", t.bf16),
+        "learning_rate": ("train.learning_rate", t.learning_rate),
+        "num_train_epochs": ("train.epochs", t.epochs),
+        "per_device_train_batch_size": ("train.per_device_batch_size", t.per_device_batch_size),
+        "gradient_accumulation_steps": ("train.gradient_accumulation_steps", t.gradient_accumulation_steps),
+        "max_length": ("train.max_seq_length", t.max_seq_length),
+        "assistant_only_loss": ("train.assistant_only_loss", t.assistant_only_loss),
+        "seed": ("train.seed", seed),
+        "gradient_checkpointing": ("train.gradient_checkpointing", t.gradient_checkpointing),
+        "save_total_limit": ("train.save_total_limit", t.save_total_limit),
+        "warmup_steps": ("train.warmup_ratio", t.warmup_ratio),  # a float below 1 is a ratio in transformers >= 5.2
+        "lr_scheduler_type": ("train.lr_scheduler", t.lr_scheduler),
+    }
+
+
 @dataclass
 class StartCheck:
-    """What to verify on the tokenised training data once the trainer has built it and before its first step.
+    """What to verify once the Hugging Face trainer has been built and before its first step.
 
-    The labelled-token check: TRL turns the assistant part of each example into `labels` (everything else is
+    Two checks. The trainer-argument check compares thirteen attributes of the trainer's own `TrainingArguments`
+    (see `expected_trainer_args`) with the config, because AlignTune drops or rewrites keywords it does not
+    know; `args_compared` stays None when none could be compared. The labelled-token check: TRL turns the assistant part of each example into `labels` (everything else is
     `IGNORE_INDEX`). The task answer is one letter, so a row should have a handful of labelled tokens: none means
     the assistant mask matched nothing, a great many means the loss covers the prompt too. The real trainer calls
     `observe` from an `on_train_begin` callback; `label_counts` stays None, with `label_note` saying why, when
@@ -511,8 +547,12 @@ class StartCheck:
     rows: int
     minimum: int
     maximum: int
+    expected_args: Mapping[str, tuple[str, Any]] = field(default_factory=dict)  # TrainingArguments attribute -> (config key, value)
     label_counts: list[int] | None = None
     label_note: str | None = None
+    args_compared: list[str] | None = None
+    args_missing: list[str] = field(default_factory=list)
+    args_note: str | None = None
 
     def check_labels(self, counts: Sequence[int]) -> None:
         self.label_counts = [int(n) for n in counts]
@@ -535,6 +575,31 @@ class StartCheck:
         counts = self._read_label_counts(train_dataloader)
         if counts is not None:
             self.check_labels(counts)
+        self.check_args(args)
+
+    def check_args(self, args: Any) -> None:
+        """Compare the Hugging Face trainer's own arguments with the config: AlignTune and TRL may change or drop a keyword.
+
+        An attribute the installed version does not have is listed as not found, not as a difference."""
+        if args is None:
+            self.args_note = "the callback received no TrainingArguments"
+            return
+        compared, missing, wrong = [], [], []
+        for name, (key, want) in self.expected_args.items():
+            if not hasattr(args, name):
+                missing.append(name)
+                continue
+            have = getattr(args, name)
+            compared.append(name)
+            if not _same_value(have, want):
+                wrong.append(f"{name} is {have!r} but the config asks {want!r} ({key})")
+        self.args_compared = sorted(compared) or None
+        self.args_missing = sorted(missing)
+        if wrong:
+            raise FinetuneError(
+                "the Hugging Face trainer was built with other arguments than the config: " + "; ".join(wrong)
+                + ". AlignTune or TRL changed or ignored a setting; see docs/toolkit-notes.md."
+            )
 
     def _read_label_counts(self, loader: Any) -> list[int] | None:
         if loader is None:
@@ -1029,13 +1094,18 @@ def _train_and_check(
     params = build_trainer_params(
         cfg, data_path=check.path, adapter_dir=work, chat_template_path=work / TEMPLATE_FILE, seed=seed, max_steps=args.max_steps
     )
-    start_check = StartCheck(rows=cfg.checks.label_check_rows, minimum=cfg.checks.label_tokens_min, maximum=cfg.checks.label_tokens_max)
+    start_check = StartCheck(
+        rows=cfg.checks.label_check_rows, minimum=cfg.checks.label_tokens_min, maximum=cfg.checks.label_tokens_max,
+        expected_args=expected_trainer_args(cfg, seed),
+    )
     trainer = hooks.trainer_factory(params, start_check)
     result = trainer.train()
     del trainer
     _release_memory()
     if start_check.label_counts is None:
         print(f"note: the labelled-token check could not run ({start_check.label_note or 'the trainer never reported its rows'})", file=sys.stderr)
+    if start_check.args_compared is None:
+        print(f"note: the trainer-argument check could not run ({start_check.args_note or 'no argument was found to compare'})", file=sys.stderr)
 
     _check_adapter(work, cfg, "work")
     rows_seen = result.get("rows_seen")
@@ -1071,6 +1141,11 @@ def _train_and_check(
         "last_logged_loss": float(format(history[-1][1], _FLOAT)),
         "history": history,
         "loss_reason": reason,
+        "args_check": (
+            "unavailable"
+            if start_check.args_compared is None
+            else {"compared": start_check.args_compared, "not_found": start_check.args_missing}
+        ),
         "label_check": (
             "unavailable"
             if start_check.label_counts is None
@@ -1115,6 +1190,7 @@ def _summary(
         "loss_history": _tidy(sample_history(trained["history"], cfg.checks.history_points)),
         "loss_ok": True,
         "loss_reason": trained["loss_reason"],
+        "args_check": trained["args_check"],
         "label_check": trained["label_check"],
         "chat_template_sha256": template_sha256,
         "wall_clock_seconds": float(format(seconds, _FLOAT)),

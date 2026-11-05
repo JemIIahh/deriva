@@ -41,6 +41,21 @@ def losses_down(n=6):
     return [[i + 1, 2.0 / (i + 1)] for i in range(n)]
 
 
+def trainer_args_for(p, overrides):
+    """The TrainingArguments a faithful Hugging Face trainer ends up with for these AlignTune keywords."""
+    args = {
+        "fp16": p["fp16"], "bf16": p["bf16"], "learning_rate": p["learning_rate"],
+        "num_train_epochs": float(p["num_epochs"]),  # transformers keeps the epochs as a float
+        "per_device_train_batch_size": p["batch_size"], "gradient_accumulation_steps": p["gradient_accumulation_steps"],
+        "max_length": p["max_seq_length"], "assistant_only_loss": p["assistant_only_loss"], "seed": p["seed"],
+        "gradient_checkpointing": p["gradient_checkpointing"], "save_total_limit": p["save_total_limit"],
+        "warmup_steps": p["warmup_ratio"],  # a float below 1 is a ratio in transformers >= 5.2
+        "lr_scheduler_type": types.SimpleNamespace(value=p["lr_scheduler"]),  # an enum in transformers
+    }
+    args.update(overrides)
+    return types.SimpleNamespace(**args)
+
+
 class FakeTrainer:
     """What the AlignTune wrapper hands back: train() writes the adapter files and returns the numbers."""
 
@@ -55,6 +70,8 @@ class FakeTrainer:
         if owner.label_counts is not None and self.start_check is not None:
             counts = owner.label_counts if owner.label_counts != "default" else [3] * self.start_check.rows
             self.start_check.check_labels(counts)
+        if owner.trainer_args is not None and self.start_check is not None:
+            self.start_check.check_args(trainer_args_for(p, owner.arg_overrides))
         out = Path(p["output_dir"])
         out.mkdir(parents=True, exist_ok=True)
         rows = sum(1 for line in Path(p["dataset_name"]).read_text(encoding="utf-8").splitlines() if line.strip())
@@ -96,6 +113,8 @@ class FakeFactory:
         self.steps = None
         self.rows_seen = None
         self.label_counts = "default"  # None: the trainer never shows its tokenised rows
+        self.trainer_args = "default"  # None: the trainer never shows its TrainingArguments
+        self.arg_overrides: dict = {}  # attribute -> value the Hugging Face trainer ended up with instead
         self.start_checks: list = []
         self.template_texts: list[str] = []
         self.write_adapter = True
@@ -1672,6 +1691,99 @@ def test_help_says_which_imports_a_dry_run_makes(capsys):
     assert "transformers" in flat and "trl" in flat and "loads no model" in flat
 
 
+# --- the trainer's arguments against the config ---------------------------------------------------------------------
+
+
+ARG_NAMES = sorted(
+    ["fp16", "bf16", "learning_rate", "num_train_epochs", "per_device_train_batch_size", "gradient_accumulation_steps",
+     "max_length", "assistant_only_loss", "seed", "gradient_checkpointing", "save_total_limit", "warmup_steps",
+     "lr_scheduler_type"]
+)
+
+
+def test_trainer_arguments_that_match_the_config_are_recorded(world):
+    assert world.run() == 0
+    assert world.summary()["args_check"] == {"compared": ARG_NAMES, "not_found": []}
+
+
+def test_the_seed_override_is_what_the_arguments_are_compared_with(world):
+    assert world.run("--seed", "123") == 0
+    assert "seed" in world.summary()["args_check"]["compared"]
+
+
+@pytest.mark.parametrize(
+    "name, wrong, config_key",
+    [
+        ("fp16", False, "train.fp16"),
+        ("bf16", True, "train.bf16"),
+        ("learning_rate", 1.0e-5, "train.learning_rate"),
+        ("num_train_epochs", 9.0, "train.epochs"),
+        ("per_device_train_batch_size", 4, "train.per_device_batch_size"),
+        ("gradient_accumulation_steps", 3, "train.gradient_accumulation_steps"),
+        ("max_length", 512, "train.max_seq_length"),
+        ("assistant_only_loss", False, "train.assistant_only_loss"),
+        ("seed", 3, "train.seed"),
+        ("gradient_checkpointing", False, "train.gradient_checkpointing"),
+        ("save_total_limit", 9, "train.save_total_limit"),
+        ("warmup_steps", 0.0, "train.warmup_ratio"),
+        ("lr_scheduler_type", types.SimpleNamespace(value="linear"), "train.lr_scheduler"),
+    ],
+)
+def test_a_trainer_argument_that_differs_from_the_config_stops_the_run(world, capsys, name, wrong, config_key):
+    err = failed_run(world, capsys, arg_overrides={name: wrong})
+    assert name in err and config_key in err
+    assert world.merge.calls == []
+
+
+def test_arguments_that_are_not_shown_are_recorded_as_unavailable(world):
+    world.factory.trainer_args = None
+    assert world.run() == 0
+    assert world.summary()["args_check"] == "unavailable"
+
+
+def test_start_check_accepts_what_transformers_stores_differently():
+    check = finetune.StartCheck(rows=1, minimum=1, maximum=16, expected_args={
+        "num_train_epochs": ("train.epochs", 2), "lr_scheduler_type": ("train.lr_scheduler", "cosine"),
+        "fp16": ("train.fp16", True), "learning_rate": ("train.learning_rate", 0.0002),
+    })
+    class Scheduler(str):  # transformers' SchedulerType is a str-valued enum
+        value = "cosine"
+    check.check_args(types.SimpleNamespace(
+        num_train_epochs=2.0, lr_scheduler_type=Scheduler("SchedulerType.COSINE"), fp16=True, learning_rate=0.0002
+    ))
+    assert check.args_compared == ["fp16", "learning_rate", "lr_scheduler_type", "num_train_epochs"]
+
+
+def test_start_check_does_not_take_a_number_for_a_flag():
+    check = finetune.StartCheck(rows=1, minimum=1, maximum=16, expected_args={"fp16": ("train.fp16", True)})
+    with pytest.raises(finetune.FinetuneError, match="fp16"):
+        check.check_args(types.SimpleNamespace(fp16=1))
+
+
+def test_start_check_lists_every_difference_and_names_the_missing_ones():
+    check = finetune.StartCheck(rows=1, minimum=1, maximum=16, expected_args={
+        "seed": ("train.seed", 1), "max_length": ("train.max_seq_length", 2048), "fp16": ("train.fp16", True),
+    })
+    with pytest.raises(finetune.FinetuneError) as caught:
+        check.check_args(types.SimpleNamespace(seed=2, max_length=4096))  # no fp16 attribute at all
+    message = str(caught.value)
+    assert "seed" in message and "max_length" in message and "fp16" not in message
+    check.expected_args.pop("seed"), check.expected_args.pop("max_length")
+    check.check_args(types.SimpleNamespace())
+    assert check.args_compared is None and check.args_missing == ["fp16"]
+
+
+def test_observe_checks_the_arguments_the_callback_receives():
+    check = finetune.StartCheck(rows=1, minimum=1, maximum=16, expected_args={"seed": ("train.seed", 1)})
+    check.observe(train_dataloader=labels([{"labels": [-100, 5]}]), args=types.SimpleNamespace(seed=1))
+    assert check.args_compared == ["seed"]
+    with pytest.raises(finetune.FinetuneError, match="seed"):
+        check.observe(train_dataloader=labels([{"labels": [-100, 5]}]), args=types.SimpleNamespace(seed=2))
+    other = finetune.StartCheck(rows=1, minimum=1, maximum=16, expected_args={"seed": ("train.seed", 1)})
+    other.observe(train_dataloader=labels([{"labels": [-100, 5]}]), args=None)
+    assert other.args_compared is None and "no TrainingArguments" in other.args_note
+
+
 # --- the real AlignTune wrapper, against a fake aligntune module ---------------------------------------------------
 
 
@@ -1742,8 +1854,8 @@ def test_the_aligntune_wrapper_adds_a_callback_that_runs_the_start_check(monkeyp
     trainer = finetune.aligntune_factory({}, check)
     callbacks = trainer.inner.get_hf_callbacks()
     assert callbacks[0] == "aligntune's own adapter" and len(callbacks) == 2  # AlignTune's own callback is kept
-    callbacks[1].on_train_begin("args", "state", "control", train_dataloader=labels([{"labels": [-100, 5]}] * 3))
-    assert check.label_counts == [1, 1]
+    callbacks[1].on_train_begin(types.SimpleNamespace(seed=1), "state", "control", train_dataloader=labels([{"labels": [-100, 5]}] * 3))
+    assert check.label_counts == [1, 1] and check.args_compared is None  # no expected arguments were given here
 
 
 def test_the_aligntune_wrapper_without_a_start_check_leaves_the_callbacks_alone(monkeypatch):

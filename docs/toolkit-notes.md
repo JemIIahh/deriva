@@ -592,6 +592,15 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   `get_hf_callbacks`, which `sft_generation.py` passes as `callbacks=`. If the hook, the dataloader or the
   `labels` column is not there, the summary says `label_check: "unavailable"` and the run goes on. Not run: that
   the rows in `train_dataloader.dataset` carry `labels` as in TRL's source.
+- **The trainer-argument check.** The same `on_train_begin` callback receives `args`, the trainer's own
+  `TrainingArguments` (an `SFTConfig`), and `finetune.py` compares thirteen attributes with the config:
+  `fp16`, `bf16`, `learning_rate`, `num_train_epochs`, `per_device_train_batch_size`,
+  `gradient_accumulation_steps`, `max_length`, `assistant_only_loss`, `seed`, `gradient_checkpointing`,
+  `save_total_limit`, `warmup_steps` (the config's `warmup_ratio`; a float below 1 is a ratio in transformers
+  >= 5.2) and `lr_scheduler_type` (an enum, compared by its value). A difference stops the run and names the
+  config key; an attribute the installed version lacks is listed as `not_found`; if nothing could be compared the
+  summary says `args_check: "unavailable"`. Not run: that these attribute names and types are what the installed
+  transformers 5.15 and TRL 1.7.1 give.
 - `loss_type` is `"nll"` (AlignTune accepts only `nll` and `dft`, so TRL's newer `chunked_nll` is not
   reachable). Full logits over the 262,144-token vocabulary are therefore materialised.
 - No packing (`packing=False`). TRL's `max_length` is AlignTune's `max_seq_length`, truncating from the start
