@@ -63,13 +63,13 @@ from __future__ import annotations
 import json
 import math
 import numbers
-import os
 import shutil
 import sys
-import uuid
 from pathlib import Path
 
 from safetensors import safe_open
+
+from msd.atomicdir import atomic_output_dir, check_out_dir
 
 SINGLE_FILE = "model.safetensors"
 INDEX_FILE = "model.safetensors.index.json"
@@ -311,15 +311,6 @@ def _copy_other_files(root: Path, folder: Path) -> None:
         shutil.copyfile(path, folder / path.name)
 
 
-def _fsync_all(folder: Path) -> None:
-    for path in folder.iterdir():
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-
 def _check_t(t) -> float:
     if isinstance(t, bool) or not isinstance(t, numbers.Real):
         raise TypeError(f"t must be a real number, got {type(t).__name__}")
@@ -329,38 +320,20 @@ def _check_t(t) -> float:
     return t
 
 
-def _check_out_dir(out_dir: Path) -> None:
-    if out_dir.exists():
-        if not out_dir.is_dir():
-            raise FileExistsError(f"out_dir {out_dir} exists and is not a directory")
-        if any(out_dir.iterdir()):
-            raise FileExistsError(f"out_dir {out_dir} is not empty; refusing to write into it")
-
-
 def blend_state_dicts(a1_dir: Path, a0_dir: Path, t: float, out_dir: Path) -> None:
     """Write `(1 - t) * A1 + t * A0` to `out_dir`, shard by shard. See the module docstring for the rules."""
     if sys.byteorder != "little":  # pragma: no cover - the writer emits little-endian bytes from memory
         raise RuntimeError("msd.blend writes tensor bytes as they are in memory and supports little-endian hosts only")
     t = _check_t(t)
     out_dir = Path(out_dir)
-    _check_out_dir(out_dir)
+    check_out_dir(out_dir)
     _torch()
     a1, a0 = _read_model("A1", a1_dir), _read_model("A0", a0_dir)
     _check_compatible(a1, a0)
 
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
-    folder = out_dir.parent / f".{out_dir.name}.{uuid.uuid4().hex[:8]}.partial"
-    folder.mkdir()
-    try:
+    with atomic_output_dir(out_dir) as folder:
         for filename in a1.files:
             _write_shard(a1, a0, t, filename, folder)
         if a1.sharded:
             _write_index(a1, folder)
         _copy_other_files(a1.root, folder)
-        _fsync_all(folder)
-        if out_dir.exists():  # an empty directory: a rename onto it works on POSIX, a removal first works everywhere
-            out_dir.rmdir()
-        os.replace(folder, out_dir)
-    except BaseException:
-        shutil.rmtree(folder, ignore_errors=True)
-        raise
