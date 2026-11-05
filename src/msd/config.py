@@ -22,5 +22,16 @@ KAPPA_LOW = 0.6
 GATE_MIN_RISE = 0.10
 GATE_MIN_LANGS = 2
 
-# Model name -> Hugging Face id. Filled in a later task.
-MODEL_IDS: dict[str, str] = {}
+# Arm name -> Hugging Face repo id. Only the two public starting points are known here; A1, A2 and
+# the other derived arms are added when they are pushed to our own repos.
+# Verified 2026-11-05 against the public Hugging Face API (no token needed):
+#   GET https://huggingface.co/api/models/CohereLabs/tiny-aya-global  -> HTTP 200, gated "auto"
+#   GET https://huggingface.co/api/models/CohereLabs/tiny-aya-base    -> HTTP 200, gated "auto"
+# Both are gated (accept the licence on the model page, then download with a token). The model card
+# of Global lists base_model CohereLabs/tiny-aya-base. Other Tiny Aya variants (not used here):
+# tiny-aya-earth, tiny-aya-fire, tiny-aya-water (regional), tiny-aya-l2-thinker, tiny-aya-en-thinker,
+# tiny-aya-base-32K, and GGUF builds of the above.
+MODEL_IDS: dict[str, str] = {
+    "A0": "CohereLabs/tiny-aya-global",  # aligned model, no fine-tune ("before"); ReSta's aligned side
+    "BASE": "CohereLabs/tiny-aya-base",  # pre-alignment base; ReSta's base side
+}
