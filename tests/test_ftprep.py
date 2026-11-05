@@ -405,3 +405,24 @@ def test_fetch_language_refuses_a_short_read():
 def test_fetch_languages_are_the_study_languages_the_source_covers():
     assert set(ftprep.SOURCE_LANGS) == {"en", "hi", "ar", "sw"}
     assert set(ftprep.SOURCE_LANGS) <= set(LANGS)
+
+
+def test_dataset_revision_reads_the_commit_sha_and_last_modified():
+    seen = []
+
+    def get_json(url):
+        seen.append(url)
+        return {"id": "CohereLabs/Global-MMLU", "sha": "abc123", "lastModified": "2025-08-14T20:12:53.000Z"}
+
+    info = ftprep.dataset_revision(get_json=get_json)
+    assert info == {"revision": "abc123", "last_modified": "2025-08-14T20:12:53.000Z"}
+    assert seen == ["https://huggingface.co/api/datasets/CohereLabs/Global-MMLU"]
+
+
+def test_dataset_revision_is_none_when_the_api_has_no_sha_or_cannot_be_reached():
+    assert ftprep.dataset_revision(get_json=lambda url: {"id": "x"}) is None
+
+    def offline(url):
+        raise OSError("offline")
+
+    assert ftprep.dataset_revision(get_json=offline) is None

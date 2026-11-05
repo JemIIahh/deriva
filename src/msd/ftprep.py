@@ -43,6 +43,7 @@ OPTION_FIELDS = ("option_a", "option_b", "option_c", "option_d")
 RAW_FIELDS = ("sample_id", "subject", "question", *OPTION_FIELDS, "answer")
 ANSWERS = ("A", "B", "C", "D")
 HF_ROWS_URL = "https://datasets-server.huggingface.co/rows"
+HF_API_URL = "https://huggingface.co/api/datasets"
 
 # The fixed one-line instruction that ends every prompt. These are template strings written for
 # this task (not dataset content); a native speaker should read them before release. The reply
@@ -394,6 +395,31 @@ def http_get_page(lang: str, offset: int, length: int, timeout: float = 60.0) ->
         if exc.code == 429:
             raise RateLimited(float(exc.headers.get("Retry-After") or 30)) from exc
         raise
+
+
+def http_get_json(url: str, timeout: float = 30.0) -> Mapping[str, Any]:
+    """A public JSON document (no token)."""
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 (fixed https URL)
+        return json.load(resp)
+
+
+def dataset_revision(*, get_json: Callable[[str], Mapping[str, Any]] = http_get_json) -> dict[str, str] | None:
+    """The dataset's current commit on the Hub: {"revision": sha, "last_modified": ISO time}.
+
+    The rows endpoint does not say which commit it served, so provenance is the head commit seen
+    at fetch time (its last-modified date tells whether it predates the fetch). None when the
+    Hub API cannot be reached or gives no sha: the revision is recorded when cheap, never required.
+    """
+    try:
+        payload = get_json(f"{HF_API_URL}/{DATASET}")
+    except Exception:  # noqa: BLE001 (offline, HTTP error or bad JSON: provenance is best effort)
+        return None
+    sha = payload.get("sha")
+    if not isinstance(sha, str) or not sha:
+        return None
+    return {"revision": sha, "last_modified": str(payload.get("lastModified") or "")}
 
 
 def fetch_language(

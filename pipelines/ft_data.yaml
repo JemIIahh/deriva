@@ -8,7 +8,7 @@
 #   python scripts/build_ft_data.py fetch && python scripts/build_ft_data.py prepare
 #   envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir data/ft/curated
 #   python scripts/build_ft_data.py finalize
-#   python scripts/validate_ft_data.py --langs en,hi,ar,sw --pipeline pipelines/ft_data.yaml
+#   python scripts/validate_ft_data.py --langs en,hi,ar,sw   # checks pipelines/ft_data.yaml's allowlist by default
 # Check without running:
 #   envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir <scratch> --dry-run
 #
@@ -39,9 +39,11 @@ extra:
   source: "CohereLabs/Global-MMLU (fine-tune subset), Apache-2.0; test split, config en / hi / ar / sw"
   # Harmless-subject allowlist: everyday civics, geography, history, basic science, health
   # literacy. Left out on purpose: security_studies, computer_security, virology, medical_genetics,
-  # professional_medicine and professional_law, moral_scenarios, moral_disputes, philosophy,
-  # world_religions, human_sexuality, international_law, jurisprudence, business_ethics,
-  # us_foreign_policy, the chemistry and engineering subjects, and anything else not listed.
+  # professional_medicine, clinical_knowledge and professional_law, moral_scenarios,
+  # moral_disputes, philosophy, world_religions, human_sexuality, sociology, international_law,
+  # jurisprudence, business_ethics, us_foreign_policy, the chemistry and engineering subjects, and
+  # anything else not listed. (sociology and clinical_knowledge were considered and dropped:
+  # contested social science and clinical medicine are not everyday basics.)
   harmless_subjects:
     - high_school_government_and_politics
     - high_school_geography
@@ -50,7 +52,6 @@ extra:
     - high_school_us_history
     - prehistory
     - global_facts
-    - sociology
     - high_school_psychology
     - high_school_biology
     - conceptual_physics
@@ -58,7 +59,6 @@ extra:
     - nutrition
     - human_aging
     - anatomy
-    - clinical_knowledge
   split_seed: 20261105    # one seeded ranking of source items decides the split for every language
   heldout_pool: 260       # candidate items per language for the heldout split ...
   train_pool: 1800        # ... and for train, before CuratorKIT drops anything

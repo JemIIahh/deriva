@@ -9,7 +9,7 @@ recorded. The whole run, in order (from the repository root):
     python scripts/build_ft_data.py prepare                # -> data/ft/prep/candidates.jsonl
     envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir data/ft/curated
     python scripts/build_ft_data.py finalize               # -> data/ft/train.jsonl, heldout.jsonl
-    python scripts/validate_ft_data.py --langs en,hi,ar,sw --pipeline pipelines/ft_data.yaml
+    python scripts/validate_ft_data.py --langs en,hi,ar,sw
 
 fetch needs the network (the public Hugging Face datasets-server, no token) and only reads the
 allowlisted subjects of the test split. prepare and finalize run in the core venv; only the
@@ -66,6 +66,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         path = ftprep.raw_path(args.raw, lang)
         if path.is_file():
             info[lang] = {"rows": sum(1 for line in path.open(encoding="utf-8") if line.strip()), "sha256": ftprep.file_sha256(path)}
+    revision = ftprep.dataset_revision()
+    if revision is None:
+        print("warning: could not read the dataset revision from the Hub API; FETCH.json records null")
     write_json(
         Path(args.raw) / "FETCH.json",
         {
@@ -74,6 +77,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             "split": ftprep.SPLIT,
             "via": ftprep.HF_ROWS_URL,
             "fetched_on": datetime.date.today().isoformat(),
+            "revision": revision,  # head commit seen at fetch time: {"revision", "last_modified"} or null
             "subjects": sorted(settings["harmless_subjects"]),
             "files": info,
         },

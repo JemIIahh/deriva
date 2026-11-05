@@ -23,13 +23,22 @@ Rules, by class:
   overlap       train and heldout share no prompt (norm_text of the full user turn), no source
                 item (the id without its language prefix, so a question and its translation count
                 as one), no passage (the text above the question line, several MMLU questions
-                share one), and neither shares a prompt with the safety dev or report splits
+                share one), and neither shares a prompt with the safety dev or report splits.
+                All of this compares text of ONE language at a time: a Hindi passage in train and
+                its English original in heldout are not compared here. That cross-lingual case is
+                closed at prepare time (msd.ftprep groups every language's version of an item and
+                of a passage through the English item and passage, then assigns whole groups to
+                one split), so the validator only has to see same-language text.
   imbalance     a language's train count is more than 20% off the mean of the expected languages
   language      the question is written in the script of its language code (Devanagari for hi,
                 Arabic for ar, Latin for en / sw / hinglish); en versus sw is NOT told apart
   missing_lang  an expected language has no train rows or no heldout rows
   subject       with an allowlist, every item belongs to a harmless-subject (Global-MMLU ids are
-                `<lang>:<subject>/<split>/<n>`, so the subject is in the id)
+                `<lang>:<subject>/<split>/<n>`, so the subject is in the id). The command line
+                turns this on by default (the repository's pipelines/ft_data.yaml) and only
+                `--no-subject-check` skips it; the report always says which it was.
+  safety_empty  a language the safety test set lists as covered has no dev prompts or no report
+                prompts, which would make the leakage check pass without comparing anything
 """
 
 from __future__ import annotations
@@ -58,6 +67,7 @@ RULES: tuple[str, ...] = (
     "language",
     "missing_lang",
     "subject",
+    "safety_empty",
 )
 # 0 ok, 1 several classes failed, 2 bad arguments or unreadable input (as in build_testset.py).
 EXIT_CODES: dict[str, int] = {
@@ -69,6 +79,7 @@ EXIT_CODES: dict[str, int] = {
     "language": 15,
     "missing_lang": 16,
     "subject": 17,
+    "safety_empty": 18,
 }
 IMBALANCE_TOLERANCE = 0.20
 MAX_ANSWER_WORDS = 8
@@ -329,6 +340,9 @@ class Report:
     expected_langs: tuple[str, ...] = LANGS
     missing_expected: list[str] = field(default_factory=list)
     not_covered: list[str] = field(default_factory=list)
+    allowed_subjects: tuple[str, ...] | None = None  # None: the subject allowlist was NOT checked
+    subject_rows_checked: int = 0
+    safety_counts: dict[str, tuple[int, int]] | None = None  # lang -> (dev, report) prompts; None: not checked
 
     @property
     def ok(self) -> bool:
@@ -401,26 +415,30 @@ def read_jsonl_records(path: str | Path, where: str) -> tuple[list[Any], list[Pr
     return records, problems
 
 
-def load_safety_texts(testset_dir: str | Path) -> tuple[list[str], list[str], list[str]]:
-    """(dev texts, report texts, languages found) from `<testset_dir>/<lang>/{dev,report}.jsonl`.
+def load_safety_texts(testset_dir: str | Path) -> tuple[list[str], list[str], dict[str, tuple[int, int]]]:
+    """(dev texts, report texts, {language: (dev prompts, report prompts)}) from the test set.
 
-    Every study-language directory found is read, so a partly built test set is checked as far as
-    it exists; the languages found are returned so the caller can say what the check covered.
+    Reads `<testset_dir>/<lang>/{dev,report}.jsonl`. Every study-language directory found is read,
+    so a partly built test set is checked as far as it exists; the per-language counts say what
+    the check covered (and `validate` fails a language whose files are empty).
     """
     root = Path(testset_dir)
     dev: list[str] = []
     report: list[str] = []
-    found: list[str] = []
+    found: dict[str, tuple[int, int]] = {}
     for lang in LANGS:
         folder = root / lang
         if not folder.is_dir():
             continue
+        sizes: list[int] = []
         for split, sink in (("dev", dev), ("report", report)):
             path = folder / f"{split}.jsonl"
             if not path.is_file():
                 raise FileNotFoundError(f"{path} not found (the {lang} test-set directory is incomplete)")
-            sink.extend(p.text for p in read_jsonl(path, Prompt))
-        found.append(lang)
+            texts = [p.text for p in read_jsonl(path, Prompt)]
+            sink.extend(texts)
+            sizes.append(len(texts))
+        found[lang] = (sizes[0], sizes[1])
     if not found:
         raise FileNotFoundError(f"no language directory ({', '.join(LANGS)}) under {root}")
     return dev, report, found
@@ -483,7 +501,11 @@ def _check_split(
     allowed_subjects: Collection[str] | None,
     problems: list[Problem],
 ) -> list[dict[str, Any]]:
-    """Per-record rules; returns the structurally usable records for the cross-record rules."""
+    """Per-record rules; returns the structurally usable records for the cross-record rules.
+
+    A usable record is one whose subject was read, so `len(result)` is the number of rows the
+    subject allowlist was applied to when there is one.
+    """
     usable: list[dict[str, Any]] = []
     for rec in records:
         bad, ok = _structure(rec)
@@ -515,10 +537,16 @@ def validate(
     safety_dev: Iterable[str] = (),
     safety_report: Iterable[str] = (),
     allowed_subjects: Collection[str] | None = None,
+    safety_counts: dict[str, tuple[int, int]] | None = None,
     imbalance_tolerance: float = IMBALANCE_TOLERANCE,
     read_problems: Sequence[Problem] = (),
 ) -> Report:
-    """Run every rule on the train and heldout records and return the Report."""
+    """Run every rule on the train and heldout records and return the Report.
+
+    `allowed_subjects=None` means the subject rule is off, and the Report says so. `safety_counts`
+    is what `load_safety_texts` returned for the languages the safety texts came from (None when
+    no safety texts were loaded): a listed language with no dev or no report prompt fails.
+    """
     expected = tuple(lang for lang in LANGS if lang in set(expected_langs))
     safety_dev, safety_report = list(safety_dev), list(safety_report)
     problems: list[Problem] = list(read_problems)
@@ -547,6 +575,9 @@ def validate(
     for key, rid in prompts["heldout"].items():
         if key in prompts["train"]:
             problems.append(Problem("overlap", "heldout", rid, f"prompt also in train ({prompts['train'][key]})"))
+    # Same-language passages only. The cross-lingual case (a Hindi passage in train, its English
+    # original in heldout) cannot be seen from the text; prepare keeps every language's version
+    # of a passage on one side by grouping through the English passage (msd.ftprep.item_groups).
     passages: dict[str, dict[str, str]] = {"train": {}, "heldout": {}}
     for where, recs in (("train", train_ok), ("heldout", held_ok)):
         for rec in recs:
@@ -580,6 +611,18 @@ def validate(
                         Problem("overlap", where, ids[0] if ids else None, f"{where} overlaps the safety {name} split: {exc}")
                     )
 
+    for lang, (n_dev, n_report) in (safety_counts or {}).items():
+        if n_dev == 0 or n_report == 0:
+            problems.append(
+                Problem(
+                    "safety_empty",
+                    "safety",
+                    None,
+                    f"safety test set lists {lang} as covered but has {n_dev} dev and {n_report} report prompts, "
+                    "so the leakage check compares nothing for it",
+                )
+            )
+
     counts = {"train": _counts(train_ok), "heldout": _counts(held_ok)}
     for message in _imbalanced(counts["train"], expected, imbalance_tolerance):
         problems.append(Problem("imbalance", "train", None, message))
@@ -594,11 +637,26 @@ def validate(
     present = set(counts["train"]) | set(counts["heldout"])
     not_covered = [lang for lang in LANGS if lang not in expected and lang not in present]
 
-    return Report(problems, warnings, counts, expected, missing, not_covered)
+    return Report(
+        problems,
+        warnings,
+        counts,
+        expected,
+        missing,
+        not_covered,
+        allowed_subjects=None if allowed_subjects is None else tuple(sorted(allowed_subjects)),
+        subject_rows_checked=len(train_ok) + len(held_ok) if allowed_subjects is not None else 0,
+        safety_counts=None if safety_counts is None else dict(safety_counts),
+    )
 
 
-def render(report: Report, safety_langs: Sequence[str] | None = None, max_per_rule: int = 5) -> str:
-    """The report as text for the command line."""
+def render(report: Report, max_per_rule: int = 5) -> str:
+    """The report as text for the command line.
+
+    Two status lines are always printed, whether the check ran or not: the subject allowlist (which
+    subjects, how many rows, or NOT checked) and the safety test set (which languages and how many
+    prompts, or NOT checked), so a skipped or vacuous check can never read as a pass.
+    """
     lines: list[str] = []
     for split in ("train", "heldout"):
         counts = report.counts[split]
@@ -609,12 +667,23 @@ def render(report: Report, safety_langs: Sequence[str] | None = None, max_per_ru
         lines.append(f"missing expected languages: {', '.join(report.missing_expected)}")
     if report.not_covered:
         lines.append(f"not covered (in the study, no rows, not expected here): {', '.join(report.not_covered)}")
-    if safety_langs is None:
+    if report.allowed_subjects is None:
+        lines.append("subject allowlist: NOT checked (--no-subject-check was given; no subject is enforced)")
+    else:
+        names = ", ".join(report.allowed_subjects)
+        lines.append(
+            f"subject allowlist: checked {report.subject_rows_checked} rows "
+            f"against {len(report.allowed_subjects)} subjects ({names})"
+        )
+    if report.safety_counts is None:
         lines.append("safety test set: NOT checked (skipped)")
     else:
-        lacking = [lang for lang in LANGS if lang not in safety_langs]
+        covered = list(report.safety_counts)
+        lacking = [lang for lang in LANGS if lang not in covered]
         tail = f"; not built yet, so not checked: {', '.join(lacking)}" if lacking else ""
-        lines.append(f"safety test set covers: {', '.join(safety_langs)}{tail}")
+        lines.append(f"safety test set covers: {', '.join(covered)}{tail}")
+        sizes = "; ".join(f"{lang}: {d} dev + {r} report" for lang, (d, r) in report.safety_counts.items())
+        lines.append(f"safety prompts compared against: {sizes}")
     for warning in report.warnings:
         lines.append(f"warning: {warning}")
     for rule in report.failed_rules():
@@ -625,5 +694,9 @@ def render(report: Report, safety_langs: Sequence[str] | None = None, max_per_ru
             lines.append(f"  [{label}] {p.message}")
         if len(found) > max_per_rule:
             lines.append(f"  ... and {len(found) - max_per_rule} more")
-    lines.append("RESULT: OK" if report.ok else f"RESULT: FAILED ({', '.join(report.failed_rules())})")
+    if report.ok:
+        skipped = " (subject allowlist NOT checked)" if report.allowed_subjects is None else ""
+        lines.append(f"RESULT: OK{skipped}")
+    else:
+        lines.append(f"RESULT: FAILED ({', '.join(report.failed_rules())})")
     return "\n".join(lines)

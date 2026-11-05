@@ -138,6 +138,10 @@ def test_the_settings_in_the_real_pipeline_yaml_are_complete():
     assert settings["train_pool"] >= settings["train_cap"] and settings["heldout_pool"] >= settings["heldout_cap"]
     assert "virology" not in settings["harmless_subjects"]
     assert not {"security_studies", "computer_security", "moral_scenarios"} & settings["harmless_subjects"]
+    # borderline subjects dropped in fix round 1: sociology is contested social science and
+    # clinical_knowledge is clinical medicine, neither is everyday civics or basic science
+    assert not {"sociology", "clinical_knowledge"} & settings["harmless_subjects"]
+    assert len(settings["harmless_subjects"]) == 14
     assert ftdata.load_allowed_subjects(Path(__file__).resolve().parent.parent / "pipelines" / "ft_data.yaml") == settings["harmless_subjects"]
 
 

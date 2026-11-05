@@ -222,8 +222,9 @@
     item id, so a question and its translations share a split. No Hinglish: those rows come
     from translating the Hindi rows. Extractive-QA alternatives checked and not used:
     google-research-datasets/tydiqa (see its excluded entry; no Hindi) and ai4bharat/IndicQA
-    (front matter cc-by-4.0, Hindi only, under 1K rows, stub card). Cite Global-MMLU (Singh et
-    al. 2024); the same entry's cross-check use is listed above.
+    (front matter cc-by-4.0, Hindi is the only study language it covers (the card lists 11
+    Indic languages), under 1K rows, stub card). Cite Global-MMLU (Singh et al. 2024); the same
+    entry's cross-check use is listed above.
 
 # ------------------------------------------------------------------ excluded
 

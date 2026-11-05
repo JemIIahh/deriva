@@ -618,10 +618,32 @@ def test_subject_allowlist_passes_when_every_item_is_on_it():
     assert run(train, held, allowed_subjects={"history"}).ok
 
 
-def test_without_an_allowlist_the_subject_is_not_checked():
+def test_without_an_allowlist_the_report_says_the_subjects_were_not_checked():
+    # the library keeps "no allowlist" as an explicit opt-out; the command line turns the check
+    # on by default (see the CLI tests below), and the report must never hide that it was off
     train, held = sets()
     train[0] = rec("en", 0, item="virology/test/7")
-    assert run(train, held).ok
+    report = run(train, held)
+    assert report.allowed_subjects is None
+    text = ftdata.render(report)
+    assert "subject allowlist: NOT checked" in text
+    assert "RESULT: OK (subject allowlist NOT checked)" in text
+
+
+def test_the_report_names_the_subjects_and_how_many_rows_were_checked():
+    train, held = sets()
+    report = run(train, held, allowed_subjects={"history", "geography"})
+    assert report.subject_rows_checked == len(train) + len(held)
+    text = ftdata.render(report)
+    assert f"subject allowlist: checked {len(train) + len(held)} rows against 2 subjects (geography, history)" in text
+    assert "subject allowlist: NOT checked" not in text
+
+
+def test_rows_that_cannot_be_read_are_not_counted_as_subject_checked():
+    train, held = sets()
+    train.append({"id": "en:history/test/99", "lang": "en"})  # unusable: no messages, no gold
+    report = run(train, held, allowed_subjects={"history"})
+    assert report.subject_rows_checked == len(train) - 1 + len(held)
 
 
 # --- exit codes ------------------------------------------------------------------------------
@@ -663,10 +685,48 @@ def test_load_safety_texts_reads_every_language_found(tmp_path):
         write_jsonl(tmp_path / lang / "report.jsonl", [prompt(i, lang, "report", f"{t} rep") for i, t in enumerate(texts)])
     (tmp_path / "MANIFEST.dry.json").write_text("{}")  # a file, not a language directory
     (tmp_path / "scratch").mkdir()  # a directory that is not a study language
-    dev, rep, langs = ftdata.load_safety_texts(tmp_path)
+    dev, rep, counts = ftdata.load_safety_texts(tmp_path)
     assert sorted(dev) == ["e1 dev", "e2 dev", "s1 dev"]
     assert sorted(rep) == ["e1 rep", "e2 rep", "s1 rep"]
-    assert langs == ["en", "sw"]
+    assert list(counts) == ["en", "sw"]
+    assert counts == {"en": (2, 2), "sw": (1, 1)}  # (dev prompts, report prompts) per language
+
+
+def test_load_safety_texts_counts_an_empty_split_as_zero(tmp_path):
+    write_jsonl(tmp_path / "en" / "dev.jsonl", [])
+    write_jsonl(tmp_path / "en" / "report.jsonl", [prompt(0, "en", "report", "x")])
+    _, _, counts = ftdata.load_safety_texts(tmp_path)
+    assert counts == {"en": (0, 1)}
+
+
+def test_a_covered_language_with_no_safety_prompts_fails_with_its_own_class():
+    train, held = sets()
+    report = run(train, held, safety_counts={"en": (0, 0), "sw": (3, 4)})
+    assert classes(report) == {"safety_empty"}
+    assert report.exit_code() == ftdata.EXIT_CODES["safety_empty"]
+    (problem,) = report.problems
+    assert "en" in problem.message and "sw" not in problem.message
+
+
+def test_one_empty_safety_split_is_enough_to_make_the_leakage_check_vacuous():
+    train, held = sets()
+    assert classes(run(train, held, safety_counts={"en": (250, 0)})) == {"safety_empty"}
+    assert classes(run(train, held, safety_counts={"en": (0, 500)})) == {"safety_empty"}
+
+
+def test_non_empty_safety_counts_pass_and_are_printed_per_language():
+    train, held = sets()
+    report = run(train, held, safety_counts={"en": (250, 500), "sw": (10, 20)})
+    assert report.ok
+    text = ftdata.render(report)
+    assert "safety test set covers: en, sw" in text
+    assert "en: 250 dev + 500 report" in text and "sw: 10 dev + 20 report" in text
+
+
+def test_the_empty_safety_exit_code_is_distinct_from_every_other_class():
+    codes = ftdata.EXIT_CODES
+    assert len(set(codes.values())) == len(codes)
+    assert "safety_empty" in codes and "safety_empty" in ftdata.RULES
 
 
 def test_load_safety_texts_without_any_language_directory_raises(tmp_path):
@@ -696,10 +756,14 @@ def ft_dir(tmp_path):
     for lang in ("en", "sw"):
         write_jsonl(tmp_path / "testset" / lang / "dev.jsonl", [prompt(0, lang, "dev", f"{lang} harmful dev prompt")])
         write_jsonl(tmp_path / "testset" / lang / "report.jsonl", [prompt(0, lang, "report", f"{lang} harmful report prompt")])
+    # the fixture items are in subject "history"; the repository's own allowlist has no such subject
+    (tmp_path / "pipe.yaml").write_text("name: t\nextra:\n  harmless_subjects:\n    - history\n", encoding="utf-8")
     return tmp_path
 
 
-def cli(ft_dir, *extra, train=None, held=None):
+def cli(ft_dir, *extra, train=None, held=None, repo_allowlist=False):
+    """Run the validator script. By default the fixture's own allowlist (subject "history") is
+    passed; `repo_allowlist=True` passes nothing, so the script's own default applies."""
     cmd = [
         sys.executable, str(SCRIPT),
         "--train", str(train or ft_dir / "ft" / "train.jsonl"),
@@ -707,6 +771,8 @@ def cli(ft_dir, *extra, train=None, held=None):
         "--testset", str(ft_dir / "testset"),
         *extra,
     ]
+    if not repo_allowlist and "--pipeline" not in extra and "--no-subject-check" not in extra:
+        cmd += ["--pipeline", str(ft_dir / "pipe.yaml")]
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
 
 
@@ -771,7 +837,87 @@ def test_cli_rejects_a_language_that_is_not_in_the_study(ft_dir):
 
 
 def test_cli_reads_the_subject_allowlist_from_the_pipeline_yaml(ft_dir):
-    pipe = ft_dir / "pipe.yaml"
+    pipe = ft_dir / "other.yaml"
     pipe.write_text("name: t\nextra:\n  harmless_subjects:\n    - geography\n", encoding="utf-8")
     result = cli(ft_dir, "--langs", "en,hi,ar,sw", "--pipeline", str(pipe))
     assert result.returncode == ftdata.EXIT_CODES["subject"], result.stdout  # the fixture items are "history"
+
+
+# --- the subject allowlist is on by default ---------------------------------------------------
+
+REPO_PIPELINE = Path(__file__).resolve().parent.parent / "pipelines" / "ft_data.yaml"
+FOUR_LANGS = ("--langs", "en,hi,ar,sw")
+
+
+def write_with_subject(ft_dir, subject):
+    """Rewrite the fixture train and heldout files so every item belongs to `subject`."""
+    train, held = sets()
+    for rows in (train, held):
+        for row in rows:
+            row["id"] = row["id"].replace("history/", f"{subject}/")
+    write_ft(ft_dir / "ft" / "train.jsonl", train)
+    write_ft(ft_dir / "ft" / "heldout.jsonl", held)
+
+
+def test_a_plain_run_checks_subjects_against_the_repository_pipeline_yaml(ft_dir):
+    write_with_subject(ft_dir, "virology")  # a subject the repository allowlist leaves out
+    result = cli(ft_dir, *FOUR_LANGS, repo_allowlist=True)
+    assert result.returncode == ftdata.EXIT_CODES["subject"], result.stdout + result.stderr
+    assert "virology" in result.stdout
+    assert "subject allowlist: checked" in result.stdout
+
+
+def test_a_plain_run_passes_when_every_subject_is_on_the_repository_allowlist(ft_dir):
+    subject = sorted(ftdata.load_allowed_subjects(REPO_PIPELINE))[0]
+    write_with_subject(ft_dir, subject)
+    result = cli(ft_dir, *FOUR_LANGS, repo_allowlist=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "checked 52 rows against" in result.stdout  # 4 languages x (10 train + 3 heldout)
+    assert "subject allowlist: NOT checked" not in result.stdout
+
+
+def test_no_subject_check_is_an_explicit_opt_out_that_says_so(ft_dir):
+    write_with_subject(ft_dir, "virology")
+    result = cli(ft_dir, *FOUR_LANGS, "--no-subject-check", repo_allowlist=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "subject allowlist: NOT checked" in result.stdout
+    assert "RESULT: OK (subject allowlist NOT checked)" in result.stdout
+
+
+def test_the_allowlist_status_line_is_in_every_mode(ft_dir):
+    plain = cli(ft_dir, *FOUR_LANGS, repo_allowlist=True)  # fails on the subject, still prints it
+    explicit = cli(ft_dir, *FOUR_LANGS)  # the fixture's own yaml
+    opted_out = cli(ft_dir, *FOUR_LANGS, "--no-subject-check")
+    for result in (plain, explicit, opted_out):
+        assert "subject allowlist:" in result.stdout, result.stdout + result.stderr
+
+
+def test_the_status_line_lists_the_subjects_of_the_allowlist_in_use(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert "subject allowlist: checked 52 rows against 1 subjects (history)" in result.stdout
+
+
+def test_a_pipeline_file_and_the_opt_out_cannot_be_combined(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS, "--pipeline", str(ft_dir / "pipe.yaml"), "--no-subject-check")
+    assert result.returncode == 2
+    assert "not allowed with" in result.stderr
+
+
+def test_a_missing_pipeline_file_is_an_input_error_not_a_silent_skip(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS, "--pipeline", str(ft_dir / "nope.yaml"))
+    assert result.returncode == 2
+    assert "nope.yaml" in result.stderr
+
+
+def test_cli_prints_the_safety_prompt_counts_per_language(ft_dir):
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert "en: 1 dev + 1 report" in result.stdout and "sw: 1 dev + 1 report" in result.stdout
+
+
+def test_cli_empty_safety_files_fail_instead_of_passing_vacuously(ft_dir):
+    write_jsonl(ft_dir / "testset" / "en" / "dev.jsonl", [])
+    write_jsonl(ft_dir / "testset" / "en" / "report.jsonl", [])
+    result = cli(ft_dir, *FOUR_LANGS)
+    assert result.returncode == ftdata.EXIT_CODES["safety_empty"], result.stdout + result.stderr
+    assert "en: 0 dev + 0 report" in result.stdout
+    assert "FAIL safety_empty" in result.stdout
