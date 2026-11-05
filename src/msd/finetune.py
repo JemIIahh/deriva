@@ -4,6 +4,7 @@
     python scripts/finetune.py --config configs/ft_lora.yaml --max-steps 20 --merge     # smoke run, then
     python scripts/finetune.py --config configs/ft_lora.yaml                             # the real run
     python scripts/finetune.py --config configs/ft_lora_strong.yaml                     # the strong retry
+    python scripts/finetune.py --config configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter
 
 Every training value (model, data paths, LoRA, quantisation, learning rate, epochs, batches, sequence length,
 precision, seed, loss masking, saving) is in the YAML config; this program holds no default for any of them and
@@ -47,7 +48,9 @@ Exit codes:
      rows missing, an adapter that is not the configured one), a failure while training, merging or uploading,
      or a Hub repo that is missing or not private
   2  usage error: bad or missing arguments, --push-to without HF_TOKEN or with --max-steps or --no-merge,
-     a non-empty --out, or an --out that is, or is inside, a data folder
+     --merge-only without --adapter or with a training option, a non-empty --out (or --out/merged for
+     --merge-only), an --out that is, or is inside, a data folder, a smoke --out equal to the real run's folder,
+     or a work folder an earlier run left
 """
 
 from __future__ import annotations

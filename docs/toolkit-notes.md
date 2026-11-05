@@ -575,7 +575,8 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   but its backfill copies every extra keyword that is a valid `SFTConfig` field onto the config with `setattr`
   before the `SFTTrainer` is built, so it reaches TRL. `finetune.py` therefore writes the tokenizer's own
   **default** template (a str as it is, a dict or a list by the entry named `default`, anything else an error)
-  to `work/finetune/<config stem>[-smoke]/chat_template.jinja` and passes that path as `chat_template_path`.
+  to `work/finetune/<config stem>[-smoke]/default_chat_template.jinja` (not `chat_template.jinja`: the trainer saves its own
+  template under that name next to the adapter) and passes that path as `chat_template_path`.
   Before training (and in `--dry-run`) it checks that the text has generation markers or equals
   `trl.chat_template_utils.cohere2_chat_template` (when trl imports; otherwise the plan says the check was
   skipped). Not run against the installed libraries: that TRL then swaps the template as read.
@@ -750,7 +751,7 @@ create_sft_trainer(model_name=<base_model>, dataset_name=<train.jsonl>, backend=
                    use_peft=True, lora_r=..., lora_alpha=..., lora_dropout=..., lora_target_modules=[...],
                    precision="fp16", fp16=True, bf16=False, gradient_checkpointing=True, gradient_accumulation_steps=...,
                    warmup_ratio=..., lr_scheduler=..., weight_decay=..., max_grad_norm=..., assistant_only_loss=True,
-                   chat_template_path="work/finetune/<stem>/chat_template.jinja",
+                   chat_template_path="work/finetune/<stem>/default_chat_template.jinja",
                    seed=..., data_seed=..., logging_steps=..., save_steps=..., save_total_limit=..., loggers=["none"],
                    load_best_model_at_end=False, eval_strategy="no", device_map={"": 0})
 ```
