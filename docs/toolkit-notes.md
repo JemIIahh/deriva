@@ -365,7 +365,8 @@ and why the wrapper's sanity step (greedy outputs at alpha 0 equal A1 on 5 promp
 1. **Key mismatch is silent.** The vector covers `[k for k in aligned if k in base]`, and a tensor whose
    name is missing from either reference is simply skipped, with only an INFO log line (the count). If
    Tiny Aya Base and Global name their tensors differently (UNVERIFIED), ReSta would patch fewer
-   tensors and say nothing. Our wrapper refuses unless all three state dicts have the same names and shapes.
+   tensors and say nothing. Our wrapper refuses unless all three models have the same tensor names and shapes
+   (when it checks, and one false alarm it can raise, is under "How `scripts/run_resta.py` calls it").
 2. **Load and save round trip.** `apply()` is exact, but the model is loaded and saved by transformers:
    a dtype cast on load, a renamed or fused key, tied weights written once. The bits can change before
    ReSta touches them. Compare the tensors of the alpha-0 output with those of `--drifted`, name by name
@@ -379,10 +380,20 @@ and why the wrapper's sanity step (greedy outputs at alpha 0 equal A1 on 5 promp
 ### How `scripts/run_resta.py` calls it (written from the source above, never run against it)
 
 `src/msd/restarun.py` does, in this order: check the arguments (exit 2: `--alpha` finite in [0, 1], `--out`
-missing or empty, `--drifted` a folder, `--base` and `--aligned` not the same model); import SafeTune (exit 1 with
-one line if it is missing, before any weight is read); load the drifted, base and aligned models with
-`AutoModelForCausalLM.from_pretrained(name, dtype="auto")` on the CPU; refuse unless the three have the same
-tensor names and shapes; build `recover.ReStaTrainer(drifted, base_model=..., aligned_model=..., alpha=...,
+missing or empty, not a symbolic link and not equal to or inside the drifted folder or a local `--base` /
+`--aligned` folder, `--drifted` a folder, `--base` and `--aligned` not the same model); name any stale
+`.<out>.<8 hex>.partial` folder left next to `--out` by a killed earlier run (one line, nothing deleted);
+compare tensor names and shapes of the LOCAL folders from their safetensors headers, before any model is
+loaded (the drifted folder against each of `--base` / `--aligned` that is a folder; a folder with no
+`model.safetensors` is skipped); import SafeTune (exit 1 with one line if it is missing, before any weight is
+read); load the drifted model, then the base, and compare them as loaded (names and shapes of the state dicts),
+then load the aligned model and compare that one too, so a wrong Hub reference stops the run after the second
+load and not the third (each load is a download of the model's full size); the comparison after loading is kept
+even when the headers agreed, because tied weights and renamed keys can make a loaded state dict differ from its
+file. The header comparison is strict and can refuse a pair that would have loaded to the same state dict, for
+example a tied `lm_head.weight` stored in one folder and not in the other; if that happens for Tiny Aya Base
+against Global, the fix is to compare after loading only for that pair, and the refusal text says which check
+fired ("compared from the safetensors headers" means this one). Then build `recover.ReStaTrainer(drifted, base_model=..., aligned_model=..., alpha=...,
 dare=..., dare_drop_rate=..., dare_seed=..., device="cpu")` and call `apply()`; save with `save_pretrained`
 plus the drifted model's tokenizer into a temporary folder renamed to `--out`, with `resta_patch.json`
 recording alpha, the DARE settings, the three sources, the SafeTune version and the dtypes.

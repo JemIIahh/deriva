@@ -32,13 +32,27 @@ and do not sweep alpha on a guess.
 
 SafeTune is imported inside `import_trainer` only, after the arguments are checked and before any model is
 loaded, so `--help`, the argument checks and this module's import work without it (it needs Python 3.12,
-torch 2.7 and transformers 5.15; docs/runtime.md, section 4). Before the trainer is built the three models
-are compared tensor by tensor (names and shapes): ReSta skips a tensor that is missing from either reference
-without a word, so a mismatch is refused here.
+torch 2.7 and transformers 5.15; docs/runtime.md, section 4). The three models are compared tensor by tensor
+(names and shapes) before the trainer is built, because ReSta skips a tensor that is missing from either
+reference without a word; a mismatch is refused. The comparison is made as early as it can be:
+
+  1. Local folders first, from the safetensors headers, before any model is loaded (the drifted folder against
+     each of --base / --aligned that is a folder; a folder with no model.safetensors, or an index, is skipped).
+  2. Hub ids pairwise, right after each model loads: drifted against base after the second load, drifted
+     against aligned after the third, so a wrong reference costs one download instead of two.
+  3. That check after loading is kept even when the headers agreed: tied weights and renamed keys can make a
+     loaded state dict differ from the file it came from.
+
+A header comparison can also refuse a pair that would have loaded to the same state dict (a tied weight such as
+lm_head stored in one folder and not in the other); the message says the check came from the headers.
+
+A stale `.<out>.<8 hex>.partial` folder left by a killed earlier run is named in one line at the start and never
+deleted.
 
 Exit codes: 0 done; 1 any failure (SafeTune missing or not importable, a model that cannot be loaded, mismatched
 tensors, a failed patch or save); 2 usage error (bad or missing arguments, a non-empty --out, --drifted not a
-folder, --base and --aligned the same model).
+folder, --base and --aligned the same model, an --out that is a symbolic link or is, or is inside, one of the
+local model folders).
 """
 
 from __future__ import annotations
@@ -56,7 +70,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from msd.atomicdir import atomic_output_dir, check_out_dir
+from msd.atomicdir import atomic_output_dir, check_out_dir, note_stale_partials
+from msd.blend import tensor_headers
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
 
@@ -154,9 +169,12 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         ap.error(f"--drifted must be an existing folder, got {str(args.drifted)!r}")
     if _same_model(args.base, args.aligned):
         ap.error("--base and --aligned are the same model; the safety vector (aligned - base) would be zero")
+    sources = [("drifted", args.drifted)] + [
+        (label, Path(ref)) for label, ref in (("base", args.base), ("aligned", args.aligned)) if Path(ref).is_dir()
+    ]
     try:
-        check_out_dir(args.out)
-    except FileExistsError as exc:
+        check_out_dir(args.out, sources=sources)
+    except (FileExistsError, ValueError) as exc:  # not empty / not a folder; a symbolic link or inside a model folder
         ap.error(str(exc))
     return args
 
@@ -216,25 +234,57 @@ def _few(names) -> str:
     return shown + (f" and {len(names) - _LISTED_NAMES} more" if len(names) > _LISTED_NAMES else "")
 
 
-def _check_same_tensors(drifted, base, aligned) -> None:
-    """ReSta skips a tensor missing from either reference without a word; refuse instead."""
-    reference = drifted.state_dict()
+def _shapes_of(model) -> dict[str, tuple[int, ...]]:
+    return {name: tuple(value.shape) for name, value in model.state_dict().items()}
+
+
+def _problems(label: str, reference: dict[str, tuple[int, ...]], other: dict[str, tuple[int, ...]]) -> list[str]:
+    """What is odd about `other` (named `label`) next to `reference`: missing, extra and differently shaped tensors."""
+    missing, extra = set(reference) - set(other), set(other) - set(reference)
+    odd_shape = [n for n in set(reference) & set(other) if tuple(reference[n]) != tuple(other[n])]
     problems = []
-    for label, model in (("base", base), ("aligned", aligned)):
-        other = model.state_dict()
-        missing, extra = set(reference) - set(other), set(other) - set(reference)
-        odd_shape = [n for n in set(reference) & set(other) if tuple(reference[n].shape) != tuple(other[n].shape)]
-        if missing:
-            problems.append(f"{label} lacks {_few(missing)}")
-        if extra:
-            problems.append(f"{label} has extra {_few(extra)}")
-        if odd_shape:
-            problems.append(f"{label} has another shape for {_few(odd_shape)}")
+    if missing:
+        problems.append(f"{label} lacks {_few(missing)}")
+    if extra:
+        problems.append(f"{label} has extra {_few(extra)}")
+    if odd_shape:
+        problems.append(f"{label} has another shape for {_few(odd_shape)}")
+    return problems
+
+
+def _refuse(problems: list[str], *, source: str = "") -> None:
+    """ReSta skips a tensor missing from either reference without a word; refuse instead."""
     if problems:
         raise ReStaError(
-            "the drifted, base and aligned models do not hold the same tensors, and ReSta would skip the odd ones "
-            "silently: " + "; ".join(problems)
+            f"the drifted, base and aligned models do not hold the same tensors{source}, and ReSta would skip the odd "
+            "ones silently: " + "; ".join(problems)
         )
+
+
+def _check_local_headers(args: argparse.Namespace) -> None:
+    """Compare tensor names and shapes of the local folders from their safetensors headers, loading nothing.
+
+    The drifted folder is the reference. A folder with no safetensors file is skipped (its models are checked
+    after loading); so is everything when the drifted folder has none."""
+    try:
+        reference = {name: shape for name, (shape, _dtype) in tensor_headers(args.drifted).items()}
+    except FileNotFoundError:
+        return
+    problems = []
+    for label, ref in (("base", args.base), ("aligned", args.aligned)):
+        if not Path(ref).is_dir():
+            continue
+        try:
+            other = {name: shape for name, (shape, _dtype) in tensor_headers(ref).items()}
+        except FileNotFoundError:
+            continue
+        problems += _problems(label, reference, other)
+    _refuse(problems, source=" (compared from the safetensors headers, before any model was loaded)")
+
+
+def _check_loaded(label: str, drifted, other) -> None:
+    """The same comparison on a model that has just been loaded, so a wrong one stops the run before the next load."""
+    _refuse(_problems(label, _shapes_of(drifted), _shapes_of(other)))
 
 
 def _dtypes(model) -> list[str]:
@@ -275,6 +325,8 @@ def run(
     load_model: Callable[[str], Any] | None = None,
     load_tokenizer: Callable[[str], Any] | None = None,
 ) -> None:
+    note_stale_partials(args.out)  # leftovers of a killed earlier run: named, never deleted
+    _check_local_headers(args)  # local folders: names and shapes from the headers, before anything is loaded
     trainer_cls = trainer_cls if trainer_cls is not None else import_trainer()  # before any model is loaded
     load_model = load_model if load_model is not None else load_causal_lm
     load_tokenizer = load_tokenizer if load_tokenizer is not None else _default_load_tokenizer
@@ -282,9 +334,10 @@ def run(
     print("loading the drifted, base and aligned models in full on the CPU (about 3x one model in RAM)", file=sys.stderr)
     drifted = load_model(str(args.drifted))
     base = load_model(args.base)
+    _check_loaded("base", drifted, base)  # a wrong base is found before the aligned model is fetched
     aligned = load_model(args.aligned)
+    _check_loaded("aligned", drifted, aligned)
     print(f"dtypes: drifted {_dtypes(drifted)}, base {_dtypes(base)}, aligned {_dtypes(aligned)}", file=sys.stderr)
-    _check_same_tensors(drifted, base, aligned)
 
     trainer = trainer_cls(
         drifted,

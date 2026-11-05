@@ -83,12 +83,13 @@ def make_models():
 class World:
     """Three fake models behind a loader that records what it was asked to load."""
 
-    def __init__(self, tmp_path, models=None):
+    def __init__(self, tmp_path, models=None, *, base_ref=BASE_ID, aligned_ref=ALIGNED_ID):
         self.drifted_dir = tmp_path / "A1"
         self.drifted_dir.mkdir()
         (self.drifted_dir / "config.json").write_text("{}")
         self.out = tmp_path / "A2" / "alpha_0.25"
-        self.models = dict(zip((str(self.drifted_dir), BASE_ID, ALIGNED_ID), models or make_models()))
+        self.base_ref, self.aligned_ref = str(base_ref), str(aligned_ref)
+        self.models = dict(zip((str(self.drifted_dir), self.base_ref, self.aligned_ref), models or make_models()))
         self.loads: list[str] = []
         self.tokenizer_loads: list[str] = []
         self.original_drifted = {k: v.copy() for k, v in self.models[str(self.drifted_dir)].weights.items()}
@@ -102,7 +103,7 @@ class World:
         return FakeTokenizer()
 
     def argv(self, *extra, alpha="0.25"):
-        return ["--drifted", str(self.drifted_dir), "--base", BASE_ID, "--aligned", ALIGNED_ID, "--alpha", alpha,
+        return ["--drifted", str(self.drifted_dir), "--base", self.base_ref, "--aligned", self.aligned_ref, "--alpha", alpha,
                 "--out", str(self.out), *extra]
 
     def run(self, *extra, alpha="0.25", trainer_cls=FakeTrainer):
@@ -473,3 +474,188 @@ def test_the_script_is_a_thin_wrapper():
     assert "restarun" in text and len(text.splitlines()) < 40
     assert "import json" not in text  # no logic of its own
     assert "import safetune" not in text and "from safetune" not in text  # SafeTune is imported in msd.restarun only
+
+
+# === fix round 1: when the tensor names are compared, out_dir guards, stale partial note ==========================
+
+from safetensors.numpy import save_file as save_numpy  # noqa: E402
+
+
+def write_checkpoint(folder, model):
+    """A local model folder holding a real model.safetensors (the early check reads only its header)."""
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    save_numpy(dict(model.weights), str(Path(folder) / "model.safetensors"))
+
+
+def local_world(tmp_path, *, base="local", aligned="local", models=None, folder_models=None, write=("drifted", "base", "aligned")):
+    """A World whose drifted folder, and whichever of base / aligned are "local", are real folders.
+
+    `models` are what the loader hands out; `folder_models` are what the folders' safetensors files hold (the
+    same by default), so a test can make the headers disagree with the loaded models or the other way round.
+    `write` names the folders that get a model.safetensors at all."""
+    models = models or make_models()
+    folder_models = folder_models or models
+    base_ref = tmp_path / "base" if base == "local" else BASE_ID
+    aligned_ref = tmp_path / "aligned" if aligned == "local" else ALIGNED_ID
+    world = World(tmp_path, models, base_ref=base_ref, aligned_ref=aligned_ref)
+    for role, folder, model in (("drifted", world.drifted_dir, folder_models[0]), ("base", base_ref, folder_models[1]),
+                                ("aligned", aligned_ref, folder_models[2])):
+        if role in write and Path(folder).is_absolute():  # hub ids are not folders
+            write_checkpoint(folder, model)
+        elif role in ("base", "aligned") and Path(folder).is_absolute():
+            Path(folder).mkdir(parents=True, exist_ok=True)
+    return world
+
+
+def test_matching_local_folders_pass_the_header_check_and_the_run_goes_on(tmp_path):
+    world = local_world(tmp_path)
+    assert world.run() == 0
+    assert world.loads == [str(world.drifted_dir), world.base_ref, world.aligned_ref]
+
+
+def test_a_name_mismatch_in_a_local_folder_is_found_before_any_model_is_loaded(tmp_path, capsys):
+    drifted, base, aligned = make_models()
+    odd_base = FakeModel(embed=[[0, 0], [0, 0]], other=[0, 0])  # no "norm", an extra "other"
+    world = local_world(tmp_path, folder_models=(drifted, odd_base, aligned))
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert "norm" in err and "other" in err and "base" in err and "headers" in err
+    assert world.loads == [] and FakeTrainer.instances == []  # not even the drifted model was loaded
+    assert not world.out.exists() and siblings_of_out(world) == []
+
+
+def test_a_shape_mismatch_in_a_local_folder_is_found_before_any_model_is_loaded(tmp_path, capsys):
+    drifted, base, aligned = make_models()
+    odd_aligned = FakeModel(embed=[[1, 2, 3]], norm=[2, 4])
+    world = local_world(tmp_path, folder_models=(drifted, base, odd_aligned))
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert "embed" in err and "shape" in err and "aligned" in err
+    assert world.loads == [] and not world.out.exists()
+
+
+def test_both_odd_folders_are_named_in_one_message(tmp_path, capsys):
+    drifted, base, aligned = make_models()
+    world = local_world(tmp_path, folder_models=(drifted, FakeModel(embed=[[0, 0], [0, 0]]), FakeModel(embed=[[1, 2, 3]], norm=[2, 4])))
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert "base lacks" in err and "aligned has another shape" in err and world.loads == []
+
+
+def test_the_local_folders_are_compared_although_the_other_model_is_a_hub_id(tmp_path, capsys):
+    drifted, base, aligned = make_models()
+    world = local_world(tmp_path, base="hub", folder_models=(drifted, base, FakeModel(embed=[[1, 2], [3, 4]], renamed=[2, 4])))
+    assert world.run() == 1  # drifted and aligned are both local, base is not: they are compared all the same
+    assert "aligned" in capsys.readouterr().err
+    assert world.loads == []
+
+
+def test_a_folder_without_a_safetensors_file_is_skipped_by_the_header_check(tmp_path):
+    world = local_world(tmp_path, write=("drifted", "aligned"))  # the local base folder holds no model.safetensors
+    assert world.run() == 0
+    assert len(world.loads) == 3
+
+
+def test_no_header_check_is_possible_without_the_drifted_headers_but_the_run_still_checks_after_loading(tmp_path, capsys):
+    drifted, base, aligned = make_models()
+    world = local_world(tmp_path, base="hub", aligned="hub", write=(), models=(drifted, FakeModel(embed=[[0, 0], [0, 0]]), aligned))
+    assert world.run() == 1
+    assert "base lacks" in capsys.readouterr().err
+    assert world.loads == [str(world.drifted_dir), BASE_ID]
+
+
+def test_a_hub_id_mismatch_is_found_after_the_second_load_not_the_third(tmp_path, capsys):
+    drifted, _, aligned = make_models()
+    odd_base = FakeModel(embed=[[0, 0], [0, 0]], other=[0, 0])
+    world = World(tmp_path, (drifted, odd_base, aligned))  # both references are hub ids: nothing to read first
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert "base" in err and "norm" in err and "other" in err
+    assert world.loads == [str(world.drifted_dir), BASE_ID]  # the aligned model, the longest wait, was never loaded
+    assert FakeTrainer.instances == [] and not world.out.exists() and siblings_of_out(world) == []
+
+
+def test_a_hub_id_aligned_mismatch_is_found_after_the_third_load(tmp_path, capsys):
+    drifted, base, _ = make_models()
+    world = World(tmp_path, (drifted, base, FakeModel(embed=[[1, 2, 3]], norm=[2, 4])))
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert "aligned" in err and "shape" in err and "embed" in err
+    assert world.loads == [str(world.drifted_dir), BASE_ID, ALIGNED_ID]
+    assert FakeTrainer.instances == [] and not world.out.exists()
+
+
+def test_the_check_after_loading_still_catches_what_the_headers_do_not_show(tmp_path, capsys):
+    # the folders' headers agree with each other, but the loaded base model's state dict is another matter
+    # (a tied or renamed tensor): found right after the second load
+    drifted, base, aligned = make_models()
+    odd_loaded_base = FakeModel(embed=[[0, 0], [0, 0]])
+    world = local_world(tmp_path, models=(drifted, odd_loaded_base, aligned), folder_models=(drifted, base, aligned))
+    assert world.run() == 1
+    err = capsys.readouterr().err
+    assert "base lacks" in err and "norm" in err and "headers" not in err
+    assert world.loads == [str(world.drifted_dir), world.base_ref]
+    assert FakeTrainer.instances == []
+
+
+def test_the_header_check_runs_without_safetune_torch_or_transformers(tmp_path):
+    drifted, base, aligned = make_models()
+    odd_base = FakeModel(embed=[[0, 0], [0, 0]])
+    for name, model in (("A1", drifted), ("base", odd_base), ("aligned", aligned)):
+        write_checkpoint(tmp_path / name, model)
+    code = (
+        "import sys; from msd import restarun; "
+        f"rc = restarun.main(['--drifted', {str(tmp_path / 'A1')!r}, '--base', {str(tmp_path / 'base')!r}, "
+        f"'--aligned', {str(tmp_path / 'aligned')!r}, '--alpha', '0.25', '--out', {str(tmp_path / 'out')!r}]); "
+        "print(rc, [m for m in ('safetune', 'torch', 'transformers') if m in sys.modules])"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.stdout.split(None, 1) == ["1", "[]\n"], done.stdout + done.stderr
+    assert "base lacks" in done.stderr and "SafeTune" not in done.stderr and not (tmp_path / "out").exists()
+
+
+# --- out_dir guards and the stale partial note ---------------------------------------------------------------------
+
+
+def test_an_out_inside_the_drifted_folder_or_a_local_reference_is_a_usage_error(tmp_path):
+    world = local_world(tmp_path)
+    for inside in (world.drifted_dir / "out", Path(world.base_ref) / "out", Path(world.aligned_ref) / "deeper" / "out",
+                   world.drifted_dir):
+        argv = world.argv()
+        argv[argv.index("--out") + 1] = str(inside)
+        assert restarun.main(argv, trainer_cls=FakeTrainer, load_model=world.load_model) == 2
+    assert not (world.drifted_dir / "out").exists() and not (Path(world.base_ref) / "out").exists()
+    assert not (Path(world.aligned_ref) / "deeper").exists() and world.loads == []
+
+
+def test_an_out_that_is_a_symlink_is_a_usage_error(tmp_path):
+    world = World(tmp_path)
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    argv = world.argv()
+    argv[argv.index("--out") + 1] = str(link)
+    assert restarun.main(argv, trainer_cls=FakeTrainer, load_model=world.load_model) == 2
+    assert list(target.iterdir()) == [] and world.loads == []
+
+
+def test_a_stale_partial_folder_is_named_at_the_start_and_left_alone(tmp_path, capsys):
+    world = World(tmp_path)
+    stale = world.out.parent / ".alpha_0.25.deadbeef.partial"
+    stale.mkdir(parents=True)
+    (stale / "model.safetensors").write_bytes(b"x" * 3000)
+
+    def load_model(name):
+        raise OSError("stop here: the note must already be out")
+
+    assert restarun.main(world.argv(), trainer_cls=FakeTrainer, load_model=load_model) == 1
+    err = capsys.readouterr().err
+    note = [line for line in err.splitlines() if ".alpha_0.25.deadbeef.partial" in line]
+    assert len(note) == 1 and "2.9 KiB" in note[0] and "not deleted" in note[0]
+    assert (stale / "model.safetensors").stat().st_size == 3000
+
+
+def test_no_note_without_leftovers(world, capsys):
+    assert world.run() == 0
+    assert "partial" not in capsys.readouterr().err
