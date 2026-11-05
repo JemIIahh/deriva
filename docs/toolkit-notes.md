@@ -436,3 +436,289 @@ The real call (`scripts/run_resta.py` is written against this source and tested 
 only), the key names of Tiny Aya Base against Global, the stored dtype and what `dtype="auto"` gives,
 peak memory, SafeTune's Tiny Aya alpha claim, and a clean `import safetune` on Kaggle or Colab. All of
 them are settled by the first GPU-runtime sanity run (plan Task 16, Step 6).
+
+## AlignTune SFT (read from source)
+
+Checked 2026-11-05. Nothing was run: AlignTune is not installed in any project venv, there is no GPU here
+and no model weights were downloaded. Everything below is read from source text: the `aligntune` 0.1.31
+package metadata (PyPI, published 2026-11-05) and the same paths in a shallow clone of
+`github.com/Lexsi-Labs/aligntune` at commit `906da95363b3238955aacb28486ea5ecc5cdbd9a` (2026-11-05); TRL
+at the `v1.7.1` tag; PEFT `main` (merge path); the public Hugging Face API record of
+`CohereLabs/tiny-aya-global` (no token) and the public `modeling_cohere2.py` of transformers `main`.
+AlignTune files read: `core/backend_factory.py` (`create_sft_trainer`), `core/sft/config.py`,
+`core/sft/config_loader.py`, `core/sft/training_args_builder.py`, `core/model_loader.py`,
+`core/precision_handler.py`, `core/peft/`, `core/merge/peft_merger.py`, `core/trainer_base.py`,
+`core/advisor.py`, `data/manager.py`, `data/curator_adapter.py`, `data/loaders/`,
+`backends/trl/sft/sft_generation.py`, `utils/config_extractor.py`, `utils/config_utils.py`,
+`utils/environment.py`, `cli/{validate,advise,merge}.py`, `examples/sft_trl_1.py` and
+`notebooks/test_algos_trl_aya.ipynb`. Anything I could not read directly is marked UNVERIFIED.
+
+### Package, licence and pins
+
+- `pip install aligntune==0.1.31`, Python >=3.11. Its own code is MIT. The wheel's licence expression is
+  `MIT AND Apache-2.0 AND AGPL-3.0-only AND LGPL-3.0-only` because it vendors unsloth and unsloth_zoo
+  (Apache-2.0 with AGPL-3.0 parts) and mergekit (LGPL-3.0). `backend="trl"` switches the unsloth backend
+  off (`_disable_unsloth_backend`), so the AGPL parts are not used by this study; that is my reading of the
+  code, not legal advice.
+- **Hard dependency `curatorkit[connectors]>=0.1.15`**, and CuratorKIT is under the Lexsi Labs Source
+  Available License 1.1 (`License-Expression: LicenseRef-LSAL-1.1` in the installed 0.1.22 metadata,
+  `LICENSE.md` read): free for research, evaluation, education and audit, noncommercial only. A study that
+  publishes an article is inside that grant; a paid product built on the same install would not be.
+- Pins that matter: `transformers>=5.15,<6`, **`trl==1.7.1` (exact)**, `peft>=0.18.0`, `torch>=2.4,<2.14`,
+  `bitsandbytes>=0.45.5` (not 0.46.0 or 0.48.0), `torchao>=0.16`, `accelerate>=1.6`, `datasets>=2.14`
+  (TRL 1.7.1 itself needs `datasets>=4.7`), `huggingface-hub>=0.34`.
+- Clash check against the other toolkits: SafeTune 0.1.12 asks `trl>=0.12,<1.15`, `transformers>=5.15,<6`,
+  `torch>=2.7` and Python >=3.12; CuratorKIT 0.1.22 asks Python >=3.11. The ranges overlap, so there is no
+  hard conflict on paper, but the plan's one-venv-per-toolkit rule stays: AlignTune pulls a large tree
+  (bitsandbytes, torchao, the vendored unsloth and mergekit) and an install on a runtime that ships its own
+  torch may replace that torch. Whether it does on Kaggle or Colab is UNVERIFIED. `kaggle/10_run_stage.ipynb`
+  installs no toolkit, so `docs/runtime.md` carries the `pip install` cell.
+
+### `create_sft_trainer`
+
+```python
+from aligntune.core.backend_factory import create_sft_trainer      # also exported as aligntune.create_sft_trainer
+create_sft_trainer(model_name=None, dataset_name=None, backend="auto", output_dir="./output", num_epochs=3,
+                   batch_size=4, learning_rate=2e-4, max_seq_length=512, max_samples=None, system_prompt=None,
+                   config=None, rope_type=None, rope_target_max_seq_length=None, rope_factor=None,
+                   attn_implementation="auto", sliding_window=None, **kwargs)
+```
+
+- It only builds config objects and returns a trainer; **nothing is loaded** until `trainer.train()`, which runs
+  `setup_model` and `setup_data` itself. It calls `set_seed(kwargs["seed"], default 42)` on entry.
+- Everything that is not a named parameter is a keyword argument read with `kwargs.get(name, default)`. A
+  misspelled keyword is NOT an error: it lands in `extra_params` and is dropped unless it happens to be a valid
+  `trl.SFTConfig` field (next bullet). That is why `src/msd/finetune.py` keeps the exact keyword list in one
+  tested function and a test pins every name.
+- After the TRL `SFTConfig` is built (`core/sft/training_args_builder.py`), every keyword that is also a valid
+  `SFTConfig` field is copied on with `setattr` (`extract_extra_and_missing_params`; it always wins and skips
+  `__post_init__` validation). Keywords that are not `SFTConfig` fields (`lora_r`, `quantization`, ...) are
+  read earlier, by the factory, as below.
+- `backend="trl"` is the one to name (`"auto"` may pick unsloth when it is importable).
+- The factory also has `config=` (a YAML path or dict, run through `parse_config_to_unified`). We do not use it:
+  that path has other defaults (`use_peft` True, `lora_dropout` 0.05, `data_seed` 47) and `validate config`
+  below shows the SFT YAML loader is broken at this commit. Everything is passed as keywords.
+
+### Turning LoRA on, and every LoRA key
+
+LoRA is **off by default**: `use_peft` (aliases `peft_enabled`, `use_lora`) defaults to False.
+
+| keyword | default | meaning |
+| --- | --- | --- |
+| `use_peft` | False | switch LoRA on |
+| `lora_r` | 16 | rank |
+| `lora_alpha` | 32 | scaling numerator (scale = alpha / r) |
+| `lora_dropout` | 0.1 here (0.05 on the YAML path) | adapter dropout |
+| `lora_target_modules` | None | None falls back to q/k/v/o_proj; the string `"all-linear"` is resolved by AlignTune to the linear layers without the output embedding; a list names modules |
+| `lora_bias` | `"none"` | |
+| `lora_variant` | `"standard"` | |
+| `use_rslora`, `use_dora`, `init_lora_weights` | off | only via `extra_params`; `use_dora` warns "not available" and falls back to LoRA |
+
+Precedence when a key appears twice (`get_peft_value`): keywords (extra_params), then `config.model.peft.*`,
+then `config.model.*`. The adapter is applied by AlignTune itself (`core/peft/lora.py`, `peft.get_peft_model`
+with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called with `peft_config=None`.
+
+### Quantisation and precision, with the T4 in mind
+
+- Quantisation is the keyword `quantization={...}` with keys `load_in_4bit`, `load_in_8bit`,
+  `bnb_4bit_compute_dtype` (**default `"bfloat16"`**, must be `"float16"` on a T4), `bnb_4bit_quant_type`
+  (`"nf4"`) and `bnb_4bit_use_double_quant`. When it is non-empty the model goes through
+  `prepare_model_for_kbit_training`. Our configs use **no quantisation** (the choice is argued in the
+  configs): the adapter is then trained on the same fp16 weights it is merged into.
+- Precision is the keyword `precision` (`"fp16"`, `"bf16"`, `"fp32"`, `"auto"`; `ModelConfig.precision`
+  defaults to AUTO). **AUTO asks `torch.cuda.is_bf16_supported()`, which can answer True on a T4 (bf16 is
+  emulated there), so `precision="fp16"` must be passed explicitly**; `PrecisionHandler` then sets the
+  fp16/bf16 flags of the training arguments, and the keywords `fp16` / `bf16` are backfilled onto the
+  `SFTConfig` as well. TRL's own `SFTConfig` turns `bf16` on when `fp16` is unset, which is the other reason
+  to send both flags. The model is loaded with `torch_dtype=` (a deprecated alias of `dtype` in
+  transformers 5; still accepted at 5.15, UNVERIFIED on the version the runtime resolves).
+- `device_map` defaults to `"auto"`; on one GPU `{"": 0}` keeps the whole model on it.
+
+### Data: a local jsonl of `messages`, the chat template, and the loss
+
+- `dataset_name` may be a local file path. `LoaderResolver` picks `JSONLoader`, which calls
+  `datasets.load_dataset("json", data_files=path)` (a DatasetDict with one `train` split).
+- **No conversion is needed for our file.** `data/ft/train.jsonl` is `{id, lang, messages:[user, assistant], gold}`
+  per line. `DataManager` then runs CuratorKIT over the split unconditionally (`curate_split`, a temporary
+  parquet file, `format="auto"`, schema gate on, `min_tokens=0`, `max_tokens=1_000_000`, no clean, no dedup),
+  recognises the `messages` column (`task_type` conversational), restores the accepted conversations
+  (`restore_accepted_rows`, `_normalize_sft_messages`) and ends with a `messages` column plus
+  `chat_template_kwargs={"enable_thinking": False}`; only those two columns go to TRL. `system_prompt=None`
+  injects nothing. I ran the same CuratorKIT 0.1.22 reader with AlignTune's gate settings over our
+  `train.jsonl` (the JSONL reader, not the parquet path): all 6,000 rows pass, 1,500 per language, with
+  `lang` and `gold` carried as metadata. **The parquet round trip itself is UNVERIFIED**, and so is
+  whether any row can be dropped there. `finetune.py` therefore compares the number of rows the trainer
+  reports it trained on with the number in the file and refuses a run that dropped any (the 20-step smoke run
+  shows it before the full run).
+- The chat template is applied by TRL, not by AlignTune: `SFTTrainer` tokenises `messages` with
+  `tokenizer.apply_chat_template`.
+- **Loss on the assistant turn only.** TRL's `completion_only_loss` applies to prompt-completion datasets
+  only (checked in `sft_trainer.py` at v1.7.1); for `messages` the switch is `assistant_only_loss=True`. It needs the
+  template to mark the assistant span with `{% generation %}`, and TRL's `get_training_chat_template` swaps in
+  a patched template when the tokenizer's own one equals a known one. **Tiny Aya Global's template (3,239
+  characters, from the public record) is byte-identical to TRL's `cohere2.jinja`**, so TRL swaps in
+  `cohere2_training.jinja`, whose mask covers `{content}<|END_RESPONSE|><|END_OF_TURN_TOKEN|>` of the assistant
+  turn and nothing else. For our rows that is the answer letter plus the two end tokens. AlignTune passes
+  both `assistant_only_loss` (default False) and `completion_only_loss` (default None) through to the
+  `SFTConfig`. Without it the loss would also cover the ~2,000-character safety system preamble the
+  template always injects and the question. The byte-identity and the mask are read from text; that the
+  swap happens in the installed TRL is UNVERIFIED until the smoke run (its first batch can be inspected).
+- `loss_type` is `"nll"` (AlignTune accepts only `nll` and `dft`, so TRL's newer `chunked_nll` is not
+  reachable). Full logits over the 262,144-token vocabulary are therefore materialised.
+- No packing (`packing=False`). TRL's `max_length` is AlignTune's `max_seq_length`, truncating from the start
+  of the sequence (`keep_start`): **a truncated example loses its end, so its assistant span is cut or gone and
+  it trains on nothing.** `finetune.py` counts tokens with the chat template and refuses a config whose
+  `max_seq_length` is below the longest example.
+
+### Batch, schedule, checkpointing and the other defaults to override
+
+| keyword | AlignTune default | what we send and why |
+| --- | --- | --- |
+| `gradient_accumulation_steps` | 1 | from the config |
+| `warmup_ratio` | 0.1 | sent as `warmup_steps=<ratio>` (a float below 1 is a ratio in transformers >=5.2); `warmup_steps` is ignored unless `warmup_ratio` is None |
+| `lr_scheduler` | `"cosine"` | from the config |
+| `weight_decay`, `max_grad_norm` | 0.01, 1.0 | from the config |
+| `gradient_checkpointing` | **False**; `gradient_checkpointing_kwargs` `{"use_reentrant": False}` | from the config. The model-level `use_gradient_checkpointing` (default True) is NOT read on the SFT/TRL path; only this keyword reaches the `SFTConfig` |
+| `group_by_length` | True | False: length-sorted batches bias the order, and with batch size 1 it only reorders |
+| `load_best_model_at_end` | True (`metric_for_best_model="eval_loss"`) | False: there is no eval set |
+| `eval_strategy` | `"steps"` | `"no"` (it becomes `"no"` anyway when there is no eval dataset) |
+| `loggers` / `report_to` | `["tensorboard"]` / `"none"` | `report_to="none"` falls back to `loggers`, so `loggers=["none"]` |
+| `device_map` | `"auto"` | `{"": 0}`: the whole model on the one GPU; `"auto"` may offload layers to the CPU |
+| `save_steps` (`save_interval`), `logging_steps` | 500, 10 | from the config; `save_total_limit` reaches the `SFTConfig` by the backfill only |
+| `seed`, `data_seed` | 42, None | both from the config's seed |
+| `max_steps` | None | the smoke switch (`--max-steps`) |
+
+### Where files go, and merging
+
+- `TRLSFTTrainer.train()` (in `backends/trl/sft/sft_generation.py`) builds the model, trains, then calls
+  `trainer.trainer.save_model()`: **the adapter (`adapter_model.safetensors`, `adapter_config.json`) lands in
+  `output_dir` itself**, next to `checkpoint-<step>/` folders every `save_steps`, plus an AlignTune
+  `lexsi_provenance.json` (it records absolute paths, so it never goes into anything we publish).
+- `train()` returns a dict with `final_loss`, `steps`, `epochs`, `metrics`, `model_path` and `training_time`.
+  The per-step losses are in `trainer.trainer.state.log_history` (entries with a `"loss"` key).
+- **There is no resume API**: a dropped Kaggle or Colab session restarts the run (the checkpoint folders are
+  there for a manual recovery only; UNVERIFIED that `Trainer.train(resume_from_checkpoint=...)` could be
+  reached from outside).
+- Merge, three ways: `trainer.merge_adapters(output_path, adapter_path)`;
+  `PEFTMerger().merge_lora(base_model, output_path, adapter_path, tokenizer, torch_dtype="float16", ...)`
+  (`core/merge/peft_merger.py`: load the base, `PeftModel.from_pretrained`, `merge_and_unload`,
+  `save_pretrained`, save the tokenizer, add transformers-4 legacy fields to `config.json`, write
+  provenance); and the CLI `aligntune merge run --method lora-merge --base B --adapter A --output O --dtype float16`.
+  `finetune.py` does the same three PEFT calls itself, so no provenance file with absolute paths and no
+  legacy fields end up in the model folder that may be pushed. **The base must be reloaded unquantised in
+  fp16 before the adapter is merged**; merging into a 4-bit base is not possible. On the CPU, PEFT upcasts
+  the fp16 delta matmul to fp32 (`cast_to_fp32`, read on PEFT `main`); RAM is about 2x the fp16 model
+  (about 14 GB, UNVERIFIED), which is why the merge runs after the trainer and its GPU memory are freed.
+
+### Seed and determinism
+
+`set_seed` (`utils/environment.py`) seeds `random`, `numpy`, `torch`, `torch.cuda` and transformers' own seed;
+the keyword `seed` is also written to the `SFTConfig`, and we send `data_seed` as well. Two runs with the same
+seed, data, library versions and hardware should therefore draw the same data order and the same LoRA
+initialisation. Bit-identical weights are NOT promised: fp16 training on a GPU uses non-deterministic
+kernels, and `torch.use_deterministic_algorithms` is not switched on (UNVERIFIED either way). The summary
+records the seed and every library version.
+
+### `aligntune validate config` and `aligntune advise estimate`
+
+- `aligntune validate config <file>`: its SFT branch (`SFTConfigLoader._dict_to_config`) builds `ModelConfig`
+  with `lora_alpha`, `lora_dropout` and `target_modules`, none of which `ModelConfig` has (checked by walking
+  its AST), so it raises `TypeError` for an SFT YAML and falls through to the RL loader, which then
+  complains about RL fields. **It is not usable for an SFT config at this commit.** Not run (not installed),
+  so this is a reading, not an observed failure. `scripts/finetune.py --dry-run` does the validation we need.
+- `aligntune advise estimate --model M --dataset-size N --algorithm lora|qlora|sft --gpu t4 --batch-size B
+  --seq-len L --epochs E --grad-accum A` is a pure heuristic (`core/advisor.py`), nothing is measured.
+  **It infers the model size from the name** (`infer_model_size`: the first of `0.5b 1b 2b 3b 7b 13b 34b 70b 110b`
+  whose digits occur anywhere in the lower-cased name), so `CohereLabs/tiny-aya-global` has no size and
+  is assumed to be 7B; a name that contains `3b`, for example `tiny-aya-3b`, gives 3,000M. It has a T4 profile
+  (16 GB, 65 fp16 TFLOPS). The formulas, re-implemented by hand here without importing AlignTune
+  (VRAM = (M/250 + bs*seq*M/250000 + 5% adapter) x {lora 0.3, qlora 0.15, sft 1.0}; tokens/s = 65*0.5/(2M/1000) x
+  {lora 1.1, others 1.0} x 1e12 / (M x 1e6); hours = rows x seq x epochs / tokens/s), for M = 3,000, batch 1,
+  6,000 rows, 2 epochs, whole sequences of `seq` tokens, the advisor's own uncertainty +/-30%:
+
+  | algorithm | seq | VRAM | tokens/s | hours |
+  | --- | --- | --- | --- | --- |
+  | lora | 1024 | 7.5 GB | 1,986 | 1.7 |
+  | lora | 2048 | 11.2 GB | 1,986 | 3.4 |
+  | qlora | 2048 | 5.6 GB | 1,806 | 3.8 |
+  | sft (full) | 2048 | 36.6 GB | 1,806 | 3.8 |
+
+  The advisor charges every sequence at full length; our rows are mostly shorter, so the hours are an upper
+  bound on that formula. It does not model the 262k-vocabulary logits (below), so its VRAM is optimistic.
+  Command to reproduce:
+  `aligntune advise estimate --model tiny-aya-3b --dataset-size 6000 --algorithm lora --gpu t4 --batch-size 1 --seq-len 2048 --epochs 2 --grad-accum 16`.
+  UNVERIFIED: that this is what the command prints.
+
+### Tiny Aya Global: architecture, template, generation, training caveats
+
+From the public record `https://huggingface.co/api/models/CohereLabs/tiny-aya-global` (sha
+`af89d219b53ed9b13b8a4645f9c8028973510324`, last modified 2026-09-30; gated "auto"; licence CC-BY-NC-4.0) and
+`modeling_cohere2.py` (transformers `main`). The gated `config.json` could not be read without a token; the
+numbers below come from the config of a third-party derivative with the same parameter count
+(`EMD123/tiny-aya-kosher-3.3B`), so treat each as UNVERIFIED for the original.
+
+- Class `Cohere2ForCausalLM`, `model_type` `cohere2`, 3,349,227,520 parameters, stored in BF16 (6.72 GB).
+  Hidden size 2048, MLP 11008, 36 layers, 16 attention heads and 4 KV heads of dimension 128, vocabulary
+  262,144 with tied embeddings, sliding window 4096 on 3 of every 4 layers, RoPE theta 50,000, `layer_norm_eps`
+  1e-5, parallel attention/MLP blocks.
+- The embedding alone is 262,144 x 2048 = 0.54B parameters (1.07 GB in fp16). **The logits are what make
+  training memory large:** one 2,048-token example is 2,048 x 262,144 = 537M logits, 1.07 GB in fp16 and 2.15 GB
+  once the loss upcasts to fp32, with the same again for the gradient.
+- Linear layers (read from `modeling_cohere2.py`): attention `q_proj`, `k_proj`, `v_proj`, `o_proj`; MLP
+  `gate_proj`, `up_proj`, `down_proj`; and `lm_head` (tied to the embedding, never a LoRA target). Rank 16 on
+  those seven names is 839,680 parameters per layer, **30.2M in all** (121 MB in fp32).
+- Tokenizer: `bos` `<BOS_TOKEN>`, `eos` `<|END_OF_TURN_TOKEN|>`, `pad` `<PAD>` (exists), `unk` `<UNK>`. The padding
+  side is UNVERIFIED.
+- Chat template: roles must alternate, and **it always injects a long "contextual safety mode" system preamble
+  (about 2,000 characters, perhaps 450 tokens, the token count UNVERIFIED) before every conversation.** The
+  assistant turn is `<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>{content}<|END_RESPONSE|><|END_OF_TURN_TOKEN|>`;
+  the generation prompt is the first three tokens of that. Our one-letter answers sit in a template whose
+  preamble is about the safety behaviour the study measures.
+- Generation settings on the model card: `max_new_tokens=4096, do_sample=True, temperature=0.1, top_p=0.95`
+  (the card says only `pip install -U transformers accelerate`). Greedy decoding is what `run_eval.py` uses.
+- Others have fine-tuned it with TRL 0.28 under transformers 5.0 to 5.2 (public model repos
+  `qgallouedec/tiny-aya-global-SFT` and `sergiopaniego/tiny-aya-global-SFT`), so Cohere2 trains under
+  transformers >=5.0. AlignTune ships its own Tiny Aya notebook (`notebooks/test_algos_trl_aya.ipynb`:
+  `create_sft_trainer(..., use_peft=True, lora_r=16, lora_alpha=32, max_steps=2)`), and `model_loader` handles
+  Cohere2 as a plain causal LM.
+- Memory on a T4 (16 GB), arithmetic only, UNVERIFIED: fp16 weights 6.7 GB + LoRA (rank 16: 30M fp32
+  parameters, gradients and two Adam moments, about 0.5 GB) + logits and their gradient for the longest
+  example (about 5 GB at 2,048 tokens, about 2 GB at 800) + checkpointed activations (about 0.3 GB) puts the
+  longest batches near 13 to 14 GB and typical ones near 10 GB. Batch size 1, gradient checkpointing and the
+  longest example's token count (printed by `--dry-run`) are what keep it inside 16 GB.
+- fp16 stability: the model is bf16-native and a T4 has no bf16, so overflow in fp16 is a real risk
+  (UNVERIFIED). The loss finite-check in `finetune.py` stops a NaN run and the merge is written in fp16 only
+  after that check.
+- The base checkpoint `tiny-aya-base` has no chat template; AlignTune's `setup_tokenizer` has a fallback
+  for that case. Not relevant here (A1 starts from Global).
+
+### How `scripts/finetune.py` uses it (written from the source above, never run against it)
+
+`src/msd/finetune.py` reads a YAML config (`configs/ft_lora.yaml`, `configs/ft_lora_strong.yaml`; unknown keys and
+out-of-range values are errors), validates the training data in-process with `msd.ftdata` (the same rules as
+`scripts/validate_ft_data.py`, plus: no overlap with heldout or taskdev when those files exist, and the
+subject allowlist), and only then builds the trainer. The call is the one the table above lists:
+
+```python
+create_sft_trainer(model_name=<base_model>, dataset_name=<train.jsonl>, backend="trl", output_dir=<adapter dir>,
+                   num_epochs=..., batch_size=..., learning_rate=..., max_seq_length=...,
+                   use_peft=True, lora_r=..., lora_alpha=..., lora_dropout=..., lora_target_modules=[...],
+                   precision="fp16", fp16=True, bf16=False, gradient_checkpointing=True, gradient_accumulation_steps=...,
+                   warmup_ratio=..., lr_scheduler=..., weight_decay=..., max_grad_norm=..., assistant_only_loss=True,
+                   seed=..., data_seed=..., logging_steps=..., save_steps=..., save_total_limit=..., loggers=["none"],
+                   load_best_model_at_end=False, eval_strategy="no", group_by_length=False, device_map={"": 0})
+```
+
+then `trainer.train()`, the loss and row-count checks, the merge, and `finetune_summary.json`. A conversion of
+the data would be needed only if the CuratorKIT parquet round trip turned out to change the rows; the
+smoke run decides that.
+
+### What is still UNVERIFIED
+
+The real call (`scripts/finetune.py` is written against this source and tested with a fake trainer only);
+that `import aligntune` and its install work on Kaggle or Colab without replacing torch; the parquet round
+trip and any dropped row; that TRL swaps in `cohere2_training.jinja` and masks only the answer; fp16 stability
+of Cohere2 on a T4; peak memory and the real token lengths (the 450-token preamble is a guess); the T4 hours;
+the `aligntune advise` output; whether `save_total_limit` and `loggers=["none"]` reach the `SFTConfig`
+through the backfill; the architecture numbers of the gated original; the CPU merge RAM. All of them are
+settled by the first GPU-runtime run (`docs/runtime.md`, section 5, finetune steps 1 to 3).

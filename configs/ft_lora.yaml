@@ -1,0 +1,79 @@
+# Arm A1, the base fine-tune: Tiny Aya Global + a LoRA adapter trained on a HARMLESS closed-form task
+# (Global-MMLU multiple choice, bare answer letter), then merged to fp16 weights. Read by
+# scripts/finetune.py (src/msd/finetune.py). EVERY training setting lives in this file; the code holds no
+# default. Unknown keys and out-of-range values are errors. Why each AlignTune keyword is what it is:
+# docs/toolkit-notes.md, "AlignTune SFT (read from source)". Nothing here has run on a GPU yet (UNVERIFIED);
+# the first run is the 20-step smoke run in docs/runtime.md, section 5.
+#
+# configs/ft_lora_strong.yaml is the retry for the case that this one does not move the model enough. It
+# differs ONLY in learning_rate, epochs, and lora.rank / lora.alpha (tests/test_finetune.py enforces that).
+
+base_model: CohereLabs/tiny-aya-global   # A0, gated: accept the licence on the model page, HF_TOKEN in the environment
+
+data:
+  train: data/ft/train.jsonl             # 6,000 rows, 1,500 per language (docs/toolkit-notes.md, "Provenance")
+  heldout: data/ft/heldout.jsonl         # checked for overlap when the file exists; never trained on
+  taskdev: data/ft/taskdev.jsonl         # same
+  pipeline: pipelines/ft_data.yaml       # holds extra.harmless_subjects, the subject allowlist (always checked)
+  testset: data/testset                  # safety dev/report splits; checked for overlap when the folder exists
+  langs: [en, hi, ar, sw]                # every split must have rows in each (hinglish rows are not built yet)
+
+lora:
+  # Rank 16 / alpha 32 / dropout 0.05 are AlignTune's own LoRA defaults (create_sft_trainer: lora_r 16,
+  # lora_alpha 32; the YAML path: lora_dropout 0.05) and the values of its Tiny Aya notebook. alpha / rank = 2
+  # is the usual scaling. A rank-16 adapter on the seven projections below is 30.2M parameters.
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  # Names read from transformers' modeling_cohere2.py. lm_head is tied to the embedding and left alone.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  bias: none
+
+quantization:
+  # none | 4bit | 8bit. Plain fp16 LoRA: the 3.35B model is 6.7 GB in fp16, which fits a 16 GB T4 with batch 1 and
+  # gradient checkpointing (arithmetic in the notes, UNVERIFIED), so QLoRA's saving is not needed. QLoRA would
+  # also train the adapter against a 4-bit copy of A0 and then merge it into the fp16 A0: the adapter would not
+  # be the one that was trained, a confound in a study that measures small safety shifts. quant_type and
+  # double_quant are read only when mode is not none; the 4-bit compute dtype follows train.fp16 / train.bf16
+  # (AlignTune's default is bfloat16, which a T4 does not have).
+  mode: none
+  quant_type: nf4
+  double_quant: true
+
+train:
+  # 1.0e-4 is half of create_sft_trainer's default (2e-4): a modest, common LoRA rate. Two epochs over 6,000
+  # rows at an effective batch of 16 is 750 optimizer steps. (Write 1.0e-4, not 1e-4: PyYAML reads 1e-4 as text.)
+  learning_rate: 1.0e-4
+  epochs: 2
+  per_device_batch_size: 1               # a 262,144-token vocabulary makes the logits the big tensor; batch 1 is the safe start
+  gradient_accumulation_steps: 16        # effective batch 16
+  max_seq_length: 2048                   # the template adds ~450 tokens of safety preamble (UNVERIFIED); the dry run prints the real longest example
+  warmup_ratio: 0.1                      # AlignTune's default
+  lr_scheduler: cosine                   # AlignTune's default
+  weight_decay: 0.01                     # AlignTune's default
+  max_grad_norm: 1.0                     # AlignTune's default
+  gradient_checkpointing: true           # AlignTune's default is False; needed to fit the T4
+  fp16: true                             # a T4 has no bf16 (AlignTune's AUTO precision can still pick it, so it is sent explicitly)
+  bf16: false
+  seed: 20261105                         # the repository's seed (pipelines/ft_data.yaml); also sent as data_seed
+  assistant_only_loss: true              # loss on the answer letter and the two end tokens only, not the preamble or the question
+  logging_steps: 10
+  save_steps: 250                        # checkpoints for a manual recovery only: AlignTune has no resume (UNVERIFIED)
+  save_total_limit: 2
+
+aligntune:
+  backend: trl                           # "auto" may pick unsloth (AGPL parts); we use TRL only
+  device_map: {"": 0}                    # everything on the one GPU; "auto" may offload layers to the CPU, which breaks training
+  group_by_length: false                 # AlignTune's default is True; plain random order
+  load_best_model_at_end: false          # AlignTune's default is True; there is no eval set
+  eval_strategy: "no"
+  loggers: ["none"]                      # AlignTune's default is tensorboard
+
+output:
+  adapter_dir: adapter                   # inside --out
+  merged_dir: merged                     # inside --out: the A1 model folder (fp16 weights + tokenizer)
+  merge_dtype: float16
+  keep_checkpoints: false                # the checkpoint-* folders are scratch once the adapter is saved
+
+checks:
+  history_points: 20                     # loss points kept in finetune_summary.json

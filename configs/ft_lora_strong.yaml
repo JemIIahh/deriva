@@ -1,0 +1,70 @@
+# Arm A1, the STRONG retry: the same recipe as configs/ft_lora.yaml with a higher learning rate, one more
+# epoch and a bigger adapter, for the case that the base fine-tune leaves the model too close to A0 to show any
+# drift. Run it only after the base config has been run and its held-out accuracy read (docs/runtime.md,
+# section 5). Read by scripts/finetune.py. tests/test_finetune.py checks that this file differs from the base
+# in exactly these places and in no other: train.learning_rate (higher), train.epochs (more), lora.rank (higher)
+# and lora.alpha (kept at 2 x rank, so the LoRA scale alpha / rank is unchanged and only the capacity grows).
+# Every comment on a setting that does not change is in the base file. UNVERIFIED: nothing here has run.
+
+base_model: CohereLabs/tiny-aya-global
+
+data:
+  train: data/ft/train.jsonl
+  heldout: data/ft/heldout.jsonl
+  taskdev: data/ft/taskdev.jsonl
+  pipeline: pipelines/ft_data.yaml
+  testset: data/testset
+  langs: [en, hi, ar, sw]
+
+lora:
+  # Rank 32 (base 16): twice the capacity, 60.4M parameters. Not 64: at rank 64 the fp32 adapter, gradients and
+  # Adam state would take about 2 GB of a 16 GB T4 next to the 6.7 GB of weights and the logits (arithmetic in
+  # the notes, UNVERIFIED), and the longest examples already sit near 13 to 14 GB.
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  bias: none
+
+quantization:
+  mode: none                             # see the base file: no QLoRA
+  quant_type: nf4
+  double_quant: true
+
+train:
+  # 2.0e-4 is create_sft_trainer's own default (twice the base config's rate); three epochs is 1,125 steps,
+  # about 1.5 times the base run's time (UNVERIFIED, docs/runtime.md).
+  learning_rate: 2.0e-4
+  epochs: 3
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  max_seq_length: 2048
+  warmup_ratio: 0.1
+  lr_scheduler: cosine
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  fp16: true
+  bf16: false
+  seed: 20261105
+  assistant_only_loss: true
+  logging_steps: 10
+  save_steps: 250
+  save_total_limit: 2
+
+aligntune:
+  backend: trl
+  device_map: {"": 0}
+  group_by_length: false
+  load_best_model_at_end: false
+  eval_strategy: "no"
+  loggers: ["none"]
+
+output:
+  adapter_dir: adapter
+  merged_dir: merged
+  merge_dtype: float16
+  keep_checkpoints: false
+
+checks:
+  history_points: 20
