@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+blend = ["torch"]  # msd.blend and its tests: CPU torch is enough (bf16 arithmetic and tensor bytes)
 judge = ["anthropic"]  # the anthropic: judge; the hf: judge needs torch and transformers, which only the GPU runtime has
 
 [tool.setuptools.packages.find]
