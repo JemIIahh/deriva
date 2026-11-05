@@ -172,3 +172,62 @@ def test_token_cell_survives_a_kernel_argv(name, kernel_runtime, monkeypatch, ca
 def test_run_stage_notebook_pulls_pipelines_as_well_as_scripts():
     text = "\n".join(source_of(c) for c in load("10_run_stage.ipynb")["cells"])
     assert '"pipelines/*"' in text and '"scripts/*"' in text
+
+
+# --- the upload cell only ever sends completions to a private repo ---------------------------------------
+
+
+class _Info:
+    def __init__(self, private):
+        self.private = private
+
+
+def _upload_cell():
+    cells = [source_of(c) for c in load("10_run_stage.ipynb")["cells"] if c["cell_type"] == "code"]
+    return next(src for src in cells if "upload_folder" in src)
+
+
+def _run_upload_cell(private, tmp_path, monkeypatch, log):
+    class FakeApi:
+        def repo_info(self, repo_id, **kwargs):
+            log.append(("repo_info", repo_id, kwargs))
+            return _Info(private)
+
+        def upload_folder(self, **kwargs):
+            log.append(("upload_folder", kwargs))
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "results" / "run_eval").mkdir(parents=True)
+    namespace = {"STAGE": "run_eval", "WORKSPACE_REPO": "someone/msd-workspace", "token": "dummy", "HfApi": FakeApi}
+    exec(compile(_upload_cell(), "10_run_stage.ipynb", "exec"), namespace)
+
+
+def test_upload_cell_checks_the_repo_is_private_before_uploading(tmp_path, monkeypatch):
+    log = []
+    _run_upload_cell(True, tmp_path, monkeypatch, log)
+    assert [entry[0] for entry in log] == ["repo_info", "upload_folder"]
+    assert log[0][2]["repo_type"] == "dataset" and log[0][1] == "someone/msd-workspace"
+
+
+@pytest.mark.parametrize("private", [False, None, "yes"])
+def test_upload_cell_refuses_a_repo_that_is_not_private_and_uploads_nothing(private, tmp_path, monkeypatch):
+    log = []
+    with pytest.raises(RuntimeError, match="private"):
+        _run_upload_cell(private, tmp_path, monkeypatch, log)
+    assert [entry[0] for entry in log] == ["repo_info"]  # asked, then refused: upload_folder was never called
+
+
+def test_upload_cell_says_why_in_plain_words():
+    text = _upload_cell()
+    assert ".private" in text and "repo_info" in text
+    assert "completions" in text and "private" in text.lower()
+
+
+def test_upload_cell_with_no_results_folder_uploads_and_checks_nothing(tmp_path, monkeypatch):
+    class FakeApi:
+        def __init__(self):
+            raise AssertionError("no Hugging Face call is needed when there is nothing to upload")
+
+    monkeypatch.chdir(tmp_path)
+    namespace = {"STAGE": "run_eval", "WORKSPACE_REPO": "someone/msd-workspace", "token": "dummy", "HfApi": FakeApi}
+    exec(compile(_upload_cell(), "10_run_stage.ipynb", "exec"), namespace)

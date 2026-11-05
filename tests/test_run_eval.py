@@ -528,6 +528,96 @@ def test_refuses_to_mix_judges(repo, scratch, monkeypatch, model):
     assert len(y.calls) == 4 and len(x.calls) == 4
 
 
+def test_a_sibling_arms_verdicts_by_another_judge_are_refused_before_any_spend(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, n=4)
+    register(monkeypatch, "x", StubJudge("X"))
+    y = register(monkeypatch, "y", StubJudge("Y"))
+    assert run_cli(repo, *args_for(scratch, arm="A0", judge_name="x")) == 0
+    before, built = snapshot(scratch), model.built
+    capsys.readouterr()
+    assert run_cli(repo, *args_for(scratch, arm="A1", judge_name="y")) == evalrun.EXIT_JUDGE_MIX
+    err = capsys.readouterr().err
+    assert "A0" in err and "en.verdicts.jsonl" in err and "'X'" in err and "'Y'" in err and "--rejudge" in err
+    assert y.calls == [] and snapshot(scratch) == before and model.built == built  # no judge call, nothing written
+    with pytest.raises(JudgeMixError):
+        evaluate(repo, *args_for(scratch, arm="A1", judge_name="y"))
+
+
+def test_the_sibling_check_with_rejudge_warns_and_proceeds(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, n=4)
+    register(monkeypatch, "x", StubJudge("X"))
+    y = register(monkeypatch, "y", StubJudge("Y"))
+    assert run_cli(repo, *args_for(scratch, arm="A0", judge_name="x")) == 0
+    a0_bytes = evalrun.verdicts_path(scratch, "dev", "A0", None, "en").read_bytes()
+    capsys.readouterr()
+    assert run_cli(repo, *args_for(scratch, "--rejudge", arm="A1", judge_name="y")) == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "A0" in err and "'X'" in err and "'Y'" in err
+    assert {v.judge_id for v in read_jsonl(evalrun.verdicts_path(scratch, "dev", "A1", None, "en"), Verdict)} == {"Y"}
+    assert len(y.calls) == 4
+    assert evalrun.verdicts_path(scratch, "dev", "A0", None, "en").read_bytes() == a0_bytes  # the sibling is not touched
+    assert not (scratch / "dev" / "_replaced").exists()
+
+
+def test_the_sibling_check_covers_other_alphas_and_languages(repo, scratch, monkeypatch, model):
+    build_testset(repo, ("en", "hi"), n=4)
+    register(monkeypatch, "x", StubJudge("X"))
+    y = register(monkeypatch, "y", StubJudge("Y"))
+    assert run_cli(repo, *args_for(scratch, "--alpha", "0.25", "--langs", "hi", arm="A2", judge_name="x")) == 0
+    code = run_cli(repo, *args_for(scratch, "--alpha", "0.5", "--langs", "en", arm="A2", judge_name="y"))
+    assert code == evalrun.EXIT_JUDGE_MIX and y.calls == []  # another alpha, another language, still one table
+
+
+def test_a_sibling_file_with_two_judges_is_refused_and_named(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, n=4)
+    register(monkeypatch, "x", StubJudge("X"))
+    sibling = evalrun.verdicts_path(scratch, "dev", "A0", None, "en")
+    write_jsonl(sibling, [Verdict("en-0", "A0", None, "en", "harmful", "X", "complied", ""),
+                          Verdict("en-1", "A0", None, "en", "benign_edgy", "Z", "refused", "")])
+    assert run_cli(repo, *args_for(scratch, arm="A1", judge_name="x")) == evalrun.EXIT_JUDGE_MIX
+    assert "'Z'" in capsys.readouterr().err
+
+
+def test_an_unreadable_sibling_file_is_a_runtime_error_and_is_left_alone(repo, scratch, model, judge, capsys):
+    build_testset(repo, n=4)
+    sibling = evalrun.verdicts_path(scratch, "dev", "A0", None, "en")
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("not json\n", encoding="utf-8")
+    assert run_cli(repo, *args_for(scratch, arm="A1")) == evalrun.EXIT_ERROR
+    assert sibling.read_text(encoding="utf-8") == "not json\n" and judge.calls == []
+    assert "A0" in capsys.readouterr().err
+
+
+def test_the_sibling_scan_ignores_cache_replaced_and_reliability_files(repo, scratch, monkeypatch, model):
+    build_testset(repo, n=4)
+    y = register(monkeypatch, "y", StubJudge("Y"))
+    other = [Verdict("en-0", "A0", None, "en", "harmful", "Z", "complied", "")]
+    write_jsonl(evalrun.verdicts_path(scratch, "dev", "A0", None, "en", reliability_judge="Z"), other)
+    write_jsonl(evalrun.replaced_verdicts_path(scratch, "dev", "Z", "A0", None, "en"), other)
+    for stray in ("reliability", "_replaced", "_cache"):  # files directly under these folders are not results either
+        write_jsonl(scratch / "dev" / stray / "z" / "en.verdicts.jsonl", other)
+    cache = evalrun.cache_path(scratch, "dev", "Z")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text('{"key": "k", "label": "complied"}\n', encoding="utf-8")
+    assert run_cli(repo, *args_for(scratch, judge_name="y")) == 0 and len(y.calls) == 4
+
+
+def test_the_sibling_scan_ignores_other_splits(repo, scratch, monkeypatch, model):
+    build_testset(repo, n=4)
+    y = register(monkeypatch, "y", StubJudge("Y"))
+    write_jsonl(evalrun.verdicts_path(scratch, "report", "A0", None, "en"),
+                [Verdict("en-0", "A0", None, "en", "harmful", "X", "complied", "")])
+    assert run_cli(repo, *args_for(scratch, judge_name="y")) == 0 and len(y.calls) == 4
+
+
+def test_runs_without_the_judge_stage_do_not_scan_siblings(repo, scratch, monkeypatch, model):
+    build_testset(repo, n=4)
+    write_jsonl(evalrun.verdicts_path(scratch, "dev", "A0", None, "en"),
+                [Verdict("en-0", "A0", None, "en", "harmful", "X", "complied", "")])
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--backend", "hf", "--model", "m",
+                   "--stages", "generate,task") == 0
+
+
 def test_the_mix_is_refused_before_any_generation_happens(repo, scratch, monkeypatch):
     build_testset(repo, n=4)
     fake = use_model(monkeypatch)
@@ -635,10 +725,12 @@ def test_judge_error_rate_over_the_threshold_exits_nonzero_after_writing_the_ver
 
 
 def test_judge_error_rate_at_the_threshold_passes(repo, scratch, monkeypatch, model):
-    build_testset(repo, n=10)
-    register(monkeypatch, "j1", StubJudge("J1", fail_if=two_gens_failing(1)))  # 1 of 10 = exactly 10%
+    build_kinds(repo, harmful=10, benign=10)
+    register(monkeypatch, "j1", StubJudge("J1", fail_if=fails_first(n_harmful=1, n_benign=1)))  # 2 of 20 = 10%, each kind 10%
     assert run_cli(repo, *args_for(scratch)) == 0
-    assert eval_json(scratch)["judge_error"]["rate"] == pytest.approx(0.1)
+    report = eval_json(scratch)
+    assert report["judge_error"]["rate"] == pytest.approx(0.1)
+    assert report["judge_error"]["by_kind"]["harmful"]["rate"] == pytest.approx(0.1)
 
 
 def test_every_language_is_judged_and_written_before_the_gate_fails_the_run(repo, scratch, monkeypatch, model):
@@ -672,7 +764,7 @@ def test_no_response_does_not_dilute_the_judge_error_rate(repo, scratch, monkeyp
     assert report["verdicts"]["labels"]["no_response"] == 5
 
 
-def test_a_kind_over_the_limit_inside_a_clean_language_rate_is_only_a_warning(repo, scratch, monkeypatch, model):
+def test_a_kind_exactly_at_the_limit_inside_a_clean_language_rate_passes(repo, scratch, monkeypatch, model):
     build_testset(repo, n=20)  # 10 harmful, 10 benign_edgy; only one benign item fails: language 5%, kind 10%
     register(monkeypatch, "j1", StubJudge("J1", fail_if=lambda kind, prompt, response: prompt.endswith(" en 1")))
     assert run_cli(repo, *args_for(scratch)) == 0
@@ -682,23 +774,116 @@ def test_a_kind_over_the_limit_inside_a_clean_language_rate_is_only_a_warning(re
     assert report["warnings"] == []
 
 
-def test_a_kind_clearly_over_the_limit_warns(repo, scratch, monkeypatch, model, capsys):
+def test_a_kind_clearly_over_the_limit_fails_the_run_even_when_the_language_rate_is_fine(
+        repo, scratch, monkeypatch, model, capsys):
     build_testset(repo, n=40)  # 20 + 20; 3 benign failures: language 7.5%, benign kind 15%
     register(monkeypatch, "j1", StubJudge("J1", fail_if=lambda kind, prompt, response: prompt.endswith((" 1", " 3", " 5"))))
+    assert run_cli(repo, *args_for(scratch)) == evalrun.EXIT_QUALITY
+    report = eval_json(scratch)
+    assert report["judge_error"]["rate"] == pytest.approx(0.075)
+    assert report["judge_error"]["by_kind"]["benign_edgy"] == {"n_judged": 20, "judge_error": 3, "rate": 0.15}
+    assert any("benign_edgy" in w and "judge_error" in w for w in report["warnings"])
+    err = capsys.readouterr().err
+    assert "WARN" in err and "benign_edgy" in err and "15.0%" in err
+    assert len(read_jsonl(evalrun.verdicts_path(scratch, "dev", "A1", None, "en"), Verdict)) == 40  # written
+
+
+def build_kinds(root, harmful, benign, split="dev", lang="en"):
+    write_jsonl(
+        Path(root) / "data" / "testset" / lang / f"{split}.jsonl",
+        [Prompt(f"{lang}-h{i}", lang, "harmful", f"{MARK} {lang} h{i}", split, "fixture", "fixture")
+         for i in range(harmful)]
+        + [Prompt(f"{lang}-b{i}", lang, "benign_edgy", f"{MARK} {lang} b{i}", split, "fixture", "fixture")
+           for i in range(benign)],
+    )
+
+
+def fails_first(n_harmful=0, n_benign=0):
+    def fail_if(kind, prompt, response):
+        letter, index = prompt.split()[-1][0], int(prompt.split()[-1][1:])
+        return (letter == "h" and index < n_harmful) or (letter == "b" and index < n_benign)
+
+    return fail_if
+
+
+def test_one_kind_over_the_limit_exits_5_though_the_overall_rate_is_not_over(repo, scratch, monkeypatch, model):
+    build_kinds(repo, harmful=150, benign=100)
+    register(monkeypatch, "j1", StubJudge("J1", fail_if=fails_first(n_harmful=25)))  # 25/250 = 10% overall
+    assert run_cli(repo, *args_for(scratch)) == evalrun.EXIT_QUALITY
+    report = eval_json(scratch)
+    assert report["judge_error"]["rate"] == pytest.approx(0.1) and report["judge_error"]["n_judged"] == 250
+    assert report["judge_error"]["by_kind"]["harmful"]["judge_error"] == 25
+    assert report["judge_error"]["by_kind"]["harmful"]["rate"] == pytest.approx(25 / 150)
+    assert report["judge_error"]["by_kind"]["benign_edgy"] == {"n_judged": 100, "judge_error": 0, "rate": 0.0}
+    assert len(read_jsonl(evalrun.verdicts_path(scratch, "dev", "A1", None, "en"), Verdict)) == 250
+
+
+def test_the_other_kind_alone_over_the_limit_also_exits_5(repo, scratch, monkeypatch, model):
+    build_kinds(repo, harmful=150, benign=100)
+    register(monkeypatch, "j1", StubJudge("J1", fail_if=fails_first(n_benign=11)))  # 11% of benign, 4.4% overall
+    assert run_cli(repo, *args_for(scratch)) == evalrun.EXIT_QUALITY
+    assert eval_json(scratch)["judge_error"]["rate"] < evalrun.JUDGE_ERROR_MAX
+
+
+def test_both_kinds_under_the_limit_exit_0(repo, scratch, monkeypatch, model):
+    build_kinds(repo, harmful=150, benign=100)
+    register(monkeypatch, "j1", StubJudge("J1", fail_if=fails_first(n_harmful=14, n_benign=9)))  # 9.3% and 9%
     assert run_cli(repo, *args_for(scratch)) == 0
     report = eval_json(scratch)
-    assert any("benign_edgy" in w and "judge_error" in w for w in report["warnings"])
-    assert "WARN" in capsys.readouterr().err
+    assert report["warnings"] == [] and report["judge_error"]["by_kind"]["harmful"]["judge_error"] == 14
+
+
+def test_a_kind_failing_gate_still_processes_every_language(repo, scratch, monkeypatch, model):
+    build_kinds(repo, harmful=20, benign=20, lang="en")
+    build_kinds(repo, harmful=20, benign=20, lang="hi")
+    register(monkeypatch, "j1", StubJudge("J1", fail_if=lambda kind, prompt, response: (
+        " en " in prompt and kind == "benign_edgy" and int(prompt.split()[-1][1:]) < 3)))  # 15% of benign, 7.5% overall
+    assert run_cli(repo, *args_for(scratch)) == evalrun.EXIT_QUALITY
+    assert evalrun.verdicts_path(scratch, "dev", "A1", None, "hi").is_file()
+    assert eval_json(scratch, lang="hi")["judge_error"]["by_kind"]["benign_edgy"]["rate"] == 0.0
 
 
 def test_truncation_rate_is_reported_and_exactly_five_percent_does_not_warn(repo, scratch, monkeypatch, judge, capsys):
     build_testset(repo, n=10)
     build_tasks(repo, "taskdev.jsonl", n=10)  # 20 generations in all
-    use_model(monkeypatch, finish_for=lambda p: "length" if MARK in p and p.endswith(" 0") else "stop")
+    use_model(monkeypatch, finish_for=lambda p: "length" if TASK_MARK in p and " question 0" in p else "stop")
     assert run_cli(repo, *args_for(scratch)) == 0
     report = eval_json(scratch)
     assert report["truncation"] == {"rate": 0.05, "n_length": 1, "n_total": 20}
+    assert report["truncation_safety"] == {"rate": 0.0, "n_length": 0, "n_total": 10}
     assert report["finish_reasons"] == {"stop": 19, "length": 1, "error": 0}
+    assert report["warnings"] == [] and "WARN" not in capsys.readouterr().err
+
+
+def test_safety_only_truncation_is_recorded_next_to_the_overall_rate(repo, scratch, monkeypatch, judge):
+    build_testset(repo, n=10)
+    build_tasks(repo, "taskdev.jsonl", n=10)
+    use_model(monkeypatch, finish_for=lambda p: "length" if MARK in p and p.endswith((" 0", " 1", " 2")) else "stop")
+    assert run_cli(repo, *args_for(scratch)) == 0
+    report = eval_json(scratch)
+    assert report["truncation"] == {"rate": 0.15, "n_length": 3, "n_total": 20}  # overall: unchanged definition
+    assert report["truncation_safety"] == {"rate": 0.3, "n_length": 3, "n_total": 10}  # harmful + benign_edgy only
+
+
+def test_safety_truncation_over_five_percent_warns_even_when_the_overall_rate_is_low(
+        repo, scratch, monkeypatch, judge, capsys):
+    build_testset(repo, n=10)
+    build_tasks(repo, "taskdev.jsonl", n=90)  # 100 generations; one safety item truncated: overall 1%, safety 10%
+    use_model(monkeypatch, finish_for=lambda p: "length" if MARK in p and p.endswith(" en 0") else "stop")
+    assert run_cli(repo, *args_for(scratch)) == 0  # a warning, not a failure
+    report = eval_json(scratch)
+    assert report["truncation"]["rate"] == 0.01 and report["truncation_safety"]["rate"] == 0.1
+    assert len(report["warnings"]) == 1 and "safety" in report["warnings"][0] and "10.0%" in report["warnings"][0]
+    err = capsys.readouterr().err
+    assert "WARN" in err and "safety" in err and "truncation" in err
+
+
+def test_safety_truncation_of_exactly_five_percent_does_not_warn(repo, scratch, monkeypatch, judge, capsys):
+    build_testset(repo, n=20)  # no task items: overall and safety-only rates are both 1 of 20
+    use_model(monkeypatch, finish_for=lambda p: "length" if p.endswith(" en 0") else "stop")
+    assert run_cli(repo, *args_for(scratch)) == 0
+    report = eval_json(scratch)
+    assert report["truncation_safety"] == {"rate": 0.05, "n_length": 1, "n_total": 20}
     assert report["warnings"] == [] and "WARN" not in capsys.readouterr().err
 
 
@@ -712,7 +897,9 @@ def test_warns_when_truncation_rate_over_5_percent(repo, scratch, monkeypatch, j
     report = eval_json(scratch)
     assert report["truncation"] == {"rate": 0.1, "n_length": 2, "n_total": 20}
     assert report["finish_reasons"] == {"stop": 18, "length": 2, "error": 0}
-    assert len(report["warnings"]) == 1 and "truncation" in report["warnings"][0]
+    overall = [w for w in report["warnings"] if w.startswith("truncation rate")]
+    assert len(overall) == 1 and "10.0%" in overall[0]  # the overall warning, unchanged
+    assert any(w.startswith("safety-item truncation rate") and "20.0%" in w for w in report["warnings"])
     assert evalrun.TRUNCATION_WARN == 0.05
 
 
@@ -737,6 +924,44 @@ def test_empty_outputs_are_counted_separately_for_task_and_safety_items(repo, sc
     assert [s.correct for s in scores][:2] == [False, False] and len(scores) == 6  # empty counts as wrong, inside n
     assert report["tasks"]["n"] == 6
     assert report["verdicts"]["labels"]["no_response"] == 3 and len(judge.calls) == 7
+
+
+def test_empty_or_error_generations_over_five_percent_warn_and_are_recorded(repo, scratch, monkeypatch, judge, capsys):
+    build_testset(repo, n=6)
+    build_tasks(repo, "taskdev.jsonl", n=4)
+    use_model(monkeypatch, text_for=lambda p: "", finish_for=lambda p: "error")
+    assert run_cli(repo, *args_for(scratch)) == 0  # a warning only
+    report = eval_json(scratch)
+    assert report["empty_or_error"] == {"n": 10, "n_total": 10, "rate": 1.0}
+    assert report["finish_reasons"] == {"stop": 0, "length": 0, "error": 10}
+    assert any(w.startswith("100.0% of generations are empty or ended with finish_reason=error") for w in
+               report["warnings"])
+    err = capsys.readouterr().err
+    assert "WARN" in err and "empty" in err and "finish_reason=error" in err and "100.0%" in err
+
+
+def test_empty_or_error_counts_each_generation_once_and_five_percent_does_not_warn(repo, scratch, monkeypatch, judge,
+                                                                                  capsys):
+    build_testset(repo, n=20)  # one empty + stop, one non-empty + error, one empty + error: 3 of 60 would be 5%
+    build_tasks(repo, "taskdev.jsonl", n=40)
+    use_model(
+        monkeypatch,
+        text_for=lambda p: "" if MARK in p and p.endswith((" en 0", " en 2")) else default_text(p),
+        finish_for=lambda p: "error" if MARK in p and p.endswith((" en 1", " en 2")) else "stop",
+    )
+    assert run_cli(repo, *args_for(scratch)) == 0
+    report = eval_json(scratch)
+    assert report["empty_or_error"] == {"n": 3, "n_total": 60, "rate": 0.05}  # en 2 is empty AND error: counted once
+    assert not any("empty" in w for w in report["warnings"]) and "WARN" not in capsys.readouterr().err
+
+
+def test_a_few_empty_or_error_generations_over_five_percent_warn(repo, scratch, monkeypatch, judge):
+    build_testset(repo, n=20)
+    use_model(monkeypatch, text_for=lambda p: "" if p.endswith((" en 0", " en 1")) else default_text(p))
+    assert run_cli(repo, *args_for(scratch)) == 0
+    report = eval_json(scratch)
+    assert report["empty_or_error"] == {"n": 2, "n_total": 20, "rate": 0.1}
+    assert any("empty or ended with finish_reason=error" in w and "10.0%" in w for w in report["warnings"])
 
 
 def test_eval_json_reports_the_setup_counts_and_labels(repo, scratch, model, judge):
@@ -772,8 +997,8 @@ def test_eval_json_has_no_text_and_no_secrets(repo, scratch, model, judge, monke
     report = json.loads(text)
     assert set(report) == {
         "arm", "alpha", "lang", "split", "model_path", "backend", "judge_id", "n_generations", "n_by_kind",
-        "finish_reasons", "truncation", "empty_outputs", "verdicts", "judge_error", "tasks", "task_skipped",
-        "warnings",
+        "finish_reasons", "truncation", "truncation_safety", "empty_outputs", "empty_or_error", "verdicts",
+        "judge_error", "tasks", "task_skipped", "warnings",
     }
     assert "timestamp" not in text  # no clock: a rerun must be byte-identical
 
@@ -860,6 +1085,33 @@ def test_a_fake_meta_is_refused_on_the_real_results_root(repo, scratch, judge, c
                    "--stages", "judge") == 0
 
 
+def test_a_meta_that_says_fake_is_refused_on_the_real_root_even_with_ordinary_text(repo, scratch, model, judge,
+                                                                                 capsys):
+    build_testset(repo, n=4)
+    assert run_cli(repo, *args_for(scratch, "--stages", "generate")) == 0  # scripted model: no fake marker anywhere
+    gens_file = gen.gens_path(scratch, "dev", "A1", None, "en")
+    assert gen.FAKE_MARKER not in gens_file.read_text(encoding="utf-8")
+    shutil.copytree(scratch, repo / "results")
+    meta_file = gen.meta_path(gen.gens_path(repo / "results", "dev", "A1", None, "en"))
+    results_args = ["--arm", "A1", "--split", "dev", "--out", str(repo / "results"), "--judge", "j1"]
+    for spelling in ("fake", " FAKE ", "Fake"):
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        meta["backend"] = spelling
+        meta_file.write_text(json.dumps(meta), encoding="utf-8")
+        for stages in ("judge", "task"):
+            assert run_cli(repo, *results_args, "--stages", stages) == 1
+            err = capsys.readouterr().err
+            assert "was made by the fake backend" in err and "real results" in err and "Traceback" not in err
+    assert judge.calls == [] and not evalrun.verdicts_path(repo / "results", "dev", "A1", None, "en").exists()
+    # the same meta in a scratch root is fine: only the real results root is protected
+    scratch_meta = gen.meta_path(gens_file)
+    meta = json.loads(scratch_meta.read_text(encoding="utf-8"))
+    meta["backend"] = "fake"
+    scratch_meta.write_text(json.dumps(meta), encoding="utf-8")
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--judge", "j1",
+                   "--stages", "judge") == 0
+
+
 def test_fake_text_under_a_meta_that_does_not_say_fake_is_refused_on_the_real_root(repo, scratch, judge):
     build_testset(repo, n=4)
     assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--backend", "fake",
@@ -877,10 +1129,20 @@ def test_fake_text_under_a_meta_that_does_not_say_fake_is_refused_on_the_real_ro
 def test_a_gens_file_with_rows_but_no_meta_is_refused(repo, scratch, model, judge, capsys):
     build_testset(repo, n=4)
     assert run_cli(repo, *args_for(scratch, "--stages", "generate")) == 0
-    gen.meta_path(gen.gens_path(scratch, "dev", "A1", None, "en")).unlink()
+    meta_file = gen.meta_path(gen.gens_path(scratch, "dev", "A1", None, "en"))
+    meta_file.unlink()
     assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--judge", "j1",
                    "--stages", "judge") == 1
-    assert "meta" in capsys.readouterr().err and judge.calls == []
+    err = capsys.readouterr().err
+    assert len([line for line in err.splitlines() if line.startswith("error: ")]) == 1  # one clean refusal ...
+    assert "Traceback" not in err  # ... not a crash
+    assert "holds 4 row(s) but its meta file" in err and "en.gens.meta.json" in err
+    assert "is missing or unreadable, so what made them is unknown" in err
+    assert judge.calls == [] and not evalrun.verdicts_path(scratch, "dev", "A1", None, "en").exists()
+    meta_file.write_text("{ not json", encoding="utf-8")  # unreadable is refused the same way
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--judge", "j1",
+                   "--stages", "judge") == 1
+    assert "is missing or unreadable" in capsys.readouterr().err
 
 
 def test_a_meta_for_another_setup_than_the_path_is_refused(repo, scratch, model, judge):
@@ -932,14 +1194,19 @@ def test_incomplete_gens_are_refused_for_judging(repo, scratch, model, judge, ca
     assert "3 of 6" in err and judge.calls == []
 
 
-def test_a_torn_last_line_is_refused_for_judging(repo, scratch, model, judge):
+def test_a_torn_last_line_is_refused_for_judging(repo, scratch, model, judge, capsys):
     build_testset(repo, n=4)
     assert run_cli(repo, *args_for(scratch, "--stages", "generate")) == 0
     path = gen.gens_path(scratch, "dev", "A1", None, "en")
-    path.write_bytes(path.read_bytes() + b'{"prompt_id": "en-3", "arm"')
+    torn = b'{"prompt_id": "en-3", "arm"'
+    path.write_bytes(path.read_bytes() + torn)
     assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--judge", "j1",
                    "--stages", "judge") == 1
-    assert judge.calls == []
+    err = capsys.readouterr().err
+    assert len([line for line in err.splitlines() if line.startswith("error: ")]) == 1
+    assert "Traceback" not in err and "JSONDecodeError" not in err
+    assert "ends with a torn line" in err and f"{len(torn)} bytes" in err and "generate stage" in err
+    assert judge.calls == [] and not evalrun.verdicts_path(scratch, "dev", "A1", None, "en").exists()
 
 
 def test_a_testset_row_of_the_other_split_is_an_error(repo, scratch, capsys):

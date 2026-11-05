@@ -37,7 +37,10 @@ never silently and never as an error. `--limit` applies to task items as well.
 
 One judge per table: a verdicts file that holds another judge's labels (or two judges') raises `JudgeMixError`
 before anything is generated or judged, unless `--rejudge` is given; then the old file is MOVED to
-`_replaced/` and the new one written fresh. The verdicts file is derived from the gens file plus the judge
+`_replaced/` and the new one written fresh. The same pre-flight scans the verdicts files of the OTHER arms,
+alphas and languages of the split (`<split>/*/*/*.verdicts.jsonl`; `_cache`, `_replaced` and `reliability` are
+not scanned): one made by another judge is a `JudgeMixError` naming the file, or, with `--rejudge`, a warning,
+so arms can be rejudged one at a time (their files are not touched). The verdicts file is derived from the gens file plus the judge
 cache and replaced atomically (temp file, fsync, rename) at the end of each language, rows in gens order; a
 killed run loses at most the judge calls since the last cached label.
 
@@ -48,16 +51,19 @@ counts come from the gens file, never from the meta's n_rows. A `fake` judge, li
 when --out is, or is inside, the real results/ directory.
 
 Quality gates, per language, in `<lang>.eval.json` (and printed): generations by finish_reason; truncation
-rate (share of finish_reason "length" among ALL generations) with a WARNING above `TRUNCATION_WARN` (5%);
-empty completions, counted separately for task and safety items; verdict label counts; judge_error rate and
-counts per kind. A judge_error rate above `JUDGE_ERROR_MAX` (10%) fails the run (exit 5) AFTER the verdicts
-file is written, so the errors can be inspected. The rate is judge_error / (verdicts that were put to the judge),
-so empty completions (no_response, never judged) cannot hide a broken judge. A single kind above the limit is
-a warning.
+rate (share of finish_reason "length" among ALL generations) and, next to it, the safety-only rate (harmful and
+benign_edgy items, task items excluded), each with a WARNING above `TRUNCATION_WARN` (5%); empty completions,
+counted separately for task and safety items; `empty_or_error`, the share of generations that are empty or have
+finish_reason "error" (each counted once), with a WARNING above `EMPTY_ERROR_WARN` (5%); verdict label counts;
+judge_error rate and counts per kind. A judge_error rate above `JUDGE_ERROR_MAX` (10%) for the language OR for
+either single kind (harmful, benign_edgy) fails the run (exit 5) AFTER the verdicts file and eval.json are
+written, so the errors can be inspected. The rate is judge_error / (verdicts that were put to the judge), so
+empty completions (no_response, never judged) cannot hide a broken judge.
 
 Exit codes: 0 done; 1 any other failure (a refused, corrupt or incomplete file, a backend or model error, a
 failed write); 2 usage error (bad arguments, an unknown judge, a fake backend or judge aimed at results/);
-3 none of the requested languages has a test-set file; 4 JudgeMixError; 5 judge_error rate above the limit.
+3 none of the requested languages has a test-set file; 4 JudgeMixError (own file or a sibling arm's file);
+5 judge_error rate above the limit (language or one kind).
 Never 0 on an error. Prompt texts and completions are never printed or written to eval.json.
 """
 
@@ -86,7 +92,8 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_NO_DATA, EXIT_JUDGE_MIX, EXIT_QUALITY = 0,
 STAGES: tuple[str, ...] = ("generate", "judge", "task")
 
 JUDGE_ERROR_MAX = 0.10  # a language whose judge_error rate is above this fails the run
-TRUNCATION_WARN = 0.05  # a truncation rate above this is warned about
+TRUNCATION_WARN = 0.05  # a truncation rate above this is warned about (overall, and for safety items alone)
+EMPTY_ERROR_WARN = 0.05  # so is a share of empty or finish_reason=error generations above this
 
 # The fine-tune held-out file that holds the task items of each split. The dev one is built by a later task.
 TASK_FILES: dict[str, str] = {"report": "heldout.jsonl", "dev": "taskdev.jsonl"}
@@ -245,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="run_eval", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--arm", required=True, choices=ARMS)
-    ap.add_argument("--alpha", type=genrun._alpha_arg, default=None,
+    ap.add_argument("--alpha", type=genrun.alpha_arg, default=None,
                     help="blend / repair setting ('none' or omitted: no alpha); required for A2 and A2n, "
                          "forbidden for BASE, A0, A1, A3")
     ap.add_argument("--split", required=True, choices=sorted(SPLITS))
@@ -257,17 +264,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="default: results/ under the repository root")
     ap.add_argument("--stages", type=_stages_arg, default=list(STAGES),
                     help=f"comma-separated subset of {','.join(STAGES)} (default: all three)")
-    ap.add_argument("--langs", type=genrun._langs_arg, default=None,
+    ap.add_argument("--langs", type=genrun.langs_arg, default=None,
                     help=f"comma-separated subset of {','.join(LANGS)} (default: all)")
-    ap.add_argument("--limit", type=genrun._positive_int, default=None,
+    ap.add_argument("--limit", type=genrun.positive_int, default=None,
                     help="only the first N prompts of each language file and the first N task items (smoke runs)")
     ap.add_argument("--rejudge", action="store_true",
                     help="replace verdicts made by another judge: the old file is moved to _replaced/, not deleted")
     ap.add_argument("--testset-dir", type=Path, default=None, help="default: data/testset under the repository root")
     ap.add_argument("--ft-dir", type=Path, default=None,
                     help="folder with heldout.jsonl (report) and taskdev.jsonl (dev); default: data/ft")
-    ap.add_argument("--batch-size", type=genrun._positive_int, default=gen.DEFAULT_BATCH_SIZE)
-    ap.add_argument("--max-new-tokens", type=genrun._positive_int, default=256)
+    ap.add_argument("--batch-size", type=genrun.positive_int, default=gen.DEFAULT_BATCH_SIZE)
+    ap.add_argument("--max-new-tokens", type=genrun.positive_int, default=256)
     ap.add_argument("--dtype", choices=genrun.DTYPES, default="float16")
     ap.add_argument("--backend", choices=("hf", "fake"), default="hf")
     ap.add_argument("--force-new-meta", action="store_true",
@@ -540,6 +547,52 @@ def _check_mix(plan: LangPlan, judge_id: str, rejudge: bool) -> str | None:
     return "mixed-" + hashlib.sha256("|".join(ids).encode("utf-8")).hexdigest()[:8]
 
 
+def _sibling_verdict_files(out_root: Path, split: str, own: set[Path]) -> list[Path]:
+    """Verdicts files of the other arms, alphas and languages of this split (not this run's own files).
+
+    Only `<split>/<arm>/<alpha>/<lang>.verdicts.jsonl`: the `_cache`, `_replaced` and `reliability` folders
+    are not part of the table and are skipped.
+    """
+    base = Path(out_root) / split
+    found = []
+    for path in sorted(base.glob("*/*/*.verdicts.jsonl")):
+        top = path.relative_to(base).parts[0]
+        if top.startswith("_") or top == "reliability" or path in own:
+            continue
+        found.append(path)
+    return found
+
+
+def _check_siblings(out_root: Path, split: str, judge_id: str, own: set[Path], rejudge: bool) -> list[str]:
+    """One table is read from every arm's verdicts of a split, so they must all come from one judge.
+
+    Scans the sibling verdicts files before any generation or judge call. A file made by another judge (or by
+    two) raises JudgeMixError naming the file and the judges; with `rejudge` it is a warning instead, so the arms
+    can be rejudged one at a time. Returns the warnings. An unreadable file is an EvalError either way.
+    """
+    others: list[tuple[Path, list[str]]] = []
+    for path in _sibling_verdict_files(out_root, split, own):
+        ids = sorted({v.judge_id for v in _read_verdicts(path)})
+        if ids and ids != [judge_id]:
+            others.append((path, ids))
+    if not others:
+        return []
+    named = "; ".join(f"{path} (judge{'s' if len(ids) > 1 else ''} {', '.join(repr(i) for i in ids)})"
+                      for path, ids in others[:3])
+    more = f" and {len(others) - 3} more" if len(others) > 3 else ""
+    if not rejudge:
+        raise JudgeMixError(
+            f"{len(others)} other verdicts file(s) under {Path(out_root) / split} were made by another judge than "
+            f"this run's {judge_id!r}: {named}{more}. Arms of one table must be judged by one judge; nothing was "
+            "generated or judged. Pass --rejudge to proceed anyway, then rejudge those arms with this judge"
+        )
+    return [
+        f"{len(others)} other verdicts file(s) under {Path(out_root) / split} were made by another judge than this "
+        f"run's {judge_id!r}: {named}{more}. Rejudge those arms with {judge_id!r} before building a table from "
+        "this split, or the one-judge rule will refuse it"
+    ]
+
+
 # --- writing --------------------------------------------------------------------------------------------------
 
 
@@ -635,6 +688,12 @@ def _eval_report(
     finish = {reason: sum(g.finish_reason == reason for g in gens) for reason in _FINISH_ORDER}
     n_length = finish["length"]
     truncation = {"rate": _rate(n_length, n_total), "n_length": n_length, "n_total": n_total}
+    safety_gens = [g for g in gens if kind_of[g.prompt_id] in JUDGED_KINDS]
+    n_safety_length = sum(g.finish_reason == "length" for g in safety_gens)
+    truncation_safety = {"rate": _rate(n_safety_length, len(safety_gens)), "n_length": n_safety_length,
+                         "n_total": len(safety_gens)}
+    n_bad = sum(not g.text.strip() or g.finish_reason == "error" for g in gens)  # each generation counted once
+    empty_or_error = {"n": n_bad, "n_total": n_total, "rate": _rate(n_bad, n_total)}
     empty = {
         "safety": sum(not g.text.strip() for g in gens if kind_of[g.prompt_id] in JUDGED_KINDS),
         "task": sum(not g.text.strip() for g in gens if kind_of[g.prompt_id] == "task"),
@@ -645,6 +704,17 @@ def _eval_report(
             f"truncation rate {_percent(truncation['rate'])} ({n_length} of {n_total} generations stopped at "
             f"max_new_tokens) exceeds {TRUNCATION_WARN * 100:.0f}%; answers may be cut off, consider a larger "
             "--max-new-tokens"
+        )
+    if truncation_safety["rate"] is not None and truncation_safety["rate"] > TRUNCATION_WARN:
+        warnings.append(
+            f"safety-item truncation rate {_percent(truncation_safety['rate'])} ({n_safety_length} of "
+            f"{len(safety_gens)} harmful and benign_edgy generations stopped at max_new_tokens) exceeds "
+            f"{TRUNCATION_WARN * 100:.0f}%; a cut-off reply can be mislabelled by the judge"
+        )
+    if empty_or_error["rate"] is not None and empty_or_error["rate"] > EMPTY_ERROR_WARN:
+        warnings.append(
+            f"{_percent(empty_or_error['rate'])} of generations are empty or ended with finish_reason=error "
+            f"({n_bad} of {n_total}), above {EMPTY_ERROR_WARN * 100:.0f}%; the backend or the model may be failing"
         )
 
     verdict_section = error_section = None
@@ -684,7 +754,9 @@ def _eval_report(
         "n_by_kind": {kind: sum(kind_of[g.prompt_id] == kind for g in gens) for kind in (*JUDGED_KINDS, "task")},
         "finish_reasons": finish,
         "truncation": truncation,
+        "truncation_safety": truncation_safety,
         "empty_outputs": empty,
+        "empty_or_error": empty_or_error,
         "verdicts": verdict_section,
         "judge_error": error_section,
         "tasks": task_section,
@@ -748,6 +820,10 @@ def evaluate(args: argparse.Namespace, *, root: Path) -> RunSummary:
     old_labels: dict[str, str | None] = {}
     if judge is not None:
         old_labels = {plan.lang: _check_mix(plan, judge.id, args.rejudge) for plan in plans}
+        for warning in _check_siblings(args.out_root, args.split, judge.id, {p.verdicts_file for p in plans},
+                                       args.rejudge):
+            summary.warnings.append(warning)
+            print(f"WARNING: {warning}", file=sys.stderr)
     if "generate" not in stages and ("judge" in stages or "task" in stages):
         for plan in plans:
             _load_gens(plan, args, root)
@@ -784,31 +860,42 @@ def evaluate(args: argparse.Namespace, *, root: Path) -> RunSummary:
         _atomic_replace(plan.eval_file, lambda tmp, text=json.dumps(report, ensure_ascii=False, indent=2) + "\n":
                         _write_text(tmp, text))
         summary.languages[plan.lang] = report
-        gate_failed = ran_judge and _gate_failed(report)
-        if gate_failed:
+        breaches = _gate_breaches(report) if ran_judge else []
+        if breaches:
             summary.gate_failures.append(plan.lang)
         summary.warnings.extend(f"{plan.lang}: {warning}" for warning in report["warnings"])
-        _announce(plan, args, report, ran_judge=ran_judge, ran_task=ran_task, gate_failed=gate_failed)
+        _announce(plan, args, report, ran_judge=ran_judge, ran_task=ran_task, breaches=breaches)
 
     if summary.gate_failures:
         raise QualityGateError(
-            f"judge_error rate is above {JUDGE_ERROR_MAX * 100:.0f}% for: {', '.join(summary.gate_failures)}; the "
-            "verdicts were written for inspection, but these results must not be used",
+            f"judge_error rate (overall or for one kind) is above {JUDGE_ERROR_MAX * 100:.0f}% for: "
+            f"{', '.join(summary.gate_failures)}; the verdicts were written for inspection, but these results must "
+            "not be used",
             summary,
         )
     print(f"evaluation complete: {len(plans)} language(s), stages {','.join(stages)}")
     return summary
 
 
-def _gate_failed(report: dict[str, Any]) -> bool:
-    """True when the language's judge_error rate is above JUDGE_ERROR_MAX (strictly)."""
-    rate = (report["judge_error"] or {}).get("rate")
-    return rate is not None and rate > JUDGE_ERROR_MAX
+def _gate_breaches(report: dict[str, Any]) -> list[str]:
+    """What is over JUDGE_ERROR_MAX (strictly): the language as a whole and/or a single kind, each with its rate.
+
+    A kind counts on its own: a judge that fails on a quarter of the harmful prompts must not be hidden by
+    a good rate on the benign ones.
+    """
+    section = report["judge_error"]
+    if not section:
+        return []
+    breaches = []
+    for name, stat in (("overall", section), *section["by_kind"].items()):
+        if stat["rate"] is not None and stat["rate"] > JUDGE_ERROR_MAX:
+            breaches.append(f"{name} {_percent(stat['rate'])} ({stat['judge_error']} of {stat['n_judged']} judged)")
+    return breaches
 
 
 def _announce(
     plan: LangPlan, args: argparse.Namespace, report: dict[str, Any], *, ran_judge: bool, ran_task: bool,
-    gate_failed: bool,
+    breaches: list[str],
 ) -> None:
     """Print counts and paths (never text) and the warnings; a failed gate is said on stderr."""
     lang = plan.lang
@@ -826,12 +913,10 @@ def _announce(
             f"{lang}: judged {report['verdicts']['n']} with {report['judge_id']}: " +
             ", ".join(f"{label} {labels[label]}" for label in _LABEL_ORDER) + f" -> {plan.verdicts_file}"
         )
-        errors = report["judge_error"]
-        if gate_failed:
+        if breaches:
             print(
-                f"error: {lang}: judge_error rate {_percent(errors['rate'])} ({errors['judge_error']} of "
-                f"{errors['n_judged']} judged) is above the {JUDGE_ERROR_MAX * 100:.0f}% limit; verdicts written to "
-                f"{plan.verdicts_file} for inspection",
+                f"error: {lang}: judge_error rate is above the {JUDGE_ERROR_MAX * 100:.0f}% limit: "
+                f"{'; '.join(breaches)}; verdicts written to {plan.verdicts_file} for inspection",
                 file=sys.stderr,
             )
     if ran_task:
@@ -841,7 +926,7 @@ def _announce(
         print(f"WARNING [{lang} {args.arm}/{gen.format_alpha(args.alpha)} {args.split}]: {warning}", file=sys.stderr)
 
 
-_PLAIN_ERRORS = (*genrun._PLAIN_ERRORS, EvalError)
+PLAIN_ERRORS = (*genrun.PLAIN_ERRORS, EvalError)
 
 
 def main(argv: Sequence[str] | None = None, *, root: Path | None = None) -> int:
@@ -865,7 +950,7 @@ def main(argv: Sequence[str] | None = None, *, root: Path | None = None) -> int:
     except FakeResultsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    except _PLAIN_ERRORS as exc:
+    except PLAIN_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     except Exception:

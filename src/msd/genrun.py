@@ -69,7 +69,7 @@ class MetaMismatchError(RuntimeError):
 # --- arguments --------------------------------------------------------------------------------------------
 
 
-def _positive_int(text: str) -> int:
+def positive_int(text: str) -> int:
     try:
         value = int(text)
     except ValueError:
@@ -79,7 +79,7 @@ def _positive_int(text: str) -> int:
     return value
 
 
-def _alpha_arg(text: str) -> float | None:
+def alpha_arg(text: str) -> float | None:
     if text.strip().lower() == "none":
         return None
     try:
@@ -88,7 +88,7 @@ def _alpha_arg(text: str) -> float | None:
         raise argparse.ArgumentTypeError(f"expected a number or 'none', got {text!r}") from None
 
 
-def _langs_arg(text: str) -> list[str]:
+def langs_arg(text: str) -> list[str]:
     langs = [part.strip() for part in text.split(",")]
     if not text.strip() or any(not lang for lang in langs):
         raise argparse.ArgumentTypeError("expected a comma-separated list of languages")
@@ -106,15 +106,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--model-path", help="Hugging Face repo id or local (merged) model directory; required for --backend hf")
     ap.add_argument("--arm", required=True, choices=ARMS)
-    ap.add_argument("--alpha", type=_alpha_arg, default=None,
+    ap.add_argument("--alpha", type=alpha_arg, default=None,
                     help="blend / repair setting; required for A2 and A2n, forbidden for BASE, A0, A1, A3")
     ap.add_argument("--split", required=True, choices=sorted(SPLITS))
-    ap.add_argument("--langs", type=_langs_arg, default=None, help=f"comma-separated subset of {','.join(LANGS)} (default: all)")
-    ap.add_argument("--limit", type=_positive_int, default=None, help="only the first N prompts of each language file (smoke runs)")
+    ap.add_argument("--langs", type=langs_arg, default=None, help=f"comma-separated subset of {','.join(LANGS)} (default: all)")
+    ap.add_argument("--limit", type=positive_int, default=None, help="only the first N prompts of each language file (smoke runs)")
     ap.add_argument("--out-root", type=Path, default=None, help="default: results/ under the repository root")
     ap.add_argument("--testset-dir", type=Path, default=None, help="default: data/testset under the repository root")
-    ap.add_argument("--batch-size", type=_positive_int, default=gen.DEFAULT_BATCH_SIZE)
-    ap.add_argument("--max-new-tokens", type=_positive_int, default=256)
+    ap.add_argument("--batch-size", type=positive_int, default=gen.DEFAULT_BATCH_SIZE)
+    ap.add_argument("--max-new-tokens", type=positive_int, default=256)
     ap.add_argument("--dtype", choices=DTYPES, default="float16")
     ap.add_argument("--backend", choices=("hf", "fake"), default="hf")
     ap.add_argument("--force-new-meta", action="store_true",
@@ -368,7 +368,7 @@ def run(
     return EXIT_OK
 
 
-_PLAIN_ERRORS = (gen.ResumeError, gen.BackendError, MetaMismatchError, ValueError, ImportError, OSError)
+PLAIN_ERRORS = (gen.ResumeError, gen.BackendError, MetaMismatchError, ValueError, ImportError, OSError)
 
 
 def main(argv: Sequence[str] | None = None, *, root: Path | None = None) -> int:
@@ -394,7 +394,7 @@ def main(argv: Sequence[str] | None = None, *, root: Path | None = None) -> int:
 
     try:
         return run(args, available, root)
-    except _PLAIN_ERRORS as exc:
+    except PLAIN_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     except Exception:

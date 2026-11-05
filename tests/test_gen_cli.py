@@ -294,6 +294,16 @@ def test_extra_prompts_are_generated_into_the_same_gens_file_after_the_test_set(
     assert genrun.run(args, available, repo, extra_prompts={"en": extra}) == 0  # a rerun has nothing to do
 
 
+def test_the_argument_helpers_and_error_tuple_are_public_and_leave_no_private_alias():
+    for public in ("alpha_arg", "langs_arg", "positive_int", "PLAIN_ERRORS"):
+        assert hasattr(genrun, public), public
+    for private in ("_alpha_arg", "_langs_arg", "_positive_int", "_PLAIN_ERRORS"):
+        assert not hasattr(genrun, private), private
+    assert genrun.positive_int("3") == 3 and genrun.alpha_arg("none") is None and genrun.alpha_arg("0.5") == 0.5
+    assert genrun.langs_arg("en,hi") == ["en", "hi"]
+    assert gen.ResumeError in genrun.PLAIN_ERRORS and genrun.MetaMismatchError in genrun.PLAIN_ERRORS
+
+
 def test_report_split_reads_report_files(repo, scratch):
     build_testset(repo, n=3, split="report")
     assert run_cli(repo, *fake_args(scratch, split="report")) == 0
