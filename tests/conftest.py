@@ -159,3 +159,98 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip)
+
+
+# --- a fake torch / transformers stack for HFLocalJudge ----------------------------------------------------------
+
+
+class _Batch(dict):
+    def to(self, device):
+        self.device = device
+        return self
+
+
+@pytest.fixture
+def fake_hf_stack():
+    """A builder for fake `torch` and `transformers` modules: just enough surface for `HFLocalJudge._load`.
+
+    numpy stands in for tensors. `fail_at` ("tokenizer", "model" or "to") makes that step raise `error`.
+    The returned `log` counts `load_attempts` (tokenizer `from_pretrained` calls) and records the calls.
+    """
+    import types
+
+    def build(*, chat_template="{{ messages }}", completion_ids=(7, 8, 9), fail_at=None, error=None):
+        import numpy as np
+
+        log = types.SimpleNamespace(template_calls=[], generate_calls=[], decoded=[], model_args=None,
+                                    tokenizer_args=None, load_attempts=0)
+
+        class Tokenizer:
+            eos_token_id = 2
+            pad_token_id = None
+            pad_token = None
+            eos_token = "</s>"
+
+            def __init__(self):
+                self.chat_template = chat_template
+
+            def apply_chat_template(self, messages, **options):
+                log.template_calls.append((messages, options))
+                return "<templated>" + messages[0]["content"]
+
+            def __call__(self, text, **options):
+                log.tokenizer_args = (text, options)
+                return _Batch(input_ids=np.array([[1, 5, 6, 7, 8]]), attention_mask=np.ones((1, 5), dtype=int))
+
+            def decode(self, ids, skip_special_tokens=False):
+                log.decoded.append((list(ids), skip_special_tokens))
+                return " Refused. "
+
+        class Model:
+            generation_config = types.SimpleNamespace(eos_token_id=[2, 3])
+
+            def to(self, device):
+                if fail_at == "to":
+                    raise error
+                return self
+
+            def eval(self):
+                return self
+
+            def generate(self, **options):
+                log.generate_calls.append(options)
+                prompt = options["input_ids"]
+                return np.concatenate([prompt, np.array([list(completion_ids)])], axis=1)
+
+        def load_tokenizer(name, **kw):
+            log.load_attempts += 1
+            if fail_at == "tokenizer":
+                raise error
+            return Tokenizer()
+
+        def load_model(name, **kw):
+            log.model_args = (name, kw)
+            if fail_at == "model":
+                raise error
+            return Model()
+
+        transformers = types.SimpleNamespace(
+            __version__="4.57.0",
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=load_tokenizer),
+            AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=load_model),
+        )
+
+        class NoGrad:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *exc):
+                return False
+
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: False), no_grad=NoGrad, float16="F16", bfloat16="BF16",
+            float32="F32",
+        )
+        return torch, transformers, log
+
+    return build

@@ -996,9 +996,9 @@ def test_eval_json_has_no_text_and_no_secrets(repo, scratch, model, judge, monke
         assert forbidden not in shown.out + shown.err
     report = json.loads(text)
     assert set(report) == {
-        "arm", "alpha", "lang", "split", "model_path", "backend", "judge_id", "n_generations", "n_by_kind",
+        "arm", "alpha", "lang", "split", "model_path", "backend", "judge_id", "judge", "n_generations", "n_by_kind",
         "finish_reasons", "truncation", "truncation_safety", "empty_outputs", "empty_or_error", "verdicts",
-        "judge_error", "tasks", "task_skipped", "warnings",
+        "judge_error", "tasks", "task_skipped", "warnings",  # "judge" is the one key added with the judge configuration
     }
     assert "timestamp" not in text  # no clock: a rerun must be byte-identical
 
@@ -1538,7 +1538,8 @@ def test_the_error_type_summary_names_types_and_counts_never_messages(repo, scra
 def test_no_error_summary_when_no_judge_call_raised(repo, scratch, model, judge, capsys):
     build_testset(repo)
     assert run_cli(repo, *args_for(scratch)) == 0
-    assert "judge call errors" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "judge calls that raised" not in err and "judge usage" not in err  # a clean run prints neither
 
 
 def test_an_unknown_judge_name_exits_2_listing_the_registered_names_and_the_accepted_forms(repo, scratch, capsys):
@@ -1624,3 +1625,184 @@ def test_a_judge_that_cannot_run_stops_the_run_with_one_line_instead_of_judge_er
     err = capsys.readouterr().err
     assert "error: the API key was rejected (HTTP 401)" in err and "Traceback" not in err
     assert Unusable.calls == 1  # the first call ended the run; the other items were not tried
+
+
+# --- fix round 1: summary on every exit path, breaker, HF load failure, config, usage ---------------------------
+
+
+class Flaky:
+    """Raises a CustomJudgeBoom for the first `boom` calls, then answers (or, with `fatal`, raises a setup error)."""
+
+    def __init__(self, boom, fatal=False, judge_id="F1"):
+        self.id, self.boom, self.fatal, self.calls = judge_id, boom, fatal, 0
+
+    def classify(self, kind, prompt, response):
+        from msd.judge import JudgeSetupError
+
+        self.calls += 1
+        if self.calls <= self.boom:
+            raise CustomJudgeBoom(SECRET_IN_MESSAGE)
+        if self.fatal:
+            raise JudgeSetupError("the API key was rejected (HTTP 401)")
+        return "complied" if kind == "harmful" else "refused"
+
+
+def test_the_error_summary_also_appears_when_the_run_stops_on_a_fatal_judge_error(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, n=4)
+    register(monkeypatch, "flaky", Flaky(boom=2, fatal=True))
+    assert run_cli(repo, *args_for(scratch, judge_name="flaky")) == evalrun.EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "error: the API key was rejected (HTTP 401)" in captured.err
+    assert "judge calls that raised, by exception type: CustomJudgeBoom x2" in captured.err  # the finally path
+    assert SECRET_IN_MESSAGE not in captured.err + captured.out
+
+
+class HostThenDown:
+    """Healthy for English prompts, every call raises for Hindi prompts (a service that fell over mid-run)."""
+
+    def __init__(self, judge_id="H1"):
+        self.id, self.calls = judge_id, []
+
+    def classify(self, kind, prompt, response):
+        self.calls.append(prompt)
+        if f"{MARK} hi " in prompt:
+            raise CustomJudgeBoom(SECRET_IN_MESSAGE)
+        return "complied" if kind == "harmful" else "refused"
+
+
+def test_a_tripped_breaker_mid_run_keeps_the_finished_language_and_resumes_cheaply(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, ("en", "hi"), n=12)
+    down = register(monkeypatch, "h1", HostThenDown())
+    argv = args_for(scratch, judge_name="h1", model_args=True)
+    assert run_cli(repo, *argv, "--langs", "en,hi") == evalrun.EXIT_ERROR
+    captured = capsys.readouterr()
+    en_verdicts = evalrun.verdicts_path(scratch, "dev", "A1", None, "en")
+    assert len(read_jsonl(en_verdicts, Verdict)) == 12 and evalrun.eval_path(scratch, "dev", "A1", None, "en").is_file()
+    assert not evalrun.verdicts_path(scratch, "dev", "A1", None, "hi").exists()
+    assert not evalrun.eval_path(scratch, "dev", "A1", None, "hi").exists()
+    assert "30 judge calls in a row raised" in captured.err and "CustomJudgeBoom x30" in captured.err
+    assert "Traceback" not in captured.err and SECRET_IN_MESSAGE not in captured.err + captured.out
+    for path in Path(scratch).rglob("*"):
+        if path.is_file():
+            assert SECRET_IN_MESSAGE.encode() not in path.read_bytes(), path
+
+    healthy = register(monkeypatch, "h1", StubJudge("H1"))  # the service is back
+    en_before = en_verdicts.read_bytes()
+    assert run_cli(repo, *argv, "--langs", "en,hi", "--stages", "judge") == 0
+    assert en_verdicts.read_bytes() == en_before
+    assert len(healthy.calls) == 12  # only the Hindi items; English came from the cache
+
+
+def test_a_hugging_face_load_failure_stops_after_one_attempt_without_leaking(repo, scratch, monkeypatch, model, fake_hf_stack, capsys):
+    build_testset(repo, n=4)
+    torch, transformers, log = fake_hf_stack(fail_at="tokenizer", error=OSError(f"gated repo token {SECRET_IN_MESSAGE}"))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    assert run_cli(repo, *args_for(scratch, judge_name="hf:org/Model")) == evalrun.EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "error: could not load org/Model (OSError)" in captured.err and "Traceback" not in captured.err
+    assert log.load_attempts == 1  # not once per judgment
+    assert SECRET_IN_MESSAGE not in captured.err + captured.out
+    assert not evalrun.verdicts_path(scratch, "dev", "A1", None, "en").exists()
+    for path in Path(scratch).rglob("*"):
+        if path.is_file():
+            assert SECRET_IN_MESSAGE.encode() not in path.read_bytes(), path
+
+
+class ConfiguredJudge(StubJudge):
+    """A stub with the optional `config()` and `usage()` hooks."""
+
+    def __init__(self, judge_id="C1", config=None, usage=None):
+        super().__init__(judge_id)
+        self._config, self._usage = config, usage
+
+    def config(self):
+        return self._config
+
+    def usage(self):
+        return dict(self._usage) if self._usage is not None else {"calls": len(self.calls), "input_tokens": 0,
+                                                                    "output_tokens": 0}
+
+
+PRE_EXISTING_KEYS = {
+    "arm", "alpha", "lang", "split", "model_path", "backend", "judge_id", "n_generations", "n_by_kind",
+    "finish_reasons", "truncation", "truncation_safety", "empty_outputs", "empty_or_error", "verdicts", "judge_error",
+    "tasks", "task_skipped", "warnings",
+}
+
+
+def test_eval_json_records_the_judge_configuration_next_to_the_id(repo, scratch, monkeypatch, model):
+    from msd.judge import MAX_CONSECUTIVE_FAILURES, template_fingerprint
+
+    build_testset(repo, n=4)
+    register(monkeypatch, "c1", ConfiguredJudge(config={"type": "stub", "model": "m", "max_tokens": 512,
+                                                         "sampling": "default"}))
+    assert run_cli(repo, *args_for(scratch, judge_name="c1")) == 0
+    report = eval_json(scratch)
+    assert report["judge_id"] == "C1"
+    assert report["judge"] == {"type": "stub", "model": "m", "max_tokens": 512, "sampling": "default",
+                               "template_fingerprint": template_fingerprint(), "retries": 2,
+                               "max_consecutive_failures": MAX_CONSECUTIVE_FAILURES}
+    assert set(report) == PRE_EXISTING_KEYS | {"judge"}  # additive: nothing else changed
+
+
+def test_a_judge_without_config_still_records_the_runner_settings(repo, scratch, model, judge):
+    build_testset(repo, n=4)
+    assert run_cli(repo, *args_for(scratch)) == 0
+    report = eval_json(scratch)
+    assert set(report["judge"]) == {"template_fingerprint", "retries", "max_consecutive_failures"}
+
+
+def test_a_run_without_a_judge_has_no_judge_section(repo, scratch, model):
+    build_testset(repo, n=4)
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--backend", "hf", "--model", "org/model",
+                   "--stages", "generate") == 0
+    assert eval_json(scratch)["judge"] is None
+
+
+def test_the_configuration_is_redacted_like_the_id_and_reruns_are_byte_identical(repo, scratch, monkeypatch, model):
+    build_testset(repo, n=4)
+    monkeypatch.setenv("MSD_TEST_API_KEY", "sk-ant-SENTINEL-CONFIG-0123456789")
+    register(monkeypatch, "c1", ConfiguredJudge(config={"type": "stub", "note": "sk-ant-SENTINEL-CONFIG-0123456789"}))
+    assert run_cli(repo, *args_for(scratch, judge_name="c1")) == 0
+    path = evalrun.eval_path(scratch, "dev", "A1", None, "en")
+    first = path.read_bytes()
+    assert b"SENTINEL-CONFIG" not in first and eval_json(scratch)["judge"]["note"] == "***"
+    assert run_cli(repo, *args_for(scratch, "--rejudge", judge_name="c1")) == 0
+    assert path.read_bytes() == first  # no clock, no token counts: byte-identical
+
+
+def test_a_later_stage_without_the_judge_keeps_the_recorded_configuration(repo, scratch, monkeypatch, model):
+    build_testset(repo, n=4)
+    build_tasks(repo, "taskdev.jsonl", n=3)
+    register(monkeypatch, "c1", ConfiguredJudge(config={"type": "stub", "model": "m"}))
+    assert run_cli(repo, *args_for(scratch, judge_name="c1")) == 0
+    recorded = eval_json(scratch)["judge"]
+    assert recorded["model"] == "m"
+    assert run_cli(repo, "--arm", "A1", "--split", "dev", "--out", str(scratch), "--stages", "task") == 0
+    assert eval_json(scratch)["judge"] == recorded
+
+
+def test_the_stderr_summary_includes_token_usage_only_when_a_judge_call_was_made(repo, scratch, monkeypatch, model, capsys):
+    build_testset(repo, n=4)
+    register(monkeypatch, "c1", ConfiguredJudge(usage={"calls": 4, "input_tokens": 1234, "output_tokens": 8}))
+    assert run_cli(repo, *args_for(scratch, judge_name="c1")) == 0
+    err = capsys.readouterr().err
+    assert "judge usage: calls 4, input_tokens 1234, output_tokens 8" in err
+
+    # everything is cached now: no call is made, so nothing is printed
+    register(monkeypatch, "c1", ConfiguredJudge(usage={"calls": 0, "input_tokens": 0, "output_tokens": 0}))
+    assert run_cli(repo, *args_for(scratch, "--rejudge", judge_name="c1")) == 0
+    assert "judge usage" not in capsys.readouterr().err
+
+
+def test_usage_is_optional_and_only_whole_numbers_are_printed(repo, scratch, tmp_path, monkeypatch, model, judge, capsys):
+    build_testset(repo, n=4)
+    assert run_cli(repo, *args_for(scratch)) == 0  # StubJudge has no usage()
+    assert "judge usage" not in capsys.readouterr().err
+
+    register(monkeypatch, "c2", ConfiguredJudge("C2", usage={"calls": 2, "input_tokens": 10, "note": SECRET_IN_MESSAGE,
+                                                              "output_tokens": 1.5}))
+    assert run_cli(repo, *args_for(tmp_path / "other_out", judge_name="c2")) == 0
+    err = capsys.readouterr().err
+    assert "judge usage: calls 2, input_tokens 10" in err and SECRET_IN_MESSAGE not in err and "1.5" not in err

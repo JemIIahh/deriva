@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from msd.judge import JudgeSetupError, render_judge_prompt, template_fingerprint
+from msd.judge import JudgeItemError, JudgeSetupError, render_judge_prompt, template_fingerprint
 
 REQUEST_TIMEOUT_SECONDS = 60.0  # the SDK default is ten minutes, which would hang a run on one bad connection
 ANTHROPIC_MAX_TOKENS = 512  # the answer is one word; the room is for models that think before answering (see below)
@@ -47,19 +47,22 @@ _PLAUSIBLE_KEY = re.compile(r"[\x21-\x7e]+")  # printable ASCII, no spaces: a ke
 
 
 # A status that means every call will fail the same way (so the run stops) rather than this one item.
-_FATAL_STATUS = {401: "the API key was rejected", 403: "the API key is not allowed to use this model",
-                 404: "the model id was not found"}
+_FATAL_STATUS = {
+    401: "the API key was rejected",
+    402: "the API reported payment required (check the account's credit and spend limit)",
+    403: "the API key is not allowed to use this model",
+    404: "the model id was not found",
+}
 
 
-class JudgeCallError(RuntimeError):
-    """One judge call produced no usable answer. The text is fixed; it never quotes the request or the reply."""
+class JudgeRefusalError(JudgeItemError):
+    """The API stopped with a refusal instead of an answer. Not retried: a refusal repeats, and one that came
+    before any output may still be billed."""
+
+    retryable = False
 
 
-class JudgeRefusalError(JudgeCallError):
-    """The API stopped with a refusal instead of an answer."""
-
-
-class JudgeNoTextError(JudgeCallError):
+class JudgeNoTextError(JudgeItemError):
     """The API answered but the reply holds no text (for example the token cap ran out before the answer)."""
 
 
@@ -139,7 +142,7 @@ class AnthropicJudge:
     `JudgeRefusalError`; one without any text raises `JudgeNoTextError`. Both are `JudgeCallError`s, so
     `JudgeRunner` counts them as failed attempts and the item ends up as `judge_error` after its retries. No
     text is ever invented. API errors (rate limit, connection, 5xx) propagate as the SDK's own exceptions, except
-    a rejected key, a forbidden model or an unknown model id (HTTP 401, 403, 404): those raise `JudgeSetupError`,
+    a rejected key, no credit, a forbidden model or an unknown model id (HTTP 401, 402, 403, 404): those raise `JudgeSetupError`,
     which stops the run, because every item would fail the same way.
 
     `temperature` is None by default and then NOT sent: the current Claude models reject any non-default
@@ -201,6 +204,15 @@ class AnthropicJudge:
     def __repr__(self) -> str:
         return f"AnthropicJudge(model={self.model!r}, id={self.id!r})"
 
+    def config(self) -> dict[str, Any]:
+        """The settings that shape the labels, as a plain dict for eval.json. No secret is in it."""
+        sampling = "default" if self.temperature is None else f"temperature {self.temperature:g}"
+        return {"type": "anthropic", "model": self.model, "max_tokens": self.max_tokens, "sampling": sampling}
+
+    def usage(self) -> dict[str, int]:
+        """What this judge has used so far, for the cost estimate."""
+        return {"calls": self.calls, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
+
     def classify(self, kind: str, prompt: str, response: str) -> str:
         request: dict[str, Any] = {
             "model": self.model,
@@ -214,10 +226,7 @@ class AnthropicJudge:
         except Exception as exc:
             status = getattr(exc, "status_code", None)  # the SDK's APIStatusError carries it
             if isinstance(status, int) and not isinstance(status, bool) and status in _FATAL_STATUS:
-                raise JudgeSetupError(
-                    f"{_FATAL_STATUS[status]} (HTTP {status}); check ANTHROPIC_API_KEY and the model id "
-                    f"{self.model!r}"
-                ) from None
+                raise JudgeSetupError(f"{_FATAL_STATUS[status]} (HTTP {status}); model {self.model!r}") from None
             raise  # rate limits, timeouts, 5xx and the rest: a failed attempt, retried by the runner
 
         usage = getattr(message, "usage", None)
@@ -247,9 +256,10 @@ class HFLocalJudge:
 
     The rendered, fenced judge prompt goes in as one user turn of the model's chat template. Nothing heavy
     happens at construction: `torch` and `transformers` are imported and the model is loaded by `_load()` on
-    the first `classify`, once. A model without a chat template (a base model) is refused with a
-    `JudgeSetupError`, as is a runtime without `torch`. A gated model takes its token from HF_TOKEN, read by
-    `transformers` itself; nothing here reads, prints or stores it.
+    the first `classify`, once. A model without a chat template (a base model), a runtime without `torch` and
+    any failure to load are `JudgeSetupError`s, which stop the run; a failed load is remembered and never
+    retried. A gated model takes its token from HF_TOKEN, read by `transformers` itself; nothing here reads,
+    prints or stores it.
 
     `generate_fn(messages) -> str` replaces the whole loaded model (tests inject a fake); it receives the chat
     message list and returns the model's text. Qwen3-style templates think first unless told not to, which
@@ -278,14 +288,22 @@ class HFLocalJudge:
         self.dtype = dtype
         self.id = f"hf:{model_id}:t{template_fingerprint()}"
         self._generate_fn = generate_fn
+        self._load_failure: str | None = None
 
     def __repr__(self) -> str:
         return f"HFLocalJudge(model_id={self.model_id!r}, id={self.id!r})"
 
-    def _load(self) -> Callable[[list[dict[str, str]]], str]:
-        """Import torch and transformers, load the model, return its `generate_fn`. Slow; runs once."""
-        from msd.gen import _TORCH_DTYPES, _dtype_keyword
+    def config(self) -> dict[str, Any]:
+        """The settings that shape the labels, as a plain dict for eval.json."""
+        return {"type": "hf", "model_id": self.model_id, "dtype": self.dtype, "max_new_tokens": self.max_new_tokens,
+                "enable_thinking": False, "greedy": True}
 
+    def _load(self) -> Callable[[list[dict[str, str]]], str]:
+        """Import torch and transformers, load the model, return its `generate_fn`. Slow; runs once.
+
+        Any failure to load (a gated repo, no network, a wrong model id, out of GPU memory) is one
+        `JudgeSetupError` naming the exception TYPE only: a Hugging Face message can carry a token.
+        """
         try:
             import torch
             import transformers
@@ -294,6 +312,15 @@ class HFLocalJudge:
                 "HFLocalJudge needs the 'torch' and 'transformers' packages, which are not installed here; run the "
                 "judge stage on the GPU runtime (Kaggle or Colab, see docs/runtime.md)"
             ) from None
+        try:
+            return self._build(torch, transformers)
+        except JudgeSetupError:
+            raise
+        except Exception as exc:
+            raise JudgeSetupError(f"could not load {self.model_id} ({type(exc).__name__})") from None
+
+    def _build(self, torch: Any, transformers: Any) -> Callable[[list[dict[str, str]]], str]:
+        from msd.gen import _TORCH_DTYPES, _dtype_keyword
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tokenizer = transformers.AutoTokenizer.from_pretrained(self.model_id)
@@ -333,5 +360,11 @@ class HFLocalJudge:
     def classify(self, kind: str, prompt: str, response: str) -> str:
         messages = [{"role": "user", "content": render_judge_prompt(kind, prompt, response)}]
         if self._generate_fn is None:
-            self._generate_fn = self._load()
+            if self._load_failure is not None:  # a failed load is final: never retried, once per judgment
+                raise JudgeSetupError(self._load_failure) from None
+            try:
+                self._generate_fn = self._load()
+            except JudgeSetupError as exc:
+                self._load_failure = str(exc)
+                raise
         return self._generate_fn(messages)

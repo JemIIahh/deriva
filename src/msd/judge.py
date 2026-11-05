@@ -21,6 +21,9 @@ LABEL_REFUSED = "refused"
 
 EXCERPT_CHARS = 200
 
+# `JudgeRunner` stops when this many judge calls in a row raised without one answer in between (see there).
+MAX_CONSECUTIVE_FAILURES = 30
+
 # One template per judged kind, one question each. Language-neutral: the request and the
 # reply are quoted verbatim and may be in any language; the answer is always one English
 # word so that `parse_label` can read it.
@@ -69,24 +72,33 @@ JUDGE_TEMPLATES: dict[str, str] = {
     "benign_edgy": BENIGN_EDGY_JUDGE_TEMPLATE,
 }
 
-# A delimiter-looking tag in inserted text, opening or closing, in any case, with stray spaces or
-# attributes, or with full-width angle brackets. Matching it is cheap; missing a variant is not.
-_TAG_LIKE = re.compile(rf"[<\uff1c]\s*/?\s*(?:{'|'.join(FENCE_TAGS)})\b[^>\uff1e]*[>\uff1e]", re.IGNORECASE)
+# A delimiter-looking tag in inserted text: "<" (or the full-width one), then only whitespace, slashes and
+# zero-width characters, then one of the delimiter names. Opening or closing, any case, with attributes, spaces,
+# a missing ">" or full-width brackets all match, because only the front of the tag is looked at: it is replaced,
+# so the tag can no longer be read as one whatever follows. Looking at the front alone also keeps the match linear
+# (an earlier version that also scanned for the closing ">" was quadratic on "<reply " repeated).
+_TAG_LIKE = re.compile(
+    rf"[<\uff1c][\s/\u200b-\u200d\u2060\ufeff]*(?:{'|'.join(FENCE_TAGS)})\b", re.IGNORECASE
+)
 
 
 def _fence_safe(text: str) -> str:
-    """`text` with every delimiter-like tag made inert (`<` becomes `&lt;`), so it cannot end its block early."""
+    """`text` with every delimiter-like tag made inert (its `<` becomes `&lt;`), so it cannot end its block early."""
     return _TAG_LIKE.sub(lambda match: "&lt;" + match.group(0)[1:], text)
 
 
 def template_fingerprint() -> str:
-    """12 hex digits that change whenever a judge template or a delimiter changes.
+    """12 hex digits that change whenever a judge template, a delimiter or the delimiter sanitiser changes.
 
     Judge ids embed this, because the verdict cache key hashes the judge id, the kind, the prompt and the
     reply but not the template text: an edited template under an unchanged id would silently reuse labels
-    made with the old wording.
+    made with the old wording. The sanitiser is part of it because it changes the rendered text.
     """
-    payload = json.dumps({"templates": JUDGE_TEMPLATES, "fence": list(FENCE_TAGS)}, sort_keys=True, ensure_ascii=False)
+    payload = json.dumps(
+        {"templates": JUDGE_TEMPLATES, "fence": list(FENCE_TAGS), "sanitiser": _TAG_LIKE.pattern},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -107,6 +119,21 @@ class JudgeSetupError(RuntimeError):
     Unlike any other exception from a judge call, `JudgeRunner` does not count it as a failed attempt: every
     later call would fail the same way, so it stops the run. Its text is fixed and never quotes a key or a text.
     """
+
+
+class JudgeUnavailableError(JudgeSetupError):
+    """Too many judge calls in a row raised (`JudgeRunner`'s circuit breaker): the service looks down."""
+
+
+class JudgeItemError(RuntimeError):
+    """A judge's own typed failure for ONE item (the API refused, the reply held no text, the cap ran out).
+
+    The service did answer, so these never count towards the circuit breaker. `retryable` says whether trying the
+    same item again can help; a judge sets it to False on a subclass when it cannot. The text is fixed and never
+    quotes the request, the reply or anything the service sent.
+    """
+
+    retryable = True
 
 
 class Judge(Protocol):
@@ -163,11 +190,33 @@ class JudgeRunner:
 
     `error_types` counts the judge calls that raised, by exception TYPE NAME only: an exception
     message can carry a key or the judged text, so it is never recorded.
+
+    Failures are told apart by what they say about the service. A `JudgeSetupError` stops the run at once. A
+    `JudgeItemError` (a typed per-item failure) is a failed attempt, but the service did answer, so it does not
+    count towards the circuit breaker and resets it; one with `retryable = False` is not retried. Any other exception (rate limit, timeout, 5xx, connection) is a failed attempt and counts towards the
+    breaker. A call that returns, even unparseable text, resets it. After `max_consecutive_failures` such
+    exceptions in a row the runner raises `JudgeUnavailableError` (one line, exception type names and the
+    count only) instead of trying every remaining item against a service that is down. Labels cached so far are
+    kept, so running the same command again resumes without repeating a call.
     """
 
-    def __init__(self, judge: Judge, cache_path: str | Path, retries: int = 2) -> None:
+    def __init__(
+        self,
+        judge: Judge,
+        cache_path: str | Path,
+        retries: int = 2,
+        max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
+    ) -> None:
         if retries < 0:
             raise ValueError(f"retries must be >= 0, got {retries}")
+        if (
+            isinstance(max_consecutive_failures, bool)
+            or not isinstance(max_consecutive_failures, int)
+            or max_consecutive_failures < 1
+        ):
+            raise ValueError(f"max_consecutive_failures must be a positive integer, got {max_consecutive_failures!r}")
+        self.max_consecutive_failures = max_consecutive_failures
+        self._streak: Counter[str] = Counter()  # exception type names of the current run of failures
         self.judge = judge
         self.cache_path = Path(cache_path)
         self.retries = retries
@@ -206,9 +255,26 @@ class JudgeRunner:
                 raw = self.judge.classify(kind, prompt, response)
             except JudgeSetupError:
                 raise  # not a bad answer but a judge that cannot run: stop instead of looping through every item
-            except Exception as exc:  # one bad call must not crash a batch; it counts as an attempt
+            except JudgeItemError as exc:
                 self.error_types[type(exc).__name__] += 1  # the type name only: a message may hold a key or text
+                self._streak.clear()  # the service answered
+                if not exc.retryable:
+                    return None
                 continue
+            except Exception as exc:  # one bad call must not crash a batch; it counts as an attempt
+                name = type(exc).__name__
+                self.error_types[name] += 1
+                self._streak[name] += 1
+                if sum(self._streak.values()) >= self.max_consecutive_failures:
+                    counts = ", ".join(f"{n} x{c}" for n, c in sorted(self._streak.items()))
+                    raise JudgeUnavailableError(
+                        f"{sum(self._streak.values())} judge calls in a row raised ({counts}) with no answer in "
+                        "between, so the judge service looks down; stopping instead of trying every item. Check the "
+                        "connection, the quota and the service status. Finished verdicts are kept: run the same "
+                        "command again to resume"
+                    ) from None
+                continue
+            self._streak.clear()
             label = parse_label(raw)
             if label is not None:
                 return label

@@ -64,8 +64,12 @@ Judges (`--judge NAME`): `fake` (a test stand-in), `anthropic:<model-id>` (Claud
 ANTHROPIC_API_KEY or the repository's `.env`) and `hf:<model-id>` (an open model on a GPU runtime), see `msd.judges`.
 A name is checked when the arguments are parsed; the judge itself is built only when the judge stage runs, and
 before anything is generated or written, so a missing key or package stops the run first (exit 1, one line, no
-traceback). Judge ids carry a fingerprint of the judge templates. If any judge call raised, a one-line summary of
-the exception TYPES and their counts goes to stderr (never a message: it can hold a key or the judged text).
+traceback). Judge ids carry a fingerprint of the judge templates, and eval.json records the judge's configuration
+under `judge` (no secrets, no token counts). If any judge call raised, a one-line summary of the exception TYPES
+and their counts goes to stderr (never a message: it can hold a key or the judged text), followed, when the judge
+reports it and made a call, by its token usage; both appear on every way out, a fatal stop included. A judge
+that cannot run at all (rejected key, no credit, a model that will not load) or 30 raised calls in a row (the
+service is down) stop the run with one line instead of looping through every item; finished verdicts are kept.
 
 Exit codes: 0 done; 1 any other failure (a refused, corrupt or incomplete file, a backend or model error, a
 judge that cannot be set up such as a missing key or package, a failed write); 2 usage error (bad arguments, an
@@ -91,7 +95,7 @@ from typing import Any, Callable, Sequence
 from msd import gen, genrun, judges
 from msd.config import ARMS, LANGS
 from msd.gen import gens_path
-from msd.judge import JUDGE_TEMPLATES, Judge, JudgeRunner
+from msd.judge import JUDGE_TEMPLATES, Judge, JudgeRunner, template_fingerprint
 from msd.schema import SPLITS, Generation, Prompt, TaskScore, Verdict, read_jsonl, write_jsonl
 from msd.scoring import score_task
 
@@ -248,12 +252,59 @@ def _make_judge(name: str, out_root: Path, root: Path) -> Judge:
     return judge
 
 
-def _report_judge_errors(runner: JudgeRunner | None) -> None:
-    """One line on stderr naming the exception TYPES the judge raised and how often (never a message or a text)."""
-    if runner is None or not runner.error_types:
+def _report_judge_run(runner: JudgeRunner | None) -> None:
+    """What the judge did, on stderr, for every way out of the judge loop (including a fatal stop).
+
+    Line 1, when any judge call raised: the exception TYPES and their counts (never a message). Line 2, when the
+    judge exposes `usage()` and made a call: its whole-number counters (calls, input_tokens, output_tokens),
+    which is what a cost estimate needs. Nothing here may raise: it runs while another error is propagating.
+    """
+    if runner is None:
         return
-    counts = ", ".join(f"{name} x{count}" for name, count in sorted(runner.error_types.items()))
-    print(f"WARNING: judge calls that raised, by exception type: {counts}", file=sys.stderr)
+    try:
+        if runner.error_types:
+            counts = ", ".join(f"{name} x{count}" for name, count in sorted(runner.error_types.items()))
+            print(f"WARNING: judge calls that raised, by exception type: {counts}", file=sys.stderr)
+        usage = runner.judge.usage() if callable(getattr(runner.judge, "usage", None)) else None
+        if isinstance(usage, dict) and isinstance(usage.get("calls"), int) and usage["calls"] > 0:
+            parts = [f"{key} {value}" for key, value in usage.items()
+                     if isinstance(value, int) and not isinstance(value, bool) and re.fullmatch(r"[a-z_]+", str(key))]
+            print(f"judge usage: {', '.join(parts)}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _redact_json(value: Any) -> Any:
+    """`value` with `gen._redact` applied to every string in it, as the judge id already is."""
+    if isinstance(value, str):
+        return gen._redact(value)
+    if isinstance(value, dict):
+        return {str(key): _redact_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_json(item) for item in value]
+    return value
+
+
+def _judge_section(runner: JudgeRunner) -> dict[str, Any]:
+    """How the judge was configured, for eval.json: the judge's own `config()` (optional), the template
+    fingerprint and the runner settings. Deterministic and secret-free; no token counts (they change on a rerun)."""
+    config = runner.judge.config() if callable(getattr(runner.judge, "config", None)) else None
+    section = {**(config if isinstance(config, dict) else {}), "template_fingerprint": template_fingerprint(),
+               "retries": runner.retries, "max_consecutive_failures": runner.max_consecutive_failures}
+    return _redact_json(section)
+
+
+def _recorded_judge_section(eval_file: Path, judge_id: str | None) -> dict[str, Any] | None:
+    """The `judge` section an earlier run recorded in `eval_file`, if it was made by the same judge, so that a
+    run of another stage (which does not rebuild the judge) does not lose it."""
+    if judge_id is None or not eval_file.is_file():
+        return None
+    try:
+        report = json.loads(eval_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    section = report.get("judge") if isinstance(report, dict) else None
+    return section if isinstance(section, dict) and report.get("judge_id") == gen._redact(judge_id) else None
 
 
 # --- arguments ------------------------------------------------------------------------------------------------
@@ -707,6 +758,7 @@ def _eval_report(
     verdicts: Sequence[Verdict] | None,
     scores: Sequence[TaskScore] | None,
     judge_id: str | None,
+    judge_section: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The `<lang>.eval.json` content: counts and rates only, no prompt or completion text, no clock."""
     kind_of = {p.id: p.kind for p in plan.prompts}
@@ -776,6 +828,7 @@ def _eval_report(
         "model_path": meta.get("model_path"),
         "backend": meta.get("backend"),
         "judge_id": gen._redact(judge_id) if judge_id else None,
+        "judge": judge_section,
         "n_generations": n_total,
         "n_by_kind": {kind: sum(kind_of[g.prompt_id] == kind for g in gens) for kind in (*JUDGED_KINDS, "task")},
         "finish_reasons": finish,
@@ -883,7 +936,9 @@ def evaluate(args: argparse.Namespace, *, root: Path) -> RunSummary:
                 raise JudgeMixError(f"{plan.verdicts_file} holds verdicts from {len(ids)} judges {sorted(ids)}")
             judge_id = runner.judge.id if runner is not None else (next(iter(ids)) if ids else None)
 
-            report = _eval_report(plan, args, gens, meta, verdicts, scores, judge_id)
+            judge_section = (_judge_section(runner) if runner is not None
+                             else _recorded_judge_section(plan.eval_file, judge_id))
+            report = _eval_report(plan, args, gens, meta, verdicts, scores, judge_id, judge_section)
             _atomic_replace(plan.eval_file, lambda tmp, text=json.dumps(report, ensure_ascii=False, indent=2) + "\n":
                             _write_text(tmp, text))
             summary.languages[plan.lang] = report
@@ -893,7 +948,7 @@ def evaluate(args: argparse.Namespace, *, root: Path) -> RunSummary:
             summary.warnings.extend(f"{plan.lang}: {warning}" for warning in report["warnings"])
             _announce(plan, args, report, ran_judge=ran_judge, ran_task=ran_task, breaches=breaches)
     finally:
-        _report_judge_errors(runner)
+        _report_judge_run(runner)
 
     if summary.gate_failures:
         raise QualityGateError(

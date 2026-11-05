@@ -5,6 +5,7 @@ function are injected fakes, and the `anthropic`, `torch` and `transformers` pac
 (the few tests that need to see the missing-package path hide them with `sys.modules[name] = None`).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -15,13 +16,12 @@ import pytest
 
 from msd import judge as judge_module
 from msd import judges
-from msd.judge import JudgeRunner, render_judge_prompt
+from msd.judge import JudgeItemError, JudgeRunner, JudgeSetupError, render_judge_prompt
 from msd.judges import (
     AnthropicJudge,
     HFLocalJudge,
     JudgeNoTextError,
     JudgeRefusalError,
-    JudgeSetupError,
     is_known_judge_name,
     make_judge,
 )
@@ -277,7 +277,8 @@ def test_the_request_carries_the_fenced_prompt_alone_and_no_temperature_by_defau
     # The current Claude models (and every model on API version 2026-10-21) reject sampling parameters, so the
     # default request sends none; determinism comes from the label cache.
     assert "temperature" not in request and "top_p" not in request and "top_k" not in request
-    assert 1 <= request["max_tokens"] <= 1024
+    # room for a model that thinks before it answers: the thinking tokens come out of the same cap
+    assert 256 <= request["max_tokens"] <= 1024 and request["max_tokens"] == judges.ANTHROPIC_MAX_TOKENS
     assert rendered.count("</reply>") == 1  # the fence survived the trip
 
 
@@ -332,11 +333,12 @@ def test_a_reply_without_text_raises_a_typed_error(stop_reason):
         j3.classify("harmful", "Q", "A")
 
 
-def test_typed_errors_are_judge_call_errors_and_carry_no_text():
-    assert issubclass(JudgeRefusalError, judges.JudgeCallError)
-    assert issubclass(JudgeNoTextError, judges.JudgeCallError)
-    assert not issubclass(JudgeSetupError, judges.JudgeCallError)
+def test_typed_errors_are_per_item_errors_and_carry_no_text():
+    assert issubclass(JudgeRefusalError, JudgeItemError)
+    assert issubclass(JudgeNoTextError, JudgeItemError)
+    assert not issubclass(JudgeSetupError, JudgeItemError)  # a setup error stops the run; an item error does not
     assert issubclass(JudgeSetupError, RuntimeError)
+    assert JudgeRefusalError.retryable is False and JudgeNoTextError.retryable is True
     secret = "REPLY-TEXT-SENTINEL"
     j = AnthropicJudge("m", client=FakeClient(reply(blocks=[], stop_reason="refusal")))
     with pytest.raises(JudgeRefusalError) as caught:
@@ -344,14 +346,41 @@ def test_typed_errors_are_judge_call_errors_and_carry_no_text():
     assert secret not in str(caught.value)
 
 
-def test_refusal_and_no_text_become_judge_error_through_the_runner(tmp_path):
-    client = FakeClient(reply(blocks=[], stop_reason="refusal"), reply(blocks=[]), reply(blocks=[], stop_reason="refusal"))
+def test_a_refusal_is_not_retried_and_ends_the_item_as_judge_error(tmp_path):
+    client = FakeClient(reply(blocks=[], stop_reason="refusal"))
     runner = JudgeRunner(AnthropicJudge("m", client=client), tmp_path / "cache.jsonl", retries=2)
-    verdict = runner.verdict(_prompt(), _gen())
-    assert verdict.label == "judge_error"
-    assert len(client.requests) == 3  # each failure was a failed attempt
-    assert dict(runner.error_types) == {"JudgeRefusalError": 2, "JudgeNoTextError": 1}
+    assert runner.verdict(_prompt(), _gen()).label == "judge_error"
+    assert len(client.requests) == 1  # deterministic in practice, and a refusal before any output may be billed
+    assert dict(runner.error_types) == {"JudgeRefusalError": 1}
+    runner.verdict(_prompt(), _gen("Another reply"))
+    assert len(client.requests) == 2  # one request per item
     assert not (tmp_path / "cache.jsonl").exists()  # a judge_error is never cached
+
+
+def test_a_reply_without_text_is_retried_then_ends_as_judge_error(tmp_path):
+    client = FakeClient(reply(blocks=[], stop_reason="max_tokens"))
+    runner = JudgeRunner(AnthropicJudge("m", client=client), tmp_path / "cache.jsonl", retries=2)
+    assert runner.verdict(_prompt(), _gen()).label == "judge_error"
+    assert len(client.requests) == 3
+    assert dict(runner.error_types) == {"JudgeNoTextError": 3}
+
+
+def test_thirty_refusals_in_a_row_do_not_trip_the_breaker(tmp_path):
+    client = FakeClient(reply(blocks=[], stop_reason="refusal"))
+    runner = JudgeRunner(AnthropicJudge("m", client=client), tmp_path / "cache.jsonl", retries=2)
+    labels = [runner.verdict(_prompt(), _gen(f"reply {i}")).label for i in range(40)]
+    assert labels == ["judge_error"] * 40 and len(client.requests) == 40
+
+
+def test_thirty_server_errors_in_a_row_trip_the_breaker(tmp_path):
+    from msd.judge import JudgeUnavailableError
+
+    client = FakeClient(StatusError(500))
+    runner = JudgeRunner(AnthropicJudge("m", client=client), tmp_path / "cache.jsonl", retries=2)
+    with pytest.raises(JudgeUnavailableError) as caught:
+        for i in range(20):
+            runner.verdict(_prompt(), _gen(f"reply {i}"))
+    assert len(client.requests) == 30 and "StatusError x30" in str(caught.value) and KEY not in str(caught.value)
 
 
 def test_api_errors_count_as_failed_attempts_and_a_good_retry_recovers(tmp_path):
@@ -383,7 +412,7 @@ class StatusError(Exception):
         self.status_code = status_code
 
 
-@pytest.mark.parametrize("status", [401, 403, 404])
+@pytest.mark.parametrize("status", [401, 402, 403, 404])
 def test_a_rejected_key_or_unknown_model_is_a_fatal_setup_error_not_a_failed_attempt(status, tmp_path):
     client = FakeClient(StatusError(status))
     j = AnthropicJudge("claude-x", client=client)
@@ -396,7 +425,7 @@ def test_a_rejected_key_or_unknown_model_is_a_fatal_setup_error_not_a_failed_att
         runner.verdict(_prompt(), _gen())
 
 
-@pytest.mark.parametrize("status", [400, 408, 429, 500, 529, None, "401"])
+@pytest.mark.parametrize("status", [400, 408, 429, 500, 529, None, "401", True])
 def test_other_api_errors_propagate_unchanged_as_retryable_attempts(status):
     j = AnthropicJudge("claude-x", client=FakeClient(StatusError(status)))
     with pytest.raises(StatusError):
@@ -433,6 +462,27 @@ def test_a_response_without_usage_counts_as_a_call_with_zero_tokens():
     j = AnthropicJudge("m", client=FakeClient(bare))
     assert j.classify("harmful", "Q", "A") == "refused"
     assert (j.calls, j.input_tokens, j.output_tokens) == (1, 0, 0)
+
+
+def test_usage_reports_the_counters_as_plain_ints():
+    j = AnthropicJudge("m", client=FakeClient(reply("complied", input_tokens=100, output_tokens=3)))
+    assert j.usage() == {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+    j.classify("harmful", "Q", "A")
+    assert j.usage() == {"calls": 1, "input_tokens": 100, "output_tokens": 3}
+
+
+def test_config_is_a_plain_json_dict_without_secrets(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", KEY)
+    a = AnthropicJudge("claude-haiku-5-5", client=FakeClient())
+    assert a.config() == {"type": "anthropic", "model": "claude-haiku-5-5", "max_tokens": judges.ANTHROPIC_MAX_TOKENS,
+                          "sampling": "default"}
+    a0 = AnthropicJudge("claude-old", client=FakeClient(), temperature=0, max_tokens=64)
+    assert a0.config() == {"type": "anthropic", "model": "claude-old", "max_tokens": 64, "sampling": "temperature 0"}
+    h = HFLocalJudge("org/Model", generate_fn=lambda m: "x")
+    assert h.config() == {"type": "hf", "model_id": "org/Model", "dtype": "float16", "max_new_tokens": 8,
+                          "enable_thinking": False, "greedy": True}
+    for config in (a.config(), a0.config(), h.config()):
+        assert KEY not in json.dumps(config) and a.config() == a.config()  # plain and deterministic
 
 
 # --- HFLocalJudge ---------------------------------------------------------------------------------------------
@@ -486,77 +536,8 @@ def test_hf_judge_arguments_are_validated():
         HFLocalJudge("org/m", dtype="int4")
 
 
-class _Batch(dict):
-    def to(self, device):
-        self.device = device
-        return self
-
-
-def _fake_hf_stack(*, chat_template="{{ messages }}", completion_ids=(7, 8, 9)):
-    """Fake `torch` and `transformers` modules: just enough surface for `HFLocalJudge._load`, with numpy for tensors."""
-    import numpy as np
-
-    log = types.SimpleNamespace(template_calls=[], generate_calls=[], decoded=[], model_args=None, tokenizer_args=None)
-
-    class Tokenizer:
-        eos_token_id = 2
-        pad_token_id = None
-        pad_token = None
-        eos_token = "</s>"
-
-        def __init__(self):
-            self.chat_template = chat_template
-
-        def apply_chat_template(self, messages, **options):
-            log.template_calls.append((messages, options))
-            return "<templated>" + messages[0]["content"]
-
-        def __call__(self, text, **options):
-            log.tokenizer_args = (text, options)
-            return _Batch(input_ids=np.array([[1, 5, 6, 7, 8]]), attention_mask=np.ones((1, 5), dtype=int))
-
-        def decode(self, ids, skip_special_tokens=False):
-            log.decoded.append((list(ids), skip_special_tokens))
-            return " Refused. "
-
-    class Model:
-        generation_config = types.SimpleNamespace(eos_token_id=[2, 3])
-
-        def to(self, device):
-            return self
-
-        def eval(self):
-            return self
-
-        def generate(self, **options):
-            log.generate_calls.append(options)
-            prompt = options["input_ids"]
-            return np.concatenate([prompt, np.array([list(completion_ids)])], axis=1)
-
-    transformers = types.SimpleNamespace(
-        __version__="4.57.0",
-        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda name, **kw: Tokenizer()),
-        AutoModelForCausalLM=types.SimpleNamespace(
-            from_pretrained=lambda name, **kw: (setattr(log, "model_args", (name, kw)), Model())[1]
-        ),
-    )
-
-    class NoGrad:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, *exc):
-            return False
-
-    torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(is_available=lambda: False), no_grad=NoGrad, float16="F16", bfloat16="BF16",
-        float32="F32",
-    )
-    return torch, transformers, log
-
-
-def test_hf_judge_load_wiring_greedy_decoding_chat_template_and_new_tokens_only(monkeypatch):
-    torch, transformers, log = _fake_hf_stack()
+def test_hf_judge_load_wiring_greedy_decoding_chat_template_and_new_tokens_only(monkeypatch, fake_hf_stack):
+    torch, transformers, log = fake_hf_stack()
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     j = HFLocalJudge("org/Model", dtype="float32")
@@ -578,8 +559,38 @@ def test_hf_judge_load_wiring_greedy_decoding_chat_template_and_new_tokens_only(
     assert log.decoded == [([7, 8, 9], True)]  # only the new tokens are decoded, special tokens skipped
 
 
-def test_hf_judge_refuses_a_model_without_a_chat_template(monkeypatch):
-    torch, transformers, _ = _fake_hf_stack(chat_template=None)
+@pytest.mark.parametrize("fail_at", ["tokenizer", "model", "to"])
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
+def test_any_load_failure_is_one_setup_error_with_the_type_name_only_and_is_not_retried(
+    monkeypatch, fake_hf_stack, fail_at, error_type
+):
+    torch, transformers, log = fake_hf_stack(fail_at=fail_at, error=error_type(f"gated repo, token {KEY}"))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    j = HFLocalJudge("org/Model")
+    with pytest.raises(JudgeSetupError) as caught:
+        j.classify("harmful", "Q", "A")
+    assert str(caught.value) == f"could not load org/Model ({error_type.__name__})"
+    assert KEY not in str(caught.value) and KEY not in repr(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    with pytest.raises(JudgeSetupError) as again:  # a second call does not try the load again
+        j.classify("harmful", "Q", "B")
+    assert str(again.value) == str(caught.value) and log.load_attempts == 1
+
+
+def test_a_load_failure_stops_the_runner_on_the_first_judgment(monkeypatch, fake_hf_stack, tmp_path):
+    torch, transformers, log = fake_hf_stack(fail_at="model", error=OSError(f"no network {KEY}"))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    runner = JudgeRunner(HFLocalJudge("org/Model"), tmp_path / "cache.jsonl")
+    with pytest.raises(JudgeSetupError):
+        for i in range(4):
+            runner.verdict(_prompt(), _gen(f"reply {i}"))
+    assert log.load_attempts == 1 and dict(runner.error_types) == {}
+
+
+def test_hf_judge_refuses_a_model_without_a_chat_template(monkeypatch, fake_hf_stack):
+    torch, transformers, _ = fake_hf_stack(chat_template=None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     with pytest.raises(JudgeSetupError) as caught:
