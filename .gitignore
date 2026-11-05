@@ -1,7 +1,8 @@
 envs/
 .env
-data/testset/
-data/ft/
+# everything under data/ stays local except the source manifest
+data/*
+!data/sources.yaml
 results/
 export/
 .superpowers/

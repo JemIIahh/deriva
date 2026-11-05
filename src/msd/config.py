@@ -14,6 +14,7 @@ ALPHAS: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
 PROBE_N = 150
 REPORT_HARMFUL_N = 300
 REPORT_BENIGN_N = 200
+DEV_BENIGN_N = 100  # dev split = PROBE_N harmful + DEV_BENIGN_N benign-edgy prompts per language
 RELIABILITY_N = 60
 
 # Judge reliability floor and drift gate.
