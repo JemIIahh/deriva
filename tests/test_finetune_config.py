@@ -172,7 +172,6 @@ BAD = [
     ("data.train", "", "data.train"),
     ("data.heldout", 3, "data.heldout"),
     ("aligntune.backend", "vllm", "aligntune.backend"),
-    ("aligntune.group_by_length", "no", "group_by_length"),
     ("aligntune.eval_strategy", False, "eval_strategy"),  # an unquoted no in YAML is False: say so
     ("aligntune.loggers", "none", "loggers"),
     ("aligntune.device_map", 3.5, "device_map"),
@@ -202,6 +201,18 @@ def test_fp16_and_bf16_together_are_refused():
     data = mutated("train.bf16", True)
     with pytest.raises(finetune.ConfigError, match="fp16.*bf16|bf16.*fp16"):
         finetune.parse_config(data)
+
+
+def test_group_by_length_is_not_a_key_any_more():
+    # transformers 5 replaced it by train_sampling_strategy, so AlignTune's old keyword reaches nothing
+    data = mutated("aligntune.group_by_length", False)
+    with pytest.raises(finetune.ConfigError, match="unknown key 'aligntune.group_by_length'"):
+        finetune.parse_config(data)
+
+
+def test_neither_real_config_mentions_group_by_length():
+    for path in (BASE_PATH, STRONG_PATH):
+        assert "group_by_length" not in path.read_text(encoding="utf-8")
 
 
 def test_the_label_bounds_must_be_ordered():

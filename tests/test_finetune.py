@@ -65,19 +65,22 @@ class FakeTrainer:
             "base_model_name_or_path": p["model_name"],
             "r": p["lora_r"],
             "lora_alpha": p["lora_alpha"],
+            "lora_dropout": p["lora_dropout"],
+            "bias": p["lora_bias"],
             "target_modules": sorted(p["lora_target_modules"]),
         }
         adapter.update(owner.adapter_overrides)
         if owner.write_adapter:
             (out / "adapter_config.json").write_text(json.dumps(adapter), encoding="utf-8")
-            (out / "adapter_model.safetensors").write_bytes(b"fake adapter weights")
+            if owner.weights_name is not None:
+                (out / owner.weights_name).write_bytes(b"fake adapter weights")
         (out / "checkpoint-250").mkdir()
         (out / "checkpoint-250" / "optimizer.pt").write_bytes(b"fake optimizer")
         (out / "lexsi_provenance.json").write_text(json.dumps({"output_dir": str(out)}), encoding="utf-8")  # absolute paths
         history = owner.losses if owner.losses is not None else losses_down(min(steps, 6) if steps > 1 else 1)
-        last = history[-1][1] if history else float("nan")
+        mean = sum(loss for _, loss in history) / len(history) if history else float("nan")  # HF's training_loss is a mean
         return {
-            "final_loss": owner.final_loss if owner.final_loss is not None else last,
+            "mean_train_loss": owner.mean_train_loss if owner.mean_train_loss is not None else mean,
             "steps": owner.steps if owner.steps is not None else steps,
             "loss_history": history,
             "rows_seen": owner.rows_seen if owner.rows_seen is not None else rows,
@@ -89,13 +92,14 @@ class FakeFactory:
         self.calls: list[dict] = []
         self.fail_with = None
         self.losses = None
-        self.final_loss = None
+        self.mean_train_loss = None
         self.steps = None
         self.rows_seen = None
         self.label_counts = "default"  # None: the trainer never shows its tokenised rows
         self.start_checks: list = []
         self.template_texts: list[str] = []
         self.write_adapter = True
+        self.weights_name = "adapter_model.safetensors"  # None: the config is saved but no weights file
         self.adapter_overrides: dict = {}
         for key, value in options.items():
             setattr(self, key, value)
@@ -365,7 +369,6 @@ REACHES = {
     "train.save_steps": ("save_steps", 33, 33, None),
     "train.save_total_limit": ("save_total_limit", 5, 5, None),
     "aligntune.device_map": ("device_map", "auto", "auto", None),
-    "aligntune.group_by_length": ("group_by_length", True, True, None),
     "aligntune.load_best_model_at_end": ("load_best_model_at_end", True, True, None),
     "aligntune.eval_strategy": ("eval_strategy", "steps", "steps", None),
     "aligntune.loggers": ("loggers", ["tensorboard"], ["tensorboard"], None),
@@ -410,6 +413,7 @@ def test_the_fixed_keywords_and_the_derived_ones(world):
     assert Path(params["output_dir"]) == world.work  # AlignTune writes into the persistent work folder
     assert "quantization" not in params  # mode none: nothing quantised, nothing sent
     assert "max_steps" not in params  # not a smoke run
+    assert "group_by_length" not in params  # not a field of transformers 5, so it would reach nothing
 
 
 def test_the_precision_follows_the_flags(tmp_path):
@@ -804,8 +808,8 @@ def test_nan_loss_fails_the_run_and_nothing_is_merged_or_kept(world, capsys):
     assert world.merge.calls == []
 
 
-def test_infinite_final_loss_fails_the_run(world, capsys):
-    err = failed_run(world, capsys, final_loss=float("inf"))
+def test_infinite_mean_train_loss_fails_the_run(world, capsys):
+    err = failed_run(world, capsys, mean_train_loss=float("inf"))
     assert "finite" in err and world.merge.calls == []
 
 
@@ -826,7 +830,7 @@ def test_one_logged_loss_cannot_show_a_decrease(world, capsys):
 
 
 def test_no_logged_loss_fails_the_run(world, capsys):
-    failed_run(world, capsys, losses=[], final_loss=0.5)
+    failed_run(world, capsys, losses=[], mean_train_loss=0.5)
 
 
 def test_rows_the_trainer_did_not_see_fail_the_run(world, capsys):
@@ -877,6 +881,33 @@ def test_an_adapter_with_other_target_modules_fails_the_run(world, capsys):
 def test_an_adapter_for_another_base_model_fails_the_run(world, capsys):
     err = failed_run(world, capsys, adapter_overrides={"base_model_name_or_path": "Someone/else"})
     assert "base_model" in err
+
+
+@pytest.mark.parametrize(
+    "overrides, key",
+    [({"lora_alpha": 7}, "lora_alpha"), ({"lora_dropout": 0.5}, "lora_dropout"), ({"bias": "all"}, "bias")],
+)
+def test_an_adapter_with_other_alpha_dropout_or_bias_fails_the_run(world, capsys, overrides, key):
+    err = failed_run(world, capsys, adapter_overrides=overrides)
+    assert key in err and world.merge.calls == []
+
+
+def test_an_adapter_without_a_weights_file_fails_the_run(world, capsys):
+    err = failed_run(world, capsys, weights_name=None)
+    assert "adapter_model.safetensors" in err and "adapter_model.bin" in err
+
+
+def test_a_bin_weights_file_is_accepted(world):
+    world.factory = FakeFactory(weights_name="adapter_model.bin")
+    assert world.run() == 0
+    assert (world.out / "adapter" / "adapter_model.bin").is_file()
+
+
+def test_merge_only_refuses_an_adapter_folder_without_weights(world, capsys):
+    kept = make_adapter(world)
+    (kept / "adapter_model.safetensors").unlink()
+    assert merge_only(world, kept) == 1
+    assert "adapter_model.safetensors" in capsys.readouterr().err and world.merge.calls == []
 
 
 def test_a_missing_adapter_fails_the_run(world, capsys):
@@ -1024,7 +1055,11 @@ def test_summary_records_the_run(world):
     assert s["libraries"] == {"aligntune": "0.0-fake", "trl": None}
     assert s["seed"] == world.raw()["train"]["seed"]
     assert s["rows_seen"] == 40
-    assert s["final_loss"] == pytest.approx(s["loss_history"][-1][1])
+    assert "final_loss" not in s  # AlignTune's "final_loss" is the mean over the run, not the last loss: named for what it is
+    losses = [loss for _, loss in s["loss_history"]]
+    assert s["last_logged_loss"] == pytest.approx(losses[-1])
+    assert s["mean_train_loss"] == pytest.approx(sum(losses) / len(losses))
+    assert s["mean_train_loss"] > s["last_logged_loss"]  # a falling loss: the mean sits above the last value
     assert s["loss_history"][0][1] > s["loss_history"][-1][1]
     assert s["merge_dtype"] == "float16"
     assert s["push_to"] is None
@@ -1097,7 +1132,8 @@ def make_adapter(world, **overrides):
     folder.mkdir(parents=True)
     data = {
         "peft_type": "LORA", "base_model_name_or_path": cfg["base_model"], "r": cfg["lora"]["rank"],
-        "lora_alpha": cfg["lora"]["alpha"], "target_modules": sorted(cfg["lora"]["target_modules"]),
+        "lora_alpha": cfg["lora"]["alpha"], "lora_dropout": cfg["lora"]["dropout"], "bias": cfg["lora"]["bias"],
+        "target_modules": sorted(cfg["lora"]["target_modules"]),
     }
     data.update(overrides)
     (folder / "adapter_config.json").write_text(json.dumps(data), encoding="utf-8")
@@ -1574,7 +1610,7 @@ class _FakeAlignTuneTrainer:
         return ["aligntune's own adapter"]
 
     def train(self):
-        return {"final_loss": 1.25, "steps": 7, "epochs": 2, "metrics": {}, "model_path": "x", "training_time": 3.0}
+        return {"final_loss": 1.25, "steps": 7, "epochs": 2, "metrics": {}, "model_path": "x", "training_time": 3.0}  # AlignTune's name
 
 
 def install_fake_aligntune(monkeypatch):
@@ -1597,7 +1633,7 @@ def test_the_aligntune_wrapper_passes_the_keywords_through_and_reads_the_numbers
     trainer = finetune.aligntune_factory({"model_name": "m", "lora_r": 4})
     assert calls == [{"model_name": "m", "lora_r": 4}]  # exactly the keywords, nothing added
     result = trainer.train()
-    assert result["final_loss"] == 1.25 and result["steps"] == 7 and result["rows_seen"] == 38
+    assert result["mean_train_loss"] == 1.25 and result["steps"] == 7 and result["rows_seen"] == 38  # its final_loss is TrainOutput.training_loss
     history = result["loss_history"]
     assert history[0] == [1, 2.0] and len(history) == 2 and math.isnan(history[1][1])
 

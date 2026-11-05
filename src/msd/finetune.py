@@ -80,6 +80,7 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
 
 SUMMARY_FILE = "finetune_summary.json"
 ADAPTER_CONFIG = "adapter_config.json"
+ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")
 SMOKE_SUFFIX = "-smoke"
 TEMPLATE_FILE = "default_chat_template.jinja"  # not chat_template.jinja: the trainer saves its own under that name
 NOT_PUBLISHED = ("lexsi_provenance.json",)  # AlignTune's provenance file records absolute paths
@@ -253,7 +254,6 @@ SCHEMA: dict[str, Any] = {
     "aligntune": {
         "backend": choice("trl"),
         "device_map": device_map,
-        "group_by_length": flag,
         "load_best_model_at_end": flag,
         "eval_strategy": choice("no", "steps", "epoch"),
         "loggers": text_list,
@@ -599,7 +599,6 @@ def build_trainer_params(
         "save_steps": t.save_steps,
         "save_total_limit": t.save_total_limit,
         "device_map": tune.device_map,
-        "group_by_length": tune.group_by_length,
         "load_best_model_at_end": tune.load_best_model_at_end,
         "eval_strategy": tune.eval_strategy,
         "loggers": list(tune.loggers),
@@ -615,8 +614,9 @@ def build_trainer_params(
 class _AlignTuneRun:
     """The real AlignTune trainer behind the small interface `run` uses: `train()` returns plain numbers.
 
-    `train()` returns `{final_loss, steps, loss_history: [[step, loss]...], rows_seen}`. The numbers come from
-    the dict `TRLSFTTrainer.train()` returns (`final_loss`, `steps`) and from the Hugging Face trainer inside it
+    `train()` returns `{mean_train_loss, steps, loss_history: [[step, loss]...], rows_seen}`. The numbers come from
+    the dict `TRLSFTTrainer.train()` returns (`final_loss`, which is `TrainOutput.training_loss`, the mean over
+    the whole run, and `steps`) and from the Hugging Face trainer inside it
     (`state.log_history`, `train_dataset`); each is None or empty when the installed version does not offer it,
     and `run` then refuses or notes it. Read from the source of aligntune 0.1.31, never run."""
 
@@ -635,7 +635,7 @@ class _AlignTuneRun:
             steps = getattr(state, "global_step", None)
         dataset = getattr(hf, "train_dataset", None)
         rows_seen = len(dataset) if dataset is not None and hasattr(dataset, "__len__") else None
-        return {"final_loss": result.get("final_loss"), "steps": steps, "loss_history": history, "rows_seen": rows_seen}
+        return {"mean_train_loss": result.get("final_loss"), "steps": steps, "loss_history": history, "rows_seen": rows_seen}
 
 
 def _hook_start_check(inner: Any, start_check: StartCheck) -> None:
@@ -1001,6 +1001,8 @@ def _check_adapter(adapter_dir: Path, cfg: SimpleNamespace, name: str) -> None:
     wanted = (
         ("r", "rank", saved.get("r"), cfg.lora.rank),
         ("lora_alpha", "alpha", saved.get("lora_alpha"), cfg.lora.alpha),
+        ("lora_dropout", "dropout", saved.get("lora_dropout"), cfg.lora.dropout),
+        ("bias", "bias", saved.get("bias"), cfg.lora.bias),
         ("base_model_name_or_path", "base model", saved.get("base_model_name_or_path"), cfg.base_model),
         ("target_modules", "target modules", modules, set(cfg.lora.target_modules)),
     )
@@ -1014,6 +1016,8 @@ def _check_adapter(adapter_dir: Path, cfg: SimpleNamespace, name: str) -> None:
             "the adapter the trainer saved does not match the config: " + "; ".join(problems)
             + ". AlignTune ignores keywords it does not know, so check the names in docs/toolkit-notes.md."
         )
+    if not any((adapter_dir / weights).is_file() for weights in ADAPTER_WEIGHTS):
+        raise FinetuneError(f"the {name} folder has {ADAPTER_CONFIG} but none of the weights files ({' or '.join(ADAPTER_WEIGHTS)})")
 
 
 def _train_and_check(
@@ -1051,18 +1055,17 @@ def _train_and_check(
         )
     history = [[step, float(loss)] for step, loss in result.get("loss_history") or []]
     ok, reason = loss_check(history)
-    final = result.get("final_loss")
-    if ok and final is not None and not math.isfinite(float(final)):
-        ok, reason = False, "the final loss is not finite (NaN or inf)"
+    mean_loss = result.get("mean_train_loss")
+    if ok and mean_loss is not None and not math.isfinite(float(mean_loss)):
+        ok, reason = False, "the mean training loss is not finite (NaN or inf)"
     if not ok:
         raise FinetuneError(f"{reason}; logged losses (step:loss) {_show_history(history, cfg.checks.history_points)}")
-    if final is None:
-        final = history[-1][1]
     return {
         "rows_seen": rows_seen,
         "planned": planned,
         "steps": steps,
-        "final_loss": float(format(float(final), _FLOAT)),
+        "mean_train_loss": None if mean_loss is None else float(format(float(mean_loss), _FLOAT)),
+        "last_logged_loss": float(format(history[-1][1], _FLOAT)),
         "history": history,
         "loss_reason": reason,
         "label_check": (
@@ -1104,7 +1107,8 @@ def _summary(
         "planned_steps": trained["planned"],
         "steps": trained["steps"],
         "rows_seen": trained["rows_seen"],
-        "final_loss": trained["final_loss"],
+        "mean_train_loss": trained["mean_train_loss"],
+        "last_logged_loss": trained["last_logged_loss"],
         "loss_history": _tidy(sample_history(trained["history"], cfg.checks.history_points)),
         "loss_ok": True,
         "loss_reason": trained["loss_reason"],
@@ -1274,6 +1278,10 @@ def _merge(hooks: Hooks, cfg: SimpleNamespace, adapter_dir: Path, merged_out: Pa
             raise FinetuneError(f"the merge wrote nothing into {cfg.output.merged_dir}")
 
 
+def _loss_text(value: float | None) -> str:
+    return "not reported" if value is None else format(value, _FLOAT)
+
+
 def _json_text(data: Mapping[str, Any]) -> str:
     return scrub(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
@@ -1388,7 +1396,7 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
     else:
         shutil.rmtree(work, ignore_errors=True)
 
-    print(f"wrote {shown(out, root)} ({'smoke run, ' if args.smoke else ''}{trained['steps']} steps, final loss {trained['final_loss']:{_FLOAT}}; {trained['loss_reason']})")
+    print(f"wrote {shown(out, root)} ({'smoke run, ' if args.smoke else ''}{trained['steps']} steps, mean train loss {_loss_text(trained['mean_train_loss'])}, last logged loss {trained['last_logged_loss']:{_FLOAT}}; {trained['loss_reason']})")
     if args.smoke:
         print("smoke run only: this model is not A1; run without --max-steps for the real fine-tune", file=sys.stderr)
     if api is not None:

@@ -608,7 +608,7 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
 | `lr_scheduler` | `"cosine"` | from the config |
 | `weight_decay`, `max_grad_norm` | 0.01, 1.0 | from the config |
 | `gradient_checkpointing` | **False**; `gradient_checkpointing_kwargs` `{"use_reentrant": False}` | from the config. The model-level `use_gradient_checkpointing` (default True) is NOT read on the SFT/TRL path; only this keyword reaches the `SFTConfig` |
-| `group_by_length` | True | False: length-sorted batches bias the order, and with batch size 1 it only reorders |
+| `group_by_length` | True (`backend_factory`) | **not sent, and not a config key**: transformers 5 replaced it by `train_sampling_strategy` (`trainer.py` tests `args.train_sampling_strategy == "group_by_length"`), so the old keyword is not an `SFTConfig` field and the backfill would drop it. Whether a length-sorted sampler is on by default is not read here; the random default is assumed, UNVERIFIED |
 | `load_best_model_at_end` | True (`metric_for_best_model="eval_loss"`) | False: there is no eval set |
 | `eval_strategy` | `"steps"` | `"no"` (it becomes `"no"` anyway when there is no eval dataset) |
 | `loggers` / `report_to` | `["tensorboard"]` / `"none"` | `report_to="none"` falls back to `loggers`, so `loggers=["none"]` |
@@ -629,6 +629,8 @@ with a `LoraConfig`) after the model is built; TRL's `SFTTrainer` is then called
   `<out>/adapter`, merges into `<out>/merged`, and writes `finetune_summary.json` last, each part atomically.
   `--merge-only --adapter PATH` repeats just the merge from a kept adapter.
 - `train()` returns a dict with `final_loss`, `steps`, `epochs`, `metrics`, `model_path` and `training_time`.
+  **`final_loss` is `train_result.training_loss`, the mean of the loss over the whole run, not the last loss**; the
+  summary calls it `mean_train_loss` and adds `last_logged_loss` from `log_history`.
   The per-step losses are in `trainer.trainer.state.log_history` (entries with a `"loss"` key).
 - **There is no resume API**: a dropped Kaggle or Colab session restarts the run (the checkpoint folders are
   there for a manual recovery only; UNVERIFIED that `Trainer.train(resume_from_checkpoint=...)` could be
@@ -741,7 +743,7 @@ create_sft_trainer(model_name=<base_model>, dataset_name=<train.jsonl>, backend=
                    warmup_ratio=..., lr_scheduler=..., weight_decay=..., max_grad_norm=..., assistant_only_loss=True,
                    chat_template_path="work/finetune/<stem>/chat_template.jinja",
                    seed=..., data_seed=..., logging_steps=..., save_steps=..., save_total_limit=..., loggers=["none"],
-                   load_best_model_at_end=False, eval_strategy="no", group_by_length=False, device_map={"": 0})
+                   load_best_model_at_end=False, eval_strategy="no", device_map={"": 0})
 ```
 
 then `trainer.train()`, the loss and row-count checks, the merge, and `finetune_summary.json`. A conversion of

@@ -290,7 +290,7 @@ starts again. What is kept is for recovery by hand.
 
 - The merge failed (out of RAM, say): the error names `<out>/adapter`. Finish without training again:
   `STAGE_ARGS = "--config data/configs/ft_lora.yaml --merge-only --adapter results/finetune/ft_lora/adapter"`. It
-  checks that adapter against the config (base model, rank, alpha, target modules), merges into
+  checks that adapter against the config (base model, rank, alpha, dropout, bias, target modules, and that the weights file is there), merges into
   `<out>/merged` and adds a `merge` section to `finetune_summary.json` (it writes a small one when the failed run
   left none). It trains nothing and reads no data; it takes no `--data`, `--seed`, `--max-steps`, `--no-merge`,
   `--dry-run` or `--push-to`.

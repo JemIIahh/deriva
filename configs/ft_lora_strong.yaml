@@ -55,7 +55,6 @@ train:
 aligntune:
   backend: trl
   device_map: {"": 0}
-  group_by_length: false
   load_best_model_at_end: false
   eval_strategy: "no"
   loggers: ["none"]

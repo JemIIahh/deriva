@@ -68,7 +68,6 @@ train:
 aligntune:
   backend: trl                           # "auto" may pick unsloth (AGPL parts); we use TRL only
   device_map: {"": 0}                    # everything on the one GPU; "auto" may offload layers to the CPU, which breaks training
-  group_by_length: false                 # AlignTune's default is True; plain random order
   load_best_model_at_end: false          # AlignTune's default is True; there is no eval set
   eval_strategy: "no"
   loggers: ["none"]                      # AlignTune's default is tensorboard
