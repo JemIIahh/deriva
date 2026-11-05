@@ -1,0 +1,127 @@
+# CuratorKIT pipeline: the harmless closed-form fine-tuning set (design doc, section 7).
+#
+# Task: multiple-choice questions on everyday civics, geography, history, basic science and
+# health literacy, answered with the bare option letter. Data: Global-MMLU (Apache-2.0, see
+# data/sources.yaml), no LLM and no generated text anywhere in this file.
+#
+# Run (from the repository root):
+#   python scripts/build_ft_data.py fetch && python scripts/build_ft_data.py prepare
+#   envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir data/ft/curated
+#   python scripts/build_ft_data.py finalize
+#   python scripts/validate_ft_data.py --langs en,hi,ar,sw --pipeline pipelines/ft_data.yaml
+# Check without running:
+#   envs/curatorkit/bin/curatorkit run pipelines/ft_data.yaml --output-dir <scratch> --dry-run
+#
+# What CuratorKIT 0.1.22 does here, and what it cannot do (read from its installed source):
+#   * reader      jsonl, forced to the Alpaca layout; id is kept as the sample id and lang / split /
+#                 stratum / gold / item / subject / rank ride along as metadata.
+#   * gate        schema: instruction and output present, length window. There is no language-id
+#                 gate (the diversity gate needs sentence-transformers) and no gate on a single
+#                 field, so the script check, the harmless-subject allowlist and the bare-answer
+#                 rule are applied before CuratorKIT (scripts/build_ft_data.py prepare, settings
+#                 below) and again after it (scripts/validate_ft_data.py).
+#   * not used    secrets and toxicity gates (detect-secrets and detoxify/torch are not installed,
+#                 the text is exam questions), hallucination and reward gates (they call an LLM
+#                 and no key exists), embedding dedup (sentence-transformers), the PII step (spaCy).
+#   * normalizers exact dedup, then MinHash near-dedup, then two stratified samplers that equalise
+#                 the languages inside the train split and inside the heldout split.
+#   * exporter    messages -> <output-dir>/sft_messages.jsonl (only `messages`; the ids come back
+#                 in the finalize step), plus a manifest, a rejected-samples sidecar and a README.
+#
+# Sample order matters: train rows are listed before heldout rows, and both dedup steps keep the
+# first sample of a duplicate group, so a heldout item that repeats a train item is the one dropped.
+
+name: ft_data_global_mmlu_harmless_mc
+version: "0.1.0"
+
+# Settings read by scripts/build_ft_data.py and scripts/validate_ft_data.py (CuratorKIT ignores it).
+extra:
+  source: "CohereLabs/Global-MMLU (fine-tune subset), Apache-2.0; test split, config en / hi / ar / sw"
+  # Harmless-subject allowlist: everyday civics, geography, history, basic science, health
+  # literacy. Left out on purpose: security_studies, computer_security, virology, medical_genetics,
+  # professional_medicine and professional_law, moral_scenarios, moral_disputes, philosophy,
+  # world_religions, human_sexuality, international_law, jurisprudence, business_ethics,
+  # us_foreign_policy, the chemistry and engineering subjects, and anything else not listed.
+  harmless_subjects:
+    - high_school_government_and_politics
+    - high_school_geography
+    - high_school_world_history
+    - high_school_european_history
+    - high_school_us_history
+    - prehistory
+    - global_facts
+    - sociology
+    - high_school_psychology
+    - high_school_biology
+    - conceptual_physics
+    - astronomy
+    - nutrition
+    - human_aging
+    - anatomy
+    - clinical_knowledge
+  split_seed: 20261105    # one seeded ranking of source items decides the split for every language
+  heldout_pool: 260       # candidate items per language for the heldout split ...
+  train_pool: 1800        # ... and for train, before CuratorKIT drops anything
+  heldout_cap: 200        # at most this many heldout rows per language in the final file
+  train_cap: 1500         # at most this many train rows per language in the final file
+  deferred: "hinglish rows come from translating the Hindi rows with the llm-chat translator (needs an endpoint)"
+
+readers:
+  - type: jsonl
+    path: data/ft/prep/candidates.jsonl
+    format: alpaca
+    source_uri: "CohereLabs/Global-MMLU#test (prepared by scripts/build_ft_data.py)"
+
+gates:
+  - type: schema
+    required_fields: [instruction, output]
+    enforce_task_types: [instruction_following]
+    min_tokens: 10     # whitespace tokens of instruction + output (the shortest real prompt has 20)
+    max_tokens: 450    # long enough for the longest exam question, short enough for a 3B model's context
+
+normalizers:
+  - type: exact_dedup
+    ignore_for_dedup:   # mask the fixed boilerplate so only the question and options are compared
+      - '(?m)^[A-D]\. '
+      - 'Answer with only the letter of the correct option\.'
+      - 'केवल सही विकल्प का अक्षर लिखकर उत्तर दें।'
+      - 'أجب بحرف الخيار الصحيح فقط\.'
+      - 'Jibu kwa herufi ya chaguo sahihi pekee\.'
+  - type: minhash_dedup
+    minhash_threshold: 0.85
+    minhash_ngram: 3
+    minhash_num_perm: 128
+    minhash_seed: 42
+    ignore_for_dedup:
+      - '(?m)^[A-D]\. '
+      - 'Answer with only the letter of the correct option\.'
+      - 'केवल सही विकल्प का अक्षर लिखकर उत्तर दें।'
+      - 'أجب بحرف الخيار الصحيح فقط\.'
+      - 'Jibu kwa herufi ya chaguo sahihi pekee\.'
+  # Equalise the languages inside each split (the sampler cuts every listed category down to the
+  # smallest one, so no language is padded and none dominates). Two samplers because a short
+  # heldout pool must not shrink train: each lists only its own split's strata and passes the
+  # other split through. When hinglish rows exist, add a hinglish stratum and use 0.2 each.
+  - type: stratified_sampler
+    category_field: stratum
+    sampler_seed: 42
+    target_distribution: {"train:en": 0.25, "train:hi": 0.25, "train:ar": 0.25, "train:sw": 0.25}
+  - type: stratified_sampler
+    category_field: stratum
+    sampler_seed: 43
+    target_distribution: {"heldout:en": 0.25, "heldout:hi": 0.25, "heldout:ar": 0.25, "heldout:sw": 0.25}
+
+# No generation step: there is no LLM key. Where a generator would go (it would add synthetic
+# public-services notices with questions; its output must pass the same validator):
+#
+# generators:
+#   - type: qa
+#     num_questions: 3
+#     difficulty: easy
+#     llm: {model: "<provider>/<model>", api_base: "<endpoint>", api_key: "<key>"}
+#
+# llm:   # global LLM block, only needed once a generator or an LLM gate is switched on
+#   model: "<provider>/<model>"
+
+exporters:
+  - type: messages

@@ -169,7 +169,9 @@
     License." 42 languages including en, hi, ar and sw (card language table). MMLU
     questions combining machine translation with professional and crowd-sourced
     post-edits; general knowledge multiple choice, not public-services QA. Permissive
-    (no share-alike) alternative to Belebele for a capability-retention check.
+    (no share-alike) alternative to Belebele for a capability-retention check. Part of
+    this dataset is also the fine-tune data (see the fine-tune subset entry below): a
+    cross-check that uses it must stay on subjects outside that entry's allowlist.
 
 - name: "openai/MMMLU"
   url: "https://huggingface.co/datasets/openai/MMMLU"
@@ -199,6 +201,29 @@
     apc). The card does not say whether Hindi is Devanagari or romanized, so hinglish is
     not listed. General instruction data, free-form answers, not public-services QA and
     not closed-form; it needs filtering for harmless content before use.
+
+- name: "CohereLabs/Global-MMLU (fine-tune subset)"
+  url: "https://huggingface.co/datasets/CohereLabs/Global-MMLU"
+  license: "apache-2.0"
+  languages: [en, hi, ar, sw]
+  used_for: "fine_tune_data"
+  verified_on: "2026-11-05"
+  notes: >-
+    Closed-form fine-tune task: harmless multiple-choice questions answered with the bare
+    option letter. License read from the raw card (huggingface.co/datasets/CohereLabs/
+    Global-MMLU/raw/main/README.md): front matter "license: apache-2.0", a "License: Apache
+    2.0" line in the summary and the Licensing Information section "This dataset can be used
+    for any purpose, under the terms of the Apache 2.0 License." Test split of the en, hi, ar
+    and sw configs, restricted to a harmless-subject allowlist (everyday civics, geography,
+    history, basic science, health literacy; the list is extra.harmless_subjects in
+    pipelines/ft_data.yaml, which also names what is left out: security, virology, moral and
+    legal subjects and similar). The card says its annotation "did not focus on flagging for
+    toxic, harmful, or offensive speech", hence the allowlist. Source items are split once by
+    item id, so a question and its translations share a split. No Hinglish: those rows come
+    from translating the Hindi rows. Extractive-QA alternatives checked and not used:
+    google-research-datasets/tydiqa (see its excluded entry; no Hindi) and ai4bharat/IndicQA
+    (front matter cc-by-4.0, Hindi only, under 1K rows, stub card). Cite Global-MMLU (Singh et
+    al. 2024); the same entry's cross-check use is listed above.
 
 # ------------------------------------------------------------------ excluded
 
