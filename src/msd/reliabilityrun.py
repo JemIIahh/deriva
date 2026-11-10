@@ -200,7 +200,7 @@ def run(args: argparse.Namespace, *, root: Path) -> dict[str, list[str]]:
         raise reportrun.ReportError(
             f"{results / SPLIT} holds no judged verdicts that enter the tables, so there is nothing to double-judge"
         )
-    for note in [*analysis.notes, *analysis.warnings]:
+    for note in [*analysis.notes, *analysis.warnings, *analysis.terminal_notes]:
         print(f"NOTE: {note}", file=sys.stderr)
 
     judge = evalrun.build_judge(args.judge, results, Path(root))

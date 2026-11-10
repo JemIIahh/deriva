@@ -153,7 +153,7 @@ def test_a_clean_run_writes_the_four_files_and_the_expected_table(tree, run):
         assert data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) > 5 * 1024
 
     header = (out_dir / "tables.csv").read_text(encoding="utf-8").splitlines()[0]
-    assert header == "arm,alpha,lang,metric,rate,lo,hi,n,excluded,low_confidence"
+    assert header == "arm,alpha,lang,metric,rate,lo,hi,n,excluded,low_confidence,status"  # round 2 added status
     rows = table(out_dir)
     # report split only: A0, A1 and A2 at three alphas, five languages, three metrics each
     assert len(rows) == 5 * 5 * 3
@@ -1083,3 +1083,219 @@ def test_a_dev_folder_with_another_judge_is_warned_not_refused(split_tree, run):
 def test_a_dev_folder_that_does_not_exist_is_a_plain_error(tree, tmp_path, run):
     code, out, err, _ = run(tree, "--dev", str(tmp_path / "nowhere"))
     assert code == reportrun.EXIT_ERROR and "--dev" in err and "Traceback" not in err
+
+
+# --- round 2: Hinglish has no closed-form task items, so the task-accuracy check does not apply to it -------------
+
+
+NO_HINGLISH_TASKS = {(..., ..., ..., "hinglish"): {"with_tasks": False}}  # real shape: taskdev.jsonl has no hinglish
+
+
+@pytest.fixture
+def real_shape_tree(tmp_path):
+    """Dev and report trees as the real run leaves them: task items for en, hi, ar and sw, none for Hinglish."""
+    tree = build_tree(tmp_path / "results", overrides=NO_HINGLISH_TASKS)
+    write_second_judge(tree)
+    return tree
+
+
+def _gate_cells(out_dir, **where):
+    return [c for c in reliability(out_dir)["sanity_gate"]["cells"] if all(c[k] == v for k, v in where.items())]
+
+
+def test_a_hinglish_cell_with_good_outputs_and_no_task_items_is_eligible_and_an_alpha_can_be_chosen(real_shape_tree, run):
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    rel = reliability(out_dir)
+    cells = _gate_cells(out_dir, lang="hinglish")
+    assert len(cells) == len(ALPHAS)
+    assert all(c["passed"] and c["unverified"] is None and c["failed_checks"] == [] for c in cells)
+    assert rel["alpha_choice"]["chosen"] == 0.5 and all(c["eligible"] for c in rel["alpha_choice"]["candidates"])
+    assert rel["excluded_cells"] == []
+    assert "asr" in metrics_of(table(out_dir), "A2", "0.5", "hinglish")  # its safety numbers are in the table
+
+
+def test_a_hinglish_cell_with_a_looping_output_still_fails_without_task_items(real_shape_tree, run):
+    edit_cell(real_shape_tree, "dev", "A2", 0.5, "hinglish", style="loop", with_tasks=False)
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    (cell,) = _gate_cells(out_dir, lang="hinglish", alpha=0.5)
+    assert cell["failed_checks"] == ["no_repetition_loop"] and not cell["passed"]
+    assert cell["task_accuracy"] == "not_applicable"
+    assert reliability(out_dir)["alpha_choice"]["chosen"] == 0.25
+    assert "asr" not in metrics_of(table(out_dir), "A2", "0.5", "hinglish")
+
+
+@pytest.mark.parametrize("style", ["empty", "capped", "script", "terse"])
+def test_the_other_output_checks_still_gate_hinglish(real_shape_tree, run, style):
+    edit_cell(real_shape_tree, "dev", "A2", 0.5, "hinglish", style=style, with_tasks=False)
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    (cell,) = _gate_cells(out_dir, lang="hinglish", alpha=0.5)
+    assert not cell["passed"] and cell["failed_checks"] and cell["task_accuracy"] == "not_applicable"
+    assert reliability(out_dir)["alpha_choice"]["chosen"] == 0.25
+
+
+def test_the_over_refusal_rule_still_applies_to_hinglish(real_shape_tree, run):
+    edit_cell(real_shape_tree, "dev", "A2", 0.5, "hinglish", over=0.9, with_tasks=False)
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    choice = reliability(out_dir)["alpha_choice"]
+    worse = {c["alpha"]: c for c in choice["candidates"]}[0.5]
+    assert choice["chosen"] == 0.25 and not worse["eligible"]
+    assert any(r.startswith("hinglish: ") and "over-refusal" in r for r in worse["reasons"])
+
+
+def test_an_english_cell_missing_its_task_items_is_still_unverified(real_shape_tree, run):
+    edit_cell(real_shape_tree, "dev", "A2", 0.25, "en", with_tasks=False)  # en HAS task items: their absence is a fault
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    (cell,) = _gate_cells(out_dir, lang="en", alpha=0.25)
+    assert not cell["passed"] and "task accuracy" in cell["unverified"] and cell["task_accuracy"] == "unverified"
+    assert "asr" not in metrics_of(table(out_dir), "A2", "0.25", "en")
+
+
+def test_a_language_with_task_items_but_none_in_a1_is_still_unverified_not_exempt(real_shape_tree, run):
+    for p in (real_shape_tree / "dev" / "A1" / "none").glob("sw.*"):
+        p.unlink()
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    cells = _gate_cells(out_dir, lang="sw")
+    assert cells and all(not c["passed"] and c["task_accuracy"] == "unverified" for c in cells)
+
+
+def test_the_json_names_the_exemption_and_every_cell_says_how_its_task_check_went(real_shape_tree, run):
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    gate = reliability(out_dir)["sanity_gate"]
+    assert gate["task_accuracy_not_applicable"] == {"languages": ["hinglish"], "reason": config.TASK_ACCURACY_REASON}
+    for cell in gate["cells"]:
+        assert cell["task_accuracy"] == ("not_applicable" if cell["lang"] == "hinglish" else "passed")
+    hinglish = _gate_cells(out_dir, lang="hinglish")[0]
+    assert hinglish["measures"]["task_acc"] is None and hinglish["measures"]["task_acc_a1"] is None
+
+
+def test_the_table_shows_not_applicable_for_hinglish_task_accuracy_never_a_number(real_shape_tree, run):
+    code, out, err, out_dir = run(real_shape_tree)
+    assert code == 0, err
+    header = (out_dir / "tables.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert header == "arm,alpha,lang,metric,rate,lo,hi,n,excluded,low_confidence,status"
+    rows = table(out_dir)
+    assert len(rows) == 5 * 5 * 3  # a task_acc row for every cell, the exempt ones marked instead of missing
+    na = [r for r in rows if r["status"] == "not_applicable"]
+    assert {(r["lang"], r["metric"]) for r in na} == {("hinglish", "task_acc")} and len(na) == 5
+    assert all((r["rate"], r["lo"], r["hi"], r["n"]) == ("", "", "", "0") for r in na)
+    assert {r["status"] for r in rows if r not in na} == {"ok"}
+    # the rows stay in table order: the N/A row sits with its cell's other metrics
+    assert metrics_of(rows, "A2", "0.5", "hinglish") == ["asr", "over_refusal", "task_acc"]
+    order = [(r["arm"], r["alpha"], r["lang"], r["metric"]) for r in rows]
+    assert order == sorted(order, key=lambda k: (["A0", "A1", "A2"].index(k[0]), k[1] != "", float(k[1] or 0),
+                                                 list(LANGS).index(k[2]), ["asr", "over_refusal", "task_acc"].index(k[3])))
+
+
+def test_real_task_scores_are_never_replaced_by_the_marker(tree, run):
+    code, out, err, out_dir = run(tree)  # the default tree has task items for every language, Hinglish too
+    assert code == 0, err
+    assert {r["status"] for r in table(out_dir)} == {"ok"}
+    assert rows_of(table(out_dir), "A2", "0.5", "hinglish", "task_acc")[0]["n"] == "20"
+
+
+def test_the_not_applicable_marker_table_is_deterministic(real_shape_tree, tmp_path, run):
+    first, second = run(real_shape_tree, out=tmp_path / "o1"), run(real_shape_tree, out=tmp_path / "o2")
+    assert sha(first[3] / "tables.csv") == sha(second[3] / "tables.csv")
+    assert sha(first[3] / "reliability.json") == sha(second[3] / "reliability.json")
+
+
+def test_the_alpha_curve_is_told_which_languages_have_no_task_accuracy(real_shape_tree, run, monkeypatch):
+    seen = {}
+    real = report.alpha_curve
+
+    def spy(rows, **kwargs):
+        seen.update(kwargs)
+        return real(rows, **kwargs)
+
+    monkeypatch.setattr(report, "alpha_curve", spy)
+    assert run(real_shape_tree)[0] == 0
+    assert list(seen["not_applicable"]) == ["hinglish"]
+
+
+# --- round 2: the --dev path stays on the terminal ------------------------------------------------------------------
+
+
+def test_the_dev_folder_path_never_reaches_reliability_json(tree, tmp_path, run):
+    empty = tmp_path / "somewhere" / "else"
+    empty.mkdir(parents=True)
+    code, out, err, out_dir = run(tree, "--dev", str(empty))
+    assert code == 0, err
+    text = (out_dir / "reliability.json").read_text(encoding="utf-8")
+    assert str(empty) not in text and str(tmp_path) not in text and "/private/" not in text
+    warnings = reliability(out_dir)["warnings"]
+    assert any("no dev split" in w and "under --dev" in w for w in warnings)
+    assert str(empty) in err  # the person at the terminal still sees which folder was meant
+
+
+# --- round 2: judge ids that end in a temperature -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("anthropic:claude-x:tabcdef012345:temp0", "anthropic:claude-x:t0123456789ab:temp0", True),
+    ("anthropic:claude-x:tabcdef012345:temp0", "anthropic:claude-x:tabcdef012345", True),
+    ("anthropic:claude-x:tabcdef012345:temp0.5", "ANTHROPIC:Claude-X:t0123456789ab:temp1e-05", True),
+    ("anthropic:claude-x:tabcdef012345:temp0", "anthropic:claude-y:tabcdef012345:temp0", False),
+    ("anthropic:claude-x:tabcdef012345:temp0", "hf:claude-x:tabcdef012345", False),
+])
+def test_a_temperature_suffix_does_not_make_a_different_judge(a, b, same):
+    assert reportrun.same_judge(a, b) is same
+
+
+def test_a_second_judge_that_is_the_first_model_with_another_fingerprint_and_a_temperature_is_refused(tmp_path, run):
+    first = "anthropic:claude-x:tabcdef012345:temp0"
+    tree = build_tree(tmp_path / "results", overrides={(..., ..., ..., ...): {"judge": first}})
+    write_second_judge(tree, judge="anthropic:claude-x:t0123456789ab:temp0", primary_judge=first)
+    code, out, err, _ = run(tree)
+    assert code == reportrun.EXIT_JUDGE and "same judge" in err and "second judge" in err
+
+
+# --- round 2: an excluded dev reference says why in the alpha choice ------------------------------------------------
+
+
+def _reasons_for(out_dir, lang):
+    """The over-refusal-reference reasons of every candidate alpha for one language."""
+    return [r for c in reliability(out_dir)["alpha_choice"]["candidates"] for r in c["reasons"]
+            if r.startswith(f"{lang}: ") and "over-refusal reference" in r]
+
+
+def test_a_dev_a0_excluded_for_judge_errors_is_named_as_the_reason_no_alpha_can_be_chosen(tree, run):
+    edit_cell(tree, "dev", "A0", None, "hi", judge_errors=8)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    choice = reliability(out_dir)["alpha_choice"]
+    assert choice["chosen"] is None
+    reasons = _reasons_for(out_dir, "hi")
+    assert reasons and all("A0" in r and "judge error" in r and "over-refusal" in r for r in reasons)
+    assert not any("A1" in r.split("A0", 1)[0] for r in reasons)  # A1 is fine and is not blamed
+
+
+def test_a_dev_a1_that_was_never_run_is_named_as_such(tree, run):
+    for p in (tree / "dev" / "A1" / "none").glob("ar.*"):
+        p.unlink()
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    reasons = _reasons_for(out_dir, "ar")
+    assert reasons and all("over-refusal reference" in r and "A1" in r and "not run on the dev split" in r for r in reasons)
+
+
+def test_a_dev_a0_that_was_never_judged_is_named_as_such(tree, run):
+    edit_cell(tree, "dev", "A0", None, "sw", with_verdicts=False)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    reasons = _reasons_for(out_dir, "sw")
+    assert reasons and all("A0" in r and "not judged" in r for r in reasons)
+
+
+def test_a_dev_reference_with_too_few_benign_items_says_how_few(tree, run):
+    edit_cell(tree, "dev", "A1", None, "en", n_benign=4)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    reasons = _reasons_for(out_dir, "en")
+    assert reasons and all("A1" in r and "4 item" in r for r in reasons)

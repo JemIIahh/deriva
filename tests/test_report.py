@@ -511,3 +511,13 @@ def test_alpha_curve_says_which_alphas_were_not_eligible_to_be_chosen():
     )
     said = " ".join(t.get_text() for t in fig.texts)
     assert "Not chosen" in said and "alpha 0.5" in said and "hi 50% vs 20% allowed" in said and "ar 60%" in said
+
+
+def test_alpha_curve_names_the_languages_whose_task_accuracy_is_not_applicable():
+    rows = [r for r in _curve_rows() if not (r["lang"] == "hinglish" and r["metric"] == "task_acc")]
+    fig = _build_alpha_curve_figure(rows, langs=list(LANGS), chosen_alpha=0.25, not_applicable=["hinglish"])
+    said = " ".join(t.get_text() for t in fig.texts)
+    assert "hinglish" in said and "task accuracy" in said and "not applicable" in said
+    assert not any(line.get_gid() == "line:hinglish" for line in fig.axes[0].lines)  # nothing is drawn for it
+    plain = " ".join(t.get_text() for t in _build_alpha_curve_figure(rows, langs=list(LANGS)).texts)
+    assert "not applicable" not in plain  # and without the argument the note is not there

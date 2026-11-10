@@ -497,6 +497,7 @@ def alpha_curve(
     chosen_alpha: float | None = None,
     excluded: Mapping[str, Sequence[float | str]] | None = None,
     not_chosen: Mapping[float, Sequence[str]] | None = None,
+    not_applicable: Sequence[str] | None = None,
 ) -> None:
     """Safety against task accuracy, one line per language along the A2 alpha grid.
 
@@ -511,10 +512,11 @@ def alpha_curve(
     A2 alphas as numbers, a single-model marker as its arm name ("A0", "A1"); a line under the plot lists them,
     because a gap in a line, or a missing marker, must not go unexplained. `not_chosen` maps an alpha that was
     not eligible to be chosen (its cells are in the table) to the reasons, one short text each, and is listed
-    on a line of its own.
+    on a line of its own. `not_applicable` names the languages with no task accuracy at all (no task items): the
+    x axis is task accuracy, so they cannot be drawn, and a line under the plot says so.
     """
     _save(_build_alpha_curve_figure(rows, langs=langs, chosen_alpha=chosen_alpha, excluded=excluded,
-                                    not_chosen=not_chosen), out_path)
+                                    not_chosen=not_chosen, not_applicable=not_applicable), out_path)
 
 
 _ALPHA_TOLERANCE = 1e-9
@@ -549,6 +551,7 @@ def _build_alpha_curve_figure(
     chosen_alpha: float | None = None,
     excluded: Mapping[str, Sequence[float | str]] | None = None,
     not_chosen: Mapping[float, Sequence[str]] | None = None,
+    not_applicable: Sequence[str] | None = None,
 ) -> Figure:
     """The figure `alpha_curve` saves; split out so tests can inspect what was drawn."""
     rates: dict[tuple, dict[str, Triple]] = {}
@@ -586,6 +589,11 @@ def _build_alpha_curve_figure(
     note_lines = (textwrap.wrap(f"Left out (cell excluded, see reliability.json): {note}", width=110) if note else [])
     note_lines += (textwrap.wrap(f"Not chosen (refuses too many benign prompts, still in the table): {refused}",
                                  width=110) if refused else [])
+    missing_x = [lang for lang in _lang_order(set(not_applicable or ())) if lang in langs]
+    if missing_x:
+        note_lines += textwrap.wrap(
+            f"Not drawn (task accuracy not applicable, no task items for the language): {', '.join(missing_x)}; "
+            "see tables.csv for its attack success rate", width=110)
     extra = 0.18 * len(note_lines)  # room under the x label for the note, inches
     height = 5.6 + extra
     fig = _new_figure(9.0, height)

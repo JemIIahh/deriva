@@ -81,6 +81,11 @@ def _group_key(arm: str, alpha: float | None, lang: str) -> tuple:
     return (_rank(arm, ARMS), alpha is not None, alpha or 0.0, _rank(lang, LANGS))
 
 
+def row_order(row: dict) -> tuple:
+    """The sort key of a table row: the order `build_table` produces (arm, alpha, language, metric)."""
+    return (*_group_key(row["arm"], row["alpha"], row["lang"]), METRICS.index(row["metric"]))
+
+
 def _require_single_judge(verdicts: Sequence[Verdict]) -> None:
     judges = sorted({v.judge_id for v in verdicts})
     if len(judges) > 1:

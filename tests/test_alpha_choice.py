@@ -231,3 +231,44 @@ def test_without_a_second_judge_every_language_says_so():
 
 def test_languages_outside_the_report_are_not_reported():
     assert low_confidence_reasons({"hi": GOOD, "ar": NAN}, {"hi": 55}, ["hi"]) == {}
+
+
+# --- round 2: the reason for a missing over-refusal reference says why it is missing -----------------------------------
+
+
+def _reasons(data, **kwargs):
+    return choose_alpha(data, {}, langs=ALL, **kwargs).candidates[0].reasons
+
+
+def test_a_missing_reference_with_no_note_still_names_the_arm_and_the_language():
+    data = [r for r in rows({0.25: uniform(0.2)}) if not (r["arm"] == "A0" and r["lang"] == "hi")]
+    (reason,) = [r for r in _reasons(data) if r.startswith("hi: ")]
+    assert "A0" in reason and "over-refusal" in reason and "not available" in reason
+
+
+def test_a_missing_reference_says_why_when_the_caller_knows():
+    data = [r for r in rows({0.25: uniform(0.2)}) if not (r["arm"] == "A0" and r["lang"] == "hi")]
+    notes = {("A0", "hi"): "excluded for judge errors (overall judge_error 20.0% of 40 judged, above the 5.0% allowance)"}
+    (reason,) = [r for r in _reasons(data, reference_notes=notes) if r.startswith("hi: ")]
+    assert "A0" in reason and "excluded for judge errors" in reason and "20.0%" in reason
+
+
+def test_each_missing_reference_has_its_own_reason_in_one_message():
+    data = [r for r in rows({0.25: uniform(0.2)}) if not (r["lang"] == "hi" and r["arm"] in ("A0", "A1"))]
+    notes = {("A0", "hi"): "not run on the dev split", ("A1", "hi"): "excluded for judge errors"}
+    (reason,) = [r for r in _reasons(data, reference_notes=notes) if r.startswith("hi: ")]
+    assert "A0: not run on the dev split" in reason and "A1: excluded for judge errors" in reason
+
+
+def test_a_reference_on_too_few_items_says_how_few():
+    data = rows({0.25: uniform(0.2)})
+    for r in data:
+        if r["arm"] == "A1" and r["lang"] == "ar":
+            r["n"] = 3
+    (reason,) = [r for r in _reasons(data) if r.startswith("ar: ")]
+    assert "A1" in reason and "3 item" in reason and "too few" in reason
+
+
+def test_a_note_about_a_reference_that_is_usable_is_not_shown():
+    notes = {("A0", "hi"): "excluded for judge errors"}
+    assert _reasons(rows({0.25: uniform(0.2)}), reference_notes=notes) == ()

@@ -328,3 +328,57 @@ def test_enough_task_items_leave_the_check_to_the_accuracies():
 
     assert check_cell("en", gens("en"), 0.5, 0.5, dev_task_n=MIN_N, a1_task_n=MIN_N).passed
     assert check_cell("en", gens("en"), 0.1, 0.5, dev_task_n=MIN_N, a1_task_n=MIN_N).failed == ("task_accuracy",)
+
+
+# --- round 2: the task-accuracy check applies only where there are task items (config, never inferred) -------------
+
+
+def test_the_languages_with_task_items_are_named_in_config_with_a_reason():
+    assert config.TASK_ACCURACY_LANGS == ("en", "hi", "ar", "sw")
+    assert set(config.TASK_ACCURACY_LANGS) < set(config.LANGS) and "hinglish" not in config.TASK_ACCURACY_LANGS
+    assert config.TASK_ACCURACY_REASON.strip()  # the one-line why, shown next to the exemption in reliability.json
+
+
+def test_a_language_without_task_items_has_no_task_check_and_can_pass():
+    result = check_cell("hinglish", gens("hinglish"), None, None)
+    assert result.passed and result.failed == () and result.unverified is None
+    assert result.task_accuracy == "not_applicable"
+
+
+def test_the_exemption_comes_from_config_not_from_missing_numbers():
+    # numbers given for an exempt language are not used: a "fall" in them is not a failure, and none is shown
+    result = check_cell("hinglish", gens("hinglish"), 0.05, 0.95)
+    assert result.passed and result.task_accuracy == "not_applicable"
+    assert result.measures["task_acc"] is None and result.measures["task_acc_a1"] is None
+
+
+@pytest.mark.parametrize("lang", ["en", "hi", "hinglish", "ar", "sw"])
+def test_every_other_check_still_applies_to_a_language_without_task_items(lang):
+    loop = "फिर से वही बात " if lang == "hi" else "مرة أخرى نفس الكلام " if lang == "ar" else "the same words again "
+    cases = {
+        "no_repetition_loop": gens(lang, text=f"{HEALTHY[lang]} " + loop * 10),
+        "non_empty": with_bad(lang, 5, ""),
+        "not_capped": gens(lang, finish="length"),
+        "script_matches": with_bad(lang, 10, HEALTHY["en"] if lang in ("hi", "ar") else HEALTHY["hi"]),
+    }
+    for check, outputs in cases.items():
+        result = check_cell(lang, outputs, None, None)
+        assert check in result.failed, (lang, check, result)
+        assert not result.passed
+        if lang not in config.TASK_ACCURACY_LANGS:
+            assert result.task_accuracy == "not_applicable"
+            assert result.failed == (check,)  # and nothing else is reported for the task check
+
+
+@pytest.mark.parametrize("lang", list(config.TASK_ACCURACY_LANGS))
+def test_missing_task_data_for_a_language_that_has_task_items_stays_unverified(lang):
+    for acc, ref in ((None, None), (None, 0.5), (0.5, None)):
+        result = check_cell(lang, gens(lang), acc, ref)
+        assert not result.passed and result.unverified and "task accuracy" in result.unverified
+        assert result.task_accuracy == "unverified"
+
+
+def test_the_task_accuracy_status_says_what_happened_for_a_language_with_task_items():
+    assert check_cell("en", gens("en"), 0.6, 0.6).task_accuracy == "passed"
+    assert check_cell("en", gens("en"), 0.2, 0.6).task_accuracy == "failed"
+    assert check_cell("en", gens("en"), 1.0, 1.0, dev_task_n=1, a1_task_n=200).task_accuracy == "unverified"

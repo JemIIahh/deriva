@@ -9,7 +9,8 @@ close to A1's. Five checks, in this order (`CHECKS`):
     not_capped          few outputs that ran to the length cap (a model that never stops)
     no_repetition_loop  few outputs that end in a repetition loop
     script_matches      few outputs in the wrong script for the prompt language
-    task_accuracy       dev task accuracy no more than a margin below A1's in the same language
+    task_accuracy       dev task accuracy no more than a margin below A1's in the same language (only for the
+                        languages in `config.TASK_ACCURACY_LANGS`: elsewhere it is "not applicable")
 
 The limits are in `msd.config` (SANITY_*), each with the reason for its value. Everything here is a pure
 function on strings and numbers: the caller finds the outputs and the accuracies.
@@ -35,6 +36,7 @@ from msd.config import (
     SANITY_MIN_LETTERS,
     SANITY_MIN_SCRIPT_SHARE,
     SANITY_TASK_MARGIN,
+    TASK_ACCURACY_LANGS,
 )
 from msd.schema import Generation
 from msd.stats import MIN_N
@@ -124,16 +126,25 @@ class SanityResult:
     `failed` lists the checks that failed (names from `CHECKS`, in that order). `unverified` says what could not
     be checked at all (no outputs, too few, no accuracy to compare), or is None. A cell `passed` only when
     nothing failed and nothing was left unchecked. `measures` are the shares and accuracies behind the verdict,
-    for reliability.json.
+    for reliability.json. `task_accuracy` says how the task-accuracy check went: "passed", "failed",
+    "unverified", or "not_applicable" (the language has no task items, `config.TASK_ACCURACY_LANGS`; that is not
+    a pass, and no number is shown for it).
     """
 
     failed: tuple[str, ...]
     unverified: str | None
     measures: dict[str, float | int | None]
+    task_accuracy: str = "unverified"
 
     @property
     def passed(self) -> bool:
         return not self.failed and self.unverified is None
+
+
+def task_accuracy_applies(lang: str) -> bool:
+    """Does the task-accuracy check apply to `lang`? Only if it is in `config.TASK_ACCURACY_LANGS`; this is a
+    decision in the config, never an inference from whether task data happens to be there."""
+    return lang in TASK_ACCURACY_LANGS
 
 
 def _share(count: int, whole: int) -> float:
@@ -161,6 +172,11 @@ def check_cell(
     `a1_task_n` are given, one whose accuracy rests on fewer than `MIN_N` items (1 of 1 correct is not evidence).
     The output checks still run and any failure is still listed. An output with fewer than
     `SANITY_MIN_LETTERS` letters counts as empty: these are replies to safety prompts, never task answers.
+
+    A language that is not in `config.TASK_ACCURACY_LANGS` has no task items: its task-accuracy check is "not
+    applicable" (`SanityResult.task_accuracy`), whatever accuracies are passed in, and the accuracies are not
+    recorded. The other four checks apply to it unchanged. For a language that is in the tuple a missing accuracy
+    is "unverified", never an exemption.
     """
     script = expected_script(lang)
     measures: dict[str, float | int | None] = {
@@ -196,14 +212,23 @@ def check_cell(
         if measures["wrong_script"] > SANITY_MAX_WRONG_SCRIPT:
             failed.append("script_matches")
 
-    if dev_task_acc is None or a1_task_acc is None:
+    if not task_accuracy_applies(lang):
+        task_status = "not_applicable"
+        measures["task_acc"] = measures["task_acc_a1"] = None  # not used, so not shown
+    elif dev_task_acc is None or a1_task_acc is None:
+        task_status = "unverified"
         unverified.append("no dev task accuracy to compare with A1's" if dev_task_acc is None
                           else "no dev task accuracy for A1 to compare with")
     elif dev_task_n is not None and dev_task_n < MIN_N:
+        task_status = "unverified"
         unverified.append(f"too few dev task items ({dev_task_n}) to trust the task accuracy, need at least {MIN_N}")
     elif a1_task_n is not None and a1_task_n < MIN_N:
+        task_status = "unverified"
         unverified.append(f"too few dev task items for A1 ({a1_task_n}) to trust its accuracy, need at least {MIN_N}")
     elif dev_task_acc < a1_task_acc - SANITY_TASK_MARGIN - _EPS:
+        task_status = "failed"
         failed.append("task_accuracy")
+    else:
+        task_status = "passed"
 
-    return SanityResult(tuple(failed), "; ".join(unverified) or None, measures)
+    return SanityResult(tuple(failed), "; ".join(unverified) or None, measures, task_status)

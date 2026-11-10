@@ -354,16 +354,21 @@ keep `finetune_marker.json` in it, which says whether it came from a smoke run).
   from the repository folder). Delete it only after you have read what you need from it; the real run has its own
   folder, `work/finetune/ft_lora`, and the same rule.
 
-**Held-out accuracy check, A0 against A1** (the task items only; no judge and no API key). `run_eval.py` reads
+**Held-out accuracy check, A0 against A1, and the dev references of the alpha choice.** `run_eval.py` reads
 `data/ft/taskdev.jsonl` for `--split dev` and `data/ft/heldout.jsonl` for `--split report` and scores the bare answer
-letter with `--stages generate,task`. The generate stage also writes the safety completions of that split (the
-study needs them for A0 and A1 anyway); `--limit N` caps both for a quick look. Use `--langs en,hi,ar,sw` (hinglish
-has no task rows). Run the dev split first, A0 then A1, then the report split once:
+letter in its task stage (no judge needed for that part). The generate stage also writes the safety completions of that
+split (the study needs them for A0 and A1 anyway); `--limit N` caps both for a quick look. Dev A0 and dev A1 must be
+run with the judge stage as well (`--stages generate,judge,task` with `--judge`, a key or a GPU judge): `make_report.py`
+lets an alpha win only if its dev over-refusal is no higher than the larger of A0's and A1's plus the margin, so a dev
+A0 or A1 without judged verdicts gives no over-refusal reference and no alpha can ever be chosen. Leave `--langs` out
+(all five languages): the task items exist for en, hi, ar and sw only, and the task stage skips Hinglish loudly
+(`task_skipped` in its eval.json) while its safety completions are still judged. Run the dev split first, A0 then A1,
+then the report split once:
 
 ```
 STAGE = "run_eval"
-STAGE_ARGS = "--arm A0 --split dev --model CohereLabs/tiny-aya-global --out results/run_eval --stages generate,task --langs en,hi,ar,sw"
-STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out results/run_eval --stages generate,task --langs en,hi,ar,sw"
+STAGE_ARGS = "--arm A0 --split dev --model CohereLabs/tiny-aya-global --out results/run_eval --judge <judge> --stages generate,judge,task"
+STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out results/run_eval --judge <judge> --stages generate,judge,task"
 # then the same two with --split report
 ```
 
@@ -373,6 +378,23 @@ uploaded to the workspace repo and a later notebook run starts from a fresh work
 `accuracy` (one file per language). Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
 heldout split). What A1 must show is that it answers the bare letter more often than A0 does (the point of the
 task); how much is a result, not a gate here.
+
+**Which dev cells must exist before `make_report.py` can choose an alpha.** Every one of these, in every language
+(en, hi, hinglish, ar, sw), generated and judged by the one judge, with judge errors under the allowance in its
+eval.json:
+
+- dev A0 and dev A1 (no alpha): their dev over-refusal is the reference an alpha is measured against, and A1's dev
+  task accuracy is what each repaired cell's must stay near;
+- dev A2 at every alpha of the grid (`--arm A2 --alpha <a> --split dev`), with its generations kept: the sanity gate
+  reads the dev benign completions, and an A2 cell never run on dev is excluded;
+- dev A3 (no alpha) and dev A2n at each blend value, if those arms are used: they go through the same gate, and a
+  report cell without its dev cell is excluded.
+
+The task-accuracy part of the gate needs task items, so it runs for en, hi, ar and sw (their dev task cells must exist
+too: a missing one is "unverified" and keeps the alpha out); for Hinglish, which has no task items, it is "not
+applicable" and recorded as such, while the other four checks and the over-refusal rule still apply. The report split
+needs the same arms and alphas, judged by the same judge; when it is rejudged into a fresh folder, give the dev folder
+with `--dev`.
 
 **Expected cost, all UNVERIFIED estimates** (nothing measured): with batch 1 and gradient checkpointing a step
 processes 16 sequences of mostly 500 to 1,500 tokens; AlignTune's own heuristic puts the base config at 1.7 h
