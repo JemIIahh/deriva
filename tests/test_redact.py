@@ -15,12 +15,14 @@ from msd.redact import (
     PUBLIC_MAX_CHARS,
     clean_text,
     cut_excerpt,
+    hidden_view,
     public_jsonl,
     public_row,
     public_task_row,
     public_text,
     strip_invisible,
 )
+from msd.gaterun import looks_fake
 from msd.schema import TaskScore, Verdict
 
 REPLACEMENT = chr(0xFFFD)  # not typed as an escape: the editing tools turn a typed escape into the raw character
@@ -59,12 +61,14 @@ def test_public_row_alpha_stays_none_for_an_arm_without_alpha():
 
 
 def test_excerpt_truncated_to_max_chars():
-    text = "abcdefghij" * 60  # 600 characters
-    assert public_row(verdict(text))["excerpt"] == text[:200]  # the default is 200
-    assert public_row(verdict(text), max_chars=10)["excerpt"] == "abcdefghij"
+    text = "word " * 120  # 600 characters, a word at every fifth one
+    shown = public_row(verdict(text))["excerpt"]
+    assert len(shown) <= 200 and shown.endswith(chr(0x2026)) and text.startswith(shown[:-1])  # the default is 200
+    assert len(shown) >= 190  # one word and the marker are given up, not more
+    assert public_row(verdict(text), max_chars=12)["excerpt"] == "word word" + chr(0x2026)
     assert public_row(verdict(text), max_chars=0)["excerpt"] == ""
-    assert public_row(verdict("short"), max_chars=10)["excerpt"] == "short"  # shorter than the cap: unchanged
-    assert public_row(verdict("x" * 200))["excerpt"] == "x" * 200
+    assert public_row(verdict("short"), max_chars=10)["excerpt"] == "short"  # shorter than the cap and the limit: unchanged
+    assert public_row(verdict("x" * 199))["excerpt"] == "x" * 199  # shorter than the upstream limit: the whole completion
     assert PUBLIC_MAX_CHARS == 200
 
 
@@ -81,7 +85,7 @@ def test_max_chars_beyond_the_published_cap_or_not_a_count_is_refused(bad):
 def test_cut_is_on_characters_not_bytes_and_never_splits_a_cluster(text):
     assert len(text.encode("utf-8")) > 1.5 * len(text)  # a letter is two or three bytes: a byte cut would be mojibake
     for cap in range(1, 120):
-        excerpt = public_row(verdict(text), max_chars=cap)["excerpt"]
+        excerpt = cut_excerpt(text, cap)
         assert len(excerpt) <= cap
         assert text.startswith(excerpt)
         assert len(excerpt) >= cap - 5, (cap, len(excerpt))  # backs off over a cluster, not over the whole text
@@ -94,20 +98,24 @@ def test_cut_is_on_characters_not_bytes_and_never_splits_a_cluster(text):
 
 
 def test_default_cap_on_a_devanagari_excerpt_is_at_most_200_characters_and_whole():
-    excerpt = public_row(verdict(DEVANAGARI))["excerpt"]
+    excerpt = cut_excerpt(DEVANAGARI, 200)
     assert 195 <= len(excerpt) <= 200
     assert DEVANAGARI.startswith(excerpt)
     assert not is_mark(DEVANAGARI[len(excerpt)])
+    shown = public_row(verdict(DEVANAGARI))["excerpt"]  # as a row: the last word and a marker are given up
+    assert 180 <= len(shown) <= 200 and shown.endswith(chr(0x2026)) and DEVANAGARI.startswith(shown[:-1])
+    assert DEVANAGARI[len(shown) - 1].isspace()
 
 
 def test_a_text_that_is_all_marks_cuts_to_nothing_rather_than_a_lone_mark():
     marks = "́" * 50  # combining acute accents, no base letter
-    assert public_row(verdict(marks), max_chars=10)["excerpt"] == ""
+    assert cut_excerpt(marks, 10) == ""
+    assert public_row(verdict(marks), max_chars=10)["excerpt"] == chr(0x2026)
 
 
 def test_the_cut_keeps_an_emoji_joiner_sequence_whole():
     family = "\U0001F468‍\U0001F469‍\U0001F467"
-    excerpt = public_row(verdict("ab" + family), max_chars=4)["excerpt"]
+    excerpt = cut_excerpt("ab" + family, 4)
     assert excerpt == "ab"  # the man (position 2) and the joiner (3) are both gone: no dangling joiner
 
 
@@ -120,8 +128,9 @@ def test_replacement_character_and_lone_surrogates_never_survive():
     json.dumps(public_row(verdict(dirty)), ensure_ascii=False).encode("utf-8")  # encodes: no surrogate is left
 
 
-def test_a_replacement_character_at_the_cut_does_not_count_against_the_cap():
-    assert public_row(verdict("abc" + REPLACEMENT * 5 + "defg"), max_chars=5)["excerpt"] == "abcde"
+def test_a_replacement_character_before_the_cut_does_not_count_against_the_cap():
+    shown = public_row(verdict("ab" + REPLACEMENT * 5 + " cd ef"), max_chars=6)["excerpt"]
+    assert shown == "ab" + chr(0x2026)  # the cleaned text is "ab cd ef": room for five characters, the last word dropped
 
 
 def test_token_shaped_text_in_the_excerpt_and_the_judge_id_is_redacted():
@@ -133,7 +142,7 @@ def test_token_shaped_text_in_the_excerpt_and_the_judge_id_is_redacted():
 
 def test_the_cap_applies_after_the_redaction_so_the_row_never_grows():
     token = "hf_" + "Z9y8X7w6V5" * 3
-    row = public_row(verdict("t" * 190 + token + "tail"), max_chars=200)
+    row = public_row(verdict("t " * 95 + token + " tail"), max_chars=200)
     assert len(row["excerpt"]) <= 200
     assert "hf_" not in row["excerpt"]
 
@@ -203,8 +212,8 @@ def split_at(text, where, char):
 
 
 def visible(text):
-    """`text` as a reader sees it: without any character `strip_invisible` or `clean_text` would remove."""
-    return strip_invisible(clean_text(text))
+    """`text` as a reader sees it: without any character `hidden_view` or `clean_text` would remove."""
+    return hidden_view(clean_text(text))
 
 
 @pytest.mark.parametrize("name", SPLIT_IDS)
@@ -273,7 +282,7 @@ def test_the_code_point_safe_cut_still_works_on_text_with_joiners():
     zwj = chr(0x200D)
     text = ("क्" + zwj + "ष कि न्दी ") * 40
     for cap in range(1, 80):
-        excerpt = public_row(verdict(text), max_chars=cap)["excerpt"]
+        excerpt = cut_excerpt(text, cap)
         assert len(excerpt) <= cap and text.startswith(excerpt)
         rest = text[len(excerpt):]
         assert rest and not is_mark(rest[0]) and rest[0] != zwj
@@ -348,3 +357,159 @@ def test_a_row_reads_the_environment_once_not_once_per_string(monkeypatch):
     assert len(calls) == 1
     public_task_row(TaskScore("item-1", "A1", None, "en", True))
     assert len(calls) == 2
+
+
+# --- fix round 1: more characters that hide a secret, and the upstream cut -----------------------------------------------
+# Unicode's Default_Ignorable_Code_Point set is more than category Cf: the combining grapheme joiner, variation
+# selectors, Hangul fillers and the unassigned tag block are invisible too. Every character is a code point.
+
+MORE_SPLITTERS = {
+    "combining-grapheme-joiner": chr(0x034F),
+    "variation-selector-16": chr(0xFE0F),
+    "variation-selector-17": chr(0xE0100),
+    "mongolian-selector": chr(0x180B),
+    "hangul-filler": chr(0x3164),
+    "halfwidth-hangul-filler": chr(0xFFA0),
+    "tag-block-unassigned": chr(0xE0000),
+    "combining-mark-after-ascii": chr(0x0301),
+}
+
+
+@pytest.mark.parametrize("name", list(MORE_SPLITTERS))
+@pytest.mark.parametrize("where", [1, 3, 12, 20, len(TOKEN) - 1])
+def test_a_token_split_by_a_default_ignorable_or_a_mark_is_published_redacted(name, where):
+    text = f"see {split_at(TOKEN, where, MORE_SPLITTERS[name])} here"
+    row = public_row(verdict(text, judge_id=text))
+    for field in ("excerpt", "judge_id"):
+        shown = visible(row[field])
+        assert "***" in shown and "hf_" not in shown, (name, where, field, shown)
+        assert not any(TOKEN[i:i + 6] in shown for i in range(3, len(TOKEN) - 5)), (name, where, field, shown)
+
+
+@pytest.mark.parametrize("name", list(MORE_SPLITTERS))
+@pytest.mark.parametrize("path", [HOME_PATH, LINUX_PATH], ids=["macos", "linux"])
+@pytest.mark.parametrize("where", [1, 3, 6, 9, 14, 24])
+def test_a_home_path_split_by_a_default_ignorable_or_a_mark_is_published_redacted(name, path, where):
+    shown = visible(public_row(verdict(f"wrote it to {split_at(path, where, MORE_SPLITTERS[name])} ok"))["excerpt"])
+    assert "***" in shown, (name, where)
+    for part in ("Users", "home", "ram", "runner", "secret", "file.txt"):
+        assert part not in shown, (name, where, part, shown)
+
+
+@pytest.mark.parametrize("secret", [TOKEN, HOME_PATH], ids=["token", "path"])
+def test_a_combining_mark_over_every_letter_of_a_secret_does_not_hide_it(secret):
+    marked = "".join(ch + chr(0x0301) for ch in secret)
+    shown = visible(public_row(verdict(f"see {marked} here"))["excerpt"])
+    assert "***" in shown and not any(secret[i:i + 5] in shown for i in range(3, len(secret) - 5))
+
+
+def test_ordinary_text_with_marks_and_default_ignorables_in_it_keeps_them_when_nothing_is_secret():
+    hindi = "कि और क्षेत्र, हिन्दी" + chr(0x200D) + " भाषा"
+    arabic = "الْحَمْدُ لِلّٰهِ" + chr(0x200C) + " رَبِّ"
+    cafe = "cafe" + chr(0x0301) + " au lait, " + "a" + chr(0xFE0F) + "b"  # a mark over an ASCII letter, a variation selector
+    for text in (hindi, arabic, cafe):
+        assert public_row(verdict(text))["excerpt"] == text
+
+
+@pytest.mark.parametrize("name", list(MORE_SPLITTERS))
+def test_a_test_judge_hidden_by_a_default_ignorable_is_still_refused(name):
+    if name == "combining-mark-after-ascii":
+        pytest.skip("a mark changes the letter it sits on: that is not the word 'fake'")
+    for judge in ("fa" + MORE_SPLITTERS[name] + "ke-judge", "FAKE" + MORE_SPLITTERS[name], "f" + MORE_SPLITTERS[name] + "a" + MORE_SPLITTERS[name] + "ke"):
+        with pytest.raises(ValueError, match="test judge"):
+            public_row(verdict(judge_id=judge))
+        assert looks_fake(judge)
+
+
+def test_a_fullwidth_token_and_path_are_redacted_too():
+    wide = lambda s: "".join(chr(ord(c) + 0xFEE0) if 0x21 <= ord(c) <= 0x7E else c for c in s)  # noqa: E731
+    for secret in (TOKEN, HOME_PATH):
+        shown = public_row(verdict(f"see {wide(secret)} here"))["excerpt"]
+        assert "***" in shown, secret
+        assert not any(part in unicodedata.normalize("NFKC", shown) for part in ("A1b2C3", "ram", "secret"))
+
+
+def test_a_windows_path_in_any_case_and_the_colab_and_kaggle_roots_are_redacted():
+    for path in ("c:" + chr(92) + "users" + chr(92) + "ram" + chr(92) + "x.txt", "D:/USERS/ram/x.txt",
+                 "C:" + chr(92) + "DOCUMENTS AND SETTINGS" + chr(92) + "ram", "/root/.ssh/id_rsa", "/content/drive/MyDrive/x",
+                 "/kaggle/working/secret.csv", "/kaggle/input/data"):
+        shown = public_row(verdict(f"see {path} now"))["excerpt"]
+        assert shown == "see *** now", (path, shown)
+
+
+# --- the upstream cut: a real excerpt arrives already cut at 200 characters (msd.judge.EXCERPT_CHARS) ---------------
+
+MARK = chr(0x2026)
+VIRAMA = chr(0x094D)
+WORDS = "word " * 100  # whitespace-delimited filler: index 185, 190, ... fall on the start of a word
+
+
+def upstream(completion):
+    """What the judge stage stores: the first 200 characters of the completion, nothing else."""
+    return completion[:200]
+
+
+@pytest.mark.parametrize("start", [181, 185, 186, 190, 195, 198])
+def test_a_token_cut_by_the_upstream_limit_publishes_no_prefix_of_it(start):
+    shown = public_row(verdict(upstream(WORDS[:start] + TOKEN + " and then more words")))["excerpt"]
+    assert "hf_" not in shown and TOKEN[3:7] not in shown, (start, shown)
+    assert shown.endswith(MARK) and len(shown) <= 200
+
+
+@pytest.mark.parametrize("start", [181, 185, 190, 195])
+def test_an_environment_secret_cut_by_the_upstream_limit_publishes_no_prefix_of_it(monkeypatch, start):
+    value = "s3cr3t-" + "k" * 25  # 32 characters, nothing like a token shape
+    monkeypatch.setenv("MSD_FIX_API_KEY", value)
+    shown = public_row(verdict(upstream(WORDS[:start] + value + " and then more words")))["excerpt"]
+    assert "s3cr3t" not in shown and "kkkk" not in shown, (start, shown)
+    assert shown.endswith(MARK) and len(shown) <= 200
+
+
+@pytest.mark.parametrize("start", [180, 185, 190, 195, 198])
+def test_a_path_cut_by_the_upstream_limit_publishes_no_part_of_it(start):
+    path = USERS + "/ram/Documents/project/results.csv"
+    shown = public_row(verdict(upstream(WORDS[:start] + path + " and then more words")))["excerpt"]
+    assert "ram" not in shown and "Docum" not in shown and USERS not in shown, (start, shown)
+    assert shown.endswith(MARK) and len(shown) <= 200
+
+
+def test_an_upstream_cut_inside_a_conjunct_does_not_end_on_a_virama():
+    completion = "a " * 98 + "कक" + "क" + VIRAMA + "षत्रिय और बहुत कुछ"  # index 199 is the virama
+    assert upstream(completion)[-1] == VIRAMA
+    shown = public_row(verdict(upstream(completion)))["excerpt"]
+    body = shown[:-1]
+    assert shown.endswith(MARK) and not body.endswith((VIRAMA, chr(0x200D))) and not is_mark(body[-1])
+    assert len(shown) <= 200 and completion.startswith(body.rstrip())
+
+
+def test_an_excerpt_shorter_than_the_upstream_limit_is_complete_and_has_no_marker():
+    for text in ("a short reply", "x " * 99 + "y", "हिन्दी भाषा"):  # 199 characters at most
+        assert len(text) < 200
+        assert public_row(verdict(text))["excerpt"] == text
+
+
+def test_an_excerpt_of_exactly_the_upstream_limit_counts_as_cut():
+    text = ("word " * 40)[:200]
+    assert len(text) == 200
+    shown = public_row(verdict(text))["excerpt"]
+    assert shown.endswith(MARK) and len(shown) <= 200 and text.startswith(shown[:-1])
+
+
+def test_the_marker_and_the_dropped_word_always_fit_under_the_cap():
+    text = "lorem ipsum dolor sit amet " * 30
+    for cap in range(1, 201):
+        shown = public_row(verdict(text), max_chars=cap)["excerpt"]
+        assert len(shown) <= cap, cap
+        assert shown.endswith(MARK) or cap == 0
+        assert text.startswith(shown[:-1].rstrip())
+
+
+def test_an_excerpt_without_any_whitespace_is_published_as_the_marker_alone():
+    # nothing tells where a word ended, so nothing of it is kept (all five study languages are written with spaces)
+    assert public_row(verdict("abcdefghij" * 60))["excerpt"] == MARK
+
+
+def test_the_cut_never_removes_more_than_a_cluster_from_a_long_chain():
+    chain = "a" + chr(0x0301) * 60
+    assert len(cut_excerpt(chain, 40)) >= 28  # the back-off is capped: a long chain cannot empty the excerpt
+    assert cut_excerpt("ab" + "क" + VIRAMA + "ष", 3) == "ab"  # a short cluster still moves back whole

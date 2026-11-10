@@ -9,23 +9,38 @@ and nothing else: no kind, no prompt text, no completion beyond the excerpt, whi
 characters. The cap is a promise made in the dataset card, so a larger `max_chars` is an error, not a choice.
 
 Every string that goes into a public row (the excerpt, the judge id, the ids, language and arm) passes through the
-same three steps, in this order, and the order is the point:
+same steps, in this order, and the order is the point:
 
 1. `clean_text`: the replacement character (U+FFFD) and lone surrogates are removed. They mean a decoding fault
    upstream and must not be published; they are also the cheapest way to hide a secret from a pattern, so they go
    first.
-2. `public_text`: redaction. Token- and key-shaped strings, home paths and the value of any secret-looking environment
-   variable become `***` (`msd.gen.redact_with`, the study's own redaction, plus the shapes below). The redaction runs on the text as it is AND on a
-   copy without the characters a reader does not see (Unicode format characters such as U+200B, U+2060, U+00AD, U+FEFF,
-   the bidi marks and the joiners, and control characters). A secret split by an invisible character stays copy-pasteable
-   but defeats a pattern, so when the invisible-free copy changes under redaction, THAT redaction is published (the
-   excerpt then loses its joiners, the price of the check); otherwise the redaction of the text as it is, so ordinary
-   Devanagari, Arabic and Persian text keeps the joiners that are meaningful there.
-3. `cut_excerpt`: the cut, and nothing else. It is on characters, never bytes, and never inside one written character: a
+2. For an excerpt that is, or may be, cut (see below): the last whitespace-delimited chunk is dropped, before the
+   redaction. A secret or a path that the cut split lives in the last chunk, and half of a secret is not recognised by a
+   pattern that needs the whole of it, so redaction cannot be relied on for it: the fragment has to go. (Dropping first
+   means the redaction never sees the fragment.)
+3. `public_text`: redaction. Token- and key-shaped strings, home paths and the value of any secret-looking environment
+   variable become `***` (`msd.gen.redact_with`, the study's own redaction, plus the shapes below). The redaction runs on
+   the text as it is AND on copies without what a reader does not see (`msd.invisible.hidden_view`: format characters,
+   the rest of Unicode's Default_Ignorable_Code_Point set such as U+034F, variation selectors, Hangul fillers and tag
+   characters, and combining marks on ASCII letters) and under NFKC (fullwidth letters). A secret split by an invisible
+   character stays copy-pasteable but defeats a pattern, so when a copy changes under redaction, THAT redaction is
+   published (the excerpt then loses its joiners and marks, the price of the check); otherwise the redaction of the text
+   as it is, so ordinary Devanagari, Arabic and Persian text keeps the joiners and marks that are meaningful there.
+   Known limit: text that is merely ENCODED (percent-encoded, a literal backslash-u written out in a string, base64) is
+   not decoded and so not recognised.
+4. `cut_excerpt`: the cut, and nothing else. It is on characters, never bytes, and never inside one written character: a
    base letter keeps its vowel signs and marks (Devanagari "कि", Arabic letters with harakat), a conjunct keeps its
-   virama, an emoji keeps its joiners. When the cut would fall inside such a cluster it moves back to the start of it,
-   so an excerpt may be a few characters short of the cap but is never mojibake and never ends on a half letter. The
-   redaction comes before the cut so a cut cannot leave half a token behind.
+   virama, an emoji keeps its joiners. When the cut would fall inside such a cluster it moves back to the start of it
+   (by at most `_MAX_BACKOFF` characters, so a long chain of marks cannot empty an excerpt), so an excerpt may be a few
+   characters short of the cap but is never mojibake and never ends on a half letter.
+
+The excerpt arrives already cut: the judge stage stores `completion[:EXCERPT_CHARS]` (`msd.judge`), so on real data the
+cut happens BEFORE this module sees the text, in the middle of whatever stood at character 200, and `cut_excerpt` has
+nothing left to cut. An excerpt of `EXCERPT_CHARS` characters or more, or one this module has to shorten, is therefore
+treated as truncated: its last whitespace-delimited chunk (a fragment of a word, a token, a path or a cluster) is dropped
+whole and an ellipsis (U+2026) ends it so a reader can see it was cut, all within the cap. All five study languages are
+written with spaces; an excerpt with no whitespace at all is published as the ellipsis alone, nothing being known about
+where a word ended. A shorter excerpt is the whole of the completion and is published as it is.
 
 A verdict from a test judge is refused, also when removable characters hide the word "fake".
 
@@ -34,15 +49,15 @@ This module reads nothing but the objects it is given and has no way to send any
 
 from __future__ import annotations
 
-import functools
 import json
 import re
-import sys
 import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 
 from msd import gen
 from msd.gaterun import looks_fake
+from msd.invisible import hidden_view, strip_invisible  # noqa: F401  (re-exported: `msd.redact` is where callers look)
+from msd.judge import EXCERPT_CHARS
 from msd.schema import TaskScore, Verdict
 
 PUBLIC_KEYS: tuple[str, ...] = ("prompt_id", "lang", "arm", "alpha", "label", "judge_id", "excerpt")
@@ -55,13 +70,15 @@ _UNWANTED = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + chr(0xFFFD) + "]"
 _ZWJ, _ZWNJ = chr(0x200D), chr(0x200C)
 _VIRAMA_CLASS = 9  # canonical combining class of the sign that joins two consonants (Devanagari, Bengali, ...)
 _LINE_BREAKS = {chr(code): "\\u%04x" % code for code in (0x85, 0x2028, 0x2029)}  # str.splitlines() splits at these
-_KEPT_CONTROLS = range(0x09, 0x0E)  # tab, line feed, vertical tab, form feed, carriage return stay in text
+_ELLIPSIS = chr(0x2026)  # ends an excerpt that was cut
+_LAST_CHUNK = re.compile(r"\S+\s*\Z")  # the last whitespace-delimited chunk and the whitespace after it
+_MAX_BACKOFF = 12  # how far a cut may move back to keep a cluster whole
 
 # The shapes of what must not be published, as text patterns (ASCII rules for \w). `msd.export` compiles the same
 # strings for bytes to scan every file it writes, so redaction and scan can never disagree about what a path or a key is.
 _TAIL = r"""[^\s"'<>`)\]]*"""
-HOME_PATH = r"(?<![\w.~-])/(?:Users|home)/[A-Za-z0-9._-]+(?:/" + _TAIL + ")?"
-WINDOWS_PATH = r"(?<![A-Za-z])[A-Za-z]:[\\/]+(?:Users|Documents and Settings)(?:[\\/]+" + _TAIL + ")?"
+HOME_PATH = r"(?<![\w.~-])/(?:Users|home|root|content|kaggle)/[A-Za-z0-9._-]+(?:/" + _TAIL + ")?"  # incl. Colab and Kaggle
+WINDOWS_PATH = r"(?<![A-Za-z])[A-Za-z]:[\\/]+(?i:Users|Documents and Settings)(?:[\\/]+" + _TAIL + ")?"  # any letter case
 SECRET_SHAPES: tuple[tuple[str, str], ...] = (
     ("a Hugging Face token", r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{16,}"),
     ("an API key", r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}"),
@@ -81,35 +98,23 @@ def clean_text(text: str) -> str:
     return _UNWANTED.sub("", text)
 
 
-def _is_invisible(code: int) -> bool:
-    category = unicodedata.category(chr(code))
-    return category == "Cf" or (category == "Cc" and code not in _KEPT_CONTROLS)
-
-
-@functools.lru_cache(maxsize=1)
-def _invisible() -> re.Pattern[str]:
-    """Every format character (category Cf) and every control character except tab, line feed and carriage return."""
-    points = [c for c in range(sys.maxunicode + 1) if _is_invisible(c)]
-    ranges, start = [], points[0]
-    for before, after in zip(points, points[1:] + [None]):
-        if after != before + 1:
-            ranges.append((start, before))
-            start = after
-    body = "".join(re.escape(chr(a)) if a == b else f"{re.escape(chr(a))}-{re.escape(chr(b))}" for a, b in ranges)
-    return re.compile("[" + body + "]")
-
-
-def strip_invisible(text: str) -> str:
-    """`text` without the characters a reader does not see: format characters (zero-width space and joiners, word joiner,
-    soft hyphen, byte-order mark, bidi marks, ...) and control characters other than tab, line feed and carriage return."""
-    return text if text.isascii() and text.isprintable() else _invisible().sub("", text)
-
-
 def _scrub(text: str, secrets: Sequence[str]) -> str:
     text = gen.redact_with(text, secrets)
     for pattern in _TEXT_PATTERNS:
         text = pattern.sub("***", text)
     return text
+
+
+def _views(text: str) -> list[str]:
+    """The copies of `text` to redact next to the text itself: without what a reader does not see, and the same under
+    NFKC (a fullwidth token is a token)."""
+    hidden = hidden_view(text)
+    views = [hidden]
+    if not hidden.isascii():
+        folded = hidden_view(unicodedata.normalize("NFKC", hidden))
+        if folded != hidden:
+            views.append(folded)
+    return views
 
 
 def public_text(text: str, secrets: Sequence[str] | None = None) -> str:
@@ -119,11 +124,11 @@ def public_text(text: str, secrets: Sequence[str] | None = None) -> str:
     if secrets is None:
         secrets = gen.secret_env_values()
     text = clean_text(text)
-    hidden = strip_invisible(text)
-    scrubbed = _scrub(hidden, secrets)
-    if scrubbed != hidden or hidden == text:
-        return scrubbed
-    return _scrub(text, secrets)  # nothing found without the invisible characters: the text as it is, joiners kept
+    for view in _views(text):
+        scrubbed = _scrub(view, secrets)
+        if scrubbed != view:
+            return scrubbed  # a copy gave something away: publish that redaction (the joiners and marks are the price)
+    return _scrub(text, secrets)  # nothing found in any copy: the text as it is, joiners and marks kept
 
 
 def _glues(before: str, after: str) -> bool:
@@ -135,13 +140,16 @@ def _glues(before: str, after: str) -> bool:
 
 
 def cut_excerpt(text: str, max_chars: int) -> str:
-    """The first `max_chars` characters of `text`, moved back to the start of the cluster the cut would split. Only
-    cuts: clean and redact first (`public_text`)."""
+    """The first `max_chars` characters of `text`, moved back to the start of the cluster the cut would split (by at most
+    `_MAX_BACKOFF` characters: a longer chain is cut where it stands, so it cannot empty the excerpt). Only cuts: clean
+    and redact around it (`public_row`)."""
     if len(text) <= max_chars:
         return text
     cut = max_chars
     while cut > 0 and _glues(text[cut - 1], text[cut]):
         cut -= 1
+        if max_chars - cut > _MAX_BACKOFF:
+            return text[:max_chars]
     return text[:cut]
 
 
@@ -151,6 +159,18 @@ def _check_max_chars(max_chars: Any) -> None:
             f"max_chars must be a whole number from 0 to {PUBLIC_MAX_CHARS} (the cap the dataset card promises), "
             f"got {max_chars!r}"
         )
+
+
+def _public_excerpt(excerpt: str, max_chars: int, secrets: Sequence[str]) -> str:
+    """The published excerpt: clean, then (when it was cut) drop the last chunk, redact, fit under the cap."""
+    text = clean_text(excerpt)
+    if len(excerpt) < EXCERPT_CHARS and len(text) <= max_chars:
+        return cut_excerpt(public_text(text, secrets), max_chars)  # the whole completion: nothing was cut
+    if max_chars == 0:
+        return ""
+    room = max_chars - len(_ELLIPSIS)
+    kept = _LAST_CHUNK.sub("", cut_excerpt(text, room)).rstrip()
+    return cut_excerpt(public_text(kept, secrets), room) + _ELLIPSIS
 
 
 def public_row(v: Verdict, max_chars: int = PUBLIC_MAX_CHARS) -> dict:
@@ -171,7 +191,7 @@ def public_row(v: Verdict, max_chars: int = PUBLIC_MAX_CHARS) -> dict:
         "alpha": v.alpha,
         "label": v.label,
         "judge_id": judge,
-        "excerpt": cut_excerpt(public_text(v.excerpt, secrets), max_chars),
+        "excerpt": _public_excerpt(v.excerpt, max_chars, secrets),
     }
 
 

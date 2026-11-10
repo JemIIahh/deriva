@@ -215,7 +215,7 @@ def plant_long_completions(results, *cells):
         write_cell(results, spec)
         path = evalrun.verdicts_path(results, split, arm, alpha, lang)
         rows = read_jsonl(path, Verdict)
-        long = [f"[{i}] " + "x" * 400 + f" {LONG_TAIL}{i:03d} " + "y" * 100 for i, _ in enumerate(rows)]
+        long = [f"[{i}] " + " ".join(["x" * 9] * 45) + f" {LONG_TAIL}{i:03d} " + "y" * 100 for i, _ in enumerate(rows)]
         write_jsonl(path, [Verdict(v.prompt_id, v.arm, v.alpha, v.lang, v.kind, v.judge_id, v.label, text)
                            for v, text in zip(rows, long)])  # an old or foreign file whose excerpts are whole completions
         gens = path.with_name(f"{lang}.gens.jsonl")
@@ -232,12 +232,13 @@ def test_export_contains_no_full_completions(run, results):
     every = {rel: (out / rel).read_bytes() for rel in files_under(out)}
     for rel, data in every.items():  # cards and manifest included
         assert LONG_TAIL.encode() not in data, rel
-        assert b"x" * 197 not in data, rel  # the first 200 characters are "[i] " + 196 x
+        assert " ".join(["x" * 9] * 30).encode() not in data, rel  # an excerpt holds fewer than 200 characters
         assert b"y" * 20 not in data, rel
     rows = read_rows(out / "dataset" / "results_public" / "report" / "A1" / "none" / "hi.verdicts.jsonl")
     assert len(rows) == 60 and n == 60
-    for i, row in enumerate(rows):  # not vacuous: the 200-character head of each completion is what was kept
-        assert row["excerpt"] == (f"[{i}] " + "x" * 400)[:200]
+    for i, row in enumerate(rows):  # not vacuous: the head of each completion is what was kept, minus its last word
+        head = (f"[{i}] " + " ".join(["x" * 9] * 45))[:199]
+        assert row["excerpt"] == head[:head.rindex(" ")] + chr(0x2026)  # the word the cut fell in is dropped, a marker added
         assert list(row) == VERDICT_KEYS
 
 
@@ -437,7 +438,7 @@ def test_the_manifest_is_deterministic_complete_and_free_of_clocks_and_paths(run
     text = (first / "MANIFEST.json").read_text(encoding="utf-8")
     manifest = json.loads(text)
     assert text == json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    assert set(manifest) == {"format", "files", "testset_freeze_sha256"}
+    assert set(manifest) == {"checks", "format", "files", "testset_freeze_sha256"}
     assert manifest["testset_freeze_sha256"] == sha((tmp_path / "testset" / "MANIFEST.json").read_bytes())
     assert sorted(manifest["files"]) == [f for f in files_under(first) if f != "MANIFEST.json"]
     for rel, info in manifest["files"].items():
@@ -550,7 +551,7 @@ def test_model_card_names_license_and_aup(run):
         assert "CC-BY-NC" in card
         assert "Acceptable Use Policy" in card
         assert "CohereLabs/tiny-aya-global" in card and "gated" in card
-        assert "inherit" in card  # the repaired and drifted models carry the base model's terms
+        assert "inherit" in card  # the fine-tuned and the repaired models carry the base model's terms
         assert "LSAL" in card and "AlignTune" in card and "CuratorKIT" in card and "SafeTune" in card
         assert "unsloth" in card and "AGPL" in card and "mergekit" in card and "LGPL" in card
         assert "not a safety guarantee" in card.lower()
@@ -570,7 +571,7 @@ def test_the_a2_card_says_which_alpha_was_chosen_and_the_a1_card_names_no_repair
     a1 = (out / "models" / "A1" / "README.md").read_text(encoding="utf-8")
     assert chosen is not None and f"alpha {chosen:g}" in a2
     assert "ReSta" in a2 and "tiny-aya-base" in a2
-    assert "No repair step" in a1 and "alpha" not in a1  # A1 is the drifted model: there is no alpha to name
+    assert "No repair step" in a1 and "alpha" not in a1  # A1 is the fine-tuned model: there is no alpha to name
 
 
 def test_dataset_card_lists_sources_licences_and_the_rules(run, frozen_testset, tmp_path):
@@ -695,12 +696,22 @@ SPLITTERS = {
     "soft-hyphen": chr(0x00AD),
     "replacement": chr(0xFFFD),
     "lone-surrogate": chr(0xD800),
+    # fix round 1: invisible in the Default_Ignorable_Code_Point sense without being category Cf, and a mark on ASCII
+    "combining-grapheme-joiner": chr(0x034F),
+    "variation-selector-16": chr(0xFE0F),
+    "variation-selector-17": chr(0xE0100),
+    "hangul-filler": chr(0x3164),
+    "halfwidth-hangul-filler": chr(0xFFA0),
+    "tag-block-unassigned": chr(0xE0000),
+    "combining-mark-after-ascii": chr(0x0301),
 }
 SECRETS = {"token": (TOKEN, 9, "secret"), "path": (SECRET_PATH, 8, "path")}  # text, where the splitter goes, word in the message
 # Every splitter x secret is checked on the scan itself (cheap, below); each end-to-end run (an export costs about a
 # second) takes a few of the combinations, chosen so that every splitter and both secrets appear.
 END_TO_END = [("zero-width-space", "token"), ("word-joiner", "path"), ("replacement", "token"), ("lone-surrogate", "path"),
-              ("zero-width-joiner", "token"), ("soft-hyphen", "path")]
+              ("zero-width-joiner", "token"), ("soft-hyphen", "path"), ("combining-grapheme-joiner", "token"),
+              ("variation-selector-16", "path"), ("variation-selector-17", "token"), ("hangul-filler", "path"),
+              ("tag-block-unassigned", "token"), ("halfwidth-hangul-filler", "path"), ("combining-mark-after-ascii", "token")]
 
 
 def split_in(secret, char, where):
@@ -709,7 +720,7 @@ def split_in(secret, char, where):
 
 def seen(data):
     """An exported file as a reader sees it: decoded, without the characters one does not see or the study strips."""
-    return redact.strip_invisible(redact.clean_text(data.decode("utf-8")))
+    return redact.hidden_view(redact.clean_text(data.decode("utf-8")))
 
 
 def assert_no_fragments_anywhere(out):
@@ -763,7 +774,8 @@ def test_a_split_secret_in_a_verdict_excerpt_is_exported_redacted_and_nothing_re
 @pytest.mark.parametrize("name, what, escaped", [
     ("zero-width-space", "token", False), ("word-joiner", "path", False), ("replacement", "token", False),
     ("zero-width-space", "token", True), ("lone-surrogate", "token", True), ("soft-hyphen", "path", True),
-    ("replacement", "path", True),
+    ("replacement", "path", True), ("combining-grapheme-joiner", "token", False), ("variation-selector-17", "path", True),
+    ("tag-block-unassigned", "token", True), ("combining-mark-after-ascii", "path", False), ("hangul-filler", "token", False),
 ], ids=lambda v: str(v))
 def test_a_split_secret_in_an_aggregate_stops_the_export(run, results, tmp_path, name, what, escaped):
     secret, where, word = SECRETS[what]
@@ -779,7 +791,8 @@ def test_a_split_secret_in_an_aggregate_stops_the_export(run, results, tmp_path,
     assert_nothing_written(tmp_path, out)
 
 
-@pytest.mark.parametrize("name, what", [("zero-width-space", "token"), ("replacement", "path")])
+@pytest.mark.parametrize("name, what", [("zero-width-space", "token"), ("replacement", "path"),
+                                         ("combining-grapheme-joiner", "path"), ("variation-selector-16", "token")])
 def test_a_split_secret_in_the_table_stops_the_export(run, results, tmp_path, name, what):
     secret, where, word = SECRETS[what]
     tables = results / "tables.csv"
@@ -821,7 +834,7 @@ def test_the_manifest_is_scanned_before_anything_is_written(run, tmp_path, monke
     # no input can put free text into the manifest (arms, languages and alphas are validated), so the test puts it there
     real = export.manifest_bytes
     leak = split_in(TOKEN, chr(0x200B), 9)
-    monkeypatch.setattr(export, "manifest_bytes", lambda files, freeze: real(files, freeze) + ("# " + leak + "\n").encode("utf-8"))
+    monkeypatch.setattr(export, "manifest_bytes", lambda *args: real(*args) + ("# " + leak + "\n").encode("utf-8"))
     code, out_text, err_text, out = run()
     assert code == export.EXIT_ERROR and "MANIFEST.json" in err_text and "secret" in err_text
     assert not any(piece in out_text + err_text for piece in FRAGMENTS)
@@ -862,6 +875,8 @@ def test_a_split_environment_secret_in_any_output_stops_the_export(run, results,
 @pytest.mark.parametrize("name, what, lang, file", [
     ("zero-width-space", "token", "en", "prompts.jsonl"), ("word-joiner", "path", "hi", "prompts_translated.jsonl"),
     ("zero-width-joiner", "path", "en", "prompts.jsonl"), ("soft-hyphen", "token", "ar", "prompts_translated.jsonl"),
+    ("combining-grapheme-joiner", "token", "en", "prompts.jsonl"), ("tag-block-unassigned", "path", "sw", "prompts_translated.jsonl"),
+    ("variation-selector-17", "token", "hinglish", "prompts_translated.jsonl"), ("combining-mark-after-ascii", "path", "en", "prompts.jsonl"),
 ])
 def test_a_split_secret_in_a_prompt_text_stops_the_export(run, frozen_testset, tmp_path, name, what, lang, file):
     secret, where, word = SECRETS[what]
@@ -937,6 +952,9 @@ def test_the_judge_id_in_every_row_and_card_has_no_replacement_character_or_surr
         for alpha in ((None,) if arm != "A2" else ALPHAS):
             for lang in config.LANGS:
                 edit_cell(results, "dev", arm, alpha, lang, judge=judge)
+    # the tables name the judge without the fault (a make_report that wrote the fault into reliability.json would make the
+    # scan refuse the whole export: the aggregates are copied byte for byte); the freshness check compares them cleaned
+    edit_reliability(results, lambda d: d["judge_ids"].update(dev="dev-judge-v1"))
     code, _o, err, out = run()
     assert code == 0, err
     rows = [row for path in (out / "dataset" / "results_public" / "dev").rglob("*.verdicts.jsonl") for row in read_rows(path)]
@@ -948,14 +966,185 @@ def test_the_judge_id_in_every_row_and_card_has_no_replacement_character_or_surr
             assert REPLACEMENT_BYTES not in data, rel
 
 
+# --- fix round 1: the upstream cut, forms of a secret a byte pattern misses, guards on free text and freshness ---------------
+
+
+def edit_reliability(results, change):
+    path = results / "reliability.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    change(data)
+    path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def set_excerpts(results, split, arm, alpha, lang, texts):
+    path = results / split / arm / ("none" if alpha is None else str(alpha)) / f"{lang}.verdicts.jsonl"
+    rows = read_jsonl(path, Verdict)
+    write_jsonl(path, [Verdict(v.prompt_id, v.arm, v.alpha, v.lang, v.kind, v.judge_id, v.label, texts[i % len(texts)])
+                       for i, v in enumerate(rows)])
+
+
+@pytest.mark.parametrize("start", [181, 186, 195])
+def test_a_token_cut_by_the_upstream_excerpt_limit_is_not_exported_as_a_prefix(run, results, start):
+    completion = ("word " * 100)[:start] + TOKEN + " and then more words"
+    set_excerpts(results, "report", "A1", None, "hi", [completion[:200]])  # what the judge stage stores
+    code, _o, err, out = run()
+    assert code == 0, err
+    rows = read_rows(out / "dataset" / "results_public" / "report" / "A1" / "none" / "hi.verdicts.jsonl")
+    assert rows and all(row["excerpt"].endswith(chr(0x2026)) and len(row["excerpt"]) <= 200 for row in rows)
+    assert all("hf_" not in row["excerpt"] for row in rows)
+    assert_no_fragments_anywhere(out)
+
+
+def fullwidth(text):
+    return "".join(chr(ord(c) + 0xFEE0) if 0x21 <= ord(c) <= 0x7E else c for c in text)
+
+
+def test_the_scan_finds_a_fullwidth_secret_a_windows_path_in_any_case_and_the_colab_and_kaggle_roots():
+    cases = {"token": fullwidth(TOKEN), "path": fullwidth(SECRET_PATH),
+             "windows-lower": "c:" + chr(92) + "users" + chr(92) + "someone" + chr(92) + "x", "windows-upper": "D:/USERS/someone/x",
+             "root": "/root/.ssh/id_rsa", "colab": "/content/drive/MyDrive/x", "kaggle": "/kaggle/working/secret.csv"}
+    for name, text in cases.items():
+        problems = export.find_leaks({"dataset/README.md": f"see {text} now\n".encode("utf-8")})
+        assert problems, name
+
+
+def test_the_scan_has_no_false_alarm_on_ordinary_paths_and_words():
+    text = "the content/page and site/root/ are fine; kaggle is a site; /content alone; users/ram; Users and home as words"
+    assert export.find_leaks({"dataset/README.md": text.encode("utf-8")}) == []
+
+
+def test_a_long_free_text_value_in_reliability_json_is_refused_by_name_only(run, results, tmp_path):
+    plant_in_reliability(results, "SENTINEL-LONG " + "words " * 120)
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR
+    assert "reliability.json" in err_text and "long" in err_text and "warnings" in err_text
+    assert "SENTINEL-LONG" not in out_text + err_text
+    assert_nothing_written(tmp_path, out)
+
+
+def test_the_shipped_reliability_json_has_no_value_the_length_guard_would_refuse(made_results):
+    data = json.loads((made_results / "reliability.json").read_text(encoding="utf-8"))
+    longest = max(len(v) for v in export.json_strings(data))
+    assert longest < export.MAX_JSON_STRING, (longest, export.MAX_JSON_STRING)
+
+
+EXCERPT_LINE = "the quick brown fox jumps over the lazy dog and keeps on running far away from here"
+
+
+def test_a_piece_of_a_verdict_excerpt_found_outside_the_results_files_stops_the_export(run, results, tmp_path):
+    set_excerpts(results, "report", "A1", None, "hi", [EXCERPT_LINE])
+    plant_in_reliability(results, "note: " + EXCERPT_LINE[10:60])  # 50 characters of an excerpt
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR
+    assert "reliability.json" in err_text and "excerpt" in err_text
+    assert EXCERPT_LINE[10:40] not in out_text + err_text
+    assert_nothing_written(tmp_path, out)
+
+
+def test_a_prompt_that_the_model_repeated_in_its_excerpt_is_not_a_leak(run, results, frozen_testset):
+    set_excerpts(results, "report", "A1", None, "hi", [EXCERPT_LINE])
+    poison_prompt(frozen_testset, "en", "report", text="explain " + EXCERPT_LINE[10:60] + " please")
+    code, _o, err, _out = run()
+    assert code == 0, err
+
+
+def test_the_alpha_and_the_judges_in_reliability_json_must_match_what_is_exported(run, results, tmp_path):
+    edit_reliability(results, lambda d: d["judge_ids"].update(report="some-other-judge-v2"))
+    code, _o, err, out = run()
+    assert code == export.EXIT_ERROR and "reliability.json" in err and "judge" in err and "make_report" in err
+    assert "some-other-judge" not in err
+    assert_nothing_written(tmp_path, out)
+
+    edit_reliability(results, lambda d: d["judge_ids"].update(report="stub-judge-v1", dev="some-other-judge-v2"))
+    code, _o, err, out = run()
+    assert code == export.EXIT_ERROR and "dev" in err
+    assert_nothing_written(tmp_path, out)
+
+    edit_reliability(results, lambda d: (d["judge_ids"].update(dev="stub-judge-v1"), d["alpha_choice"].update(chosen=0.9)))
+    code, _o, err, out = run()
+    assert code == export.EXIT_ERROR and "alpha" in err and "reliability.json" in err
+    assert_nothing_written(tmp_path, out)
+
+    edit_reliability(results, lambda d: d["alpha_choice"].update(chosen=None))  # no alpha chosen is a fine answer
+    code, _o, err, out = run()
+    assert code == 0, err
+
+
+def test_a_missing_dev_split_does_not_trip_the_judge_comparison(run, results):
+    shutil.rmtree(results / "dev")
+    code, _o, err, _out = run()
+    assert code == 0, err
+
+
+def test_the_manifest_records_the_checks_that_tied_tables_to_results(run, made_results):
+    code, _o, _e, out = run()
+    assert code == 0
+    manifest = json.loads((out / "MANIFEST.json").read_text(encoding="utf-8"))
+    reliability = json.loads((made_results / "reliability.json").read_text(encoding="utf-8"))
+    assert manifest["checks"]["reliability_judge_ids"] == {"dev": "stub-judge-v1", "report": "stub-judge-v1"}
+    assert manifest["checks"]["alpha_choice_chosen"] == reliability["alpha_choice"]["chosen"]
+    assert manifest["checks"]["exported_a2_alphas"] == [0.1, 0.25, 0.5]
+
+
+def test_a_build_record_without_a_freeze_hash_is_refused_not_skipped(run, frozen_testset, tmp_path):
+    record = frozen_testset.parent / "testset_build_summary.json"
+    data = json.loads(record.read_text(encoding="utf-8"))
+    for broken in (None, {}, {"manifest": "MANIFEST.json"}):
+        changed = dict(data)
+        if broken is None:
+            changed.pop("freeze", None)
+        else:
+            changed["freeze"] = broken
+        record.write_text(json.dumps(changed), encoding="utf-8")
+        code, _o, err, out = run()
+        assert code == export.EXIT_ERROR and "no freeze hash" in err and "build record" in err, broken  # not "stale": absent
+        assert_nothing_written(tmp_path, out)
+
+
+def test_the_cards_state_no_result_and_name_the_second_judge_only_when_there_was_one(run, results, made_results):
+    code, _o, err, out = run()
+    assert code == 0, err
+    cards = {rel: (out / rel).read_text(encoding="utf-8") for rel in files_under(out) if rel.endswith("README.md")}
+    assert len(cards) == 3
+    for rel, card in cards.items():
+        low = card.lower()
+        for phrase in ("quietly", "less safe", "win much", "win back", "wins back", "that is the point of the study", "drifted"):
+            assert phrase not in low, (rel, phrase)
+        assert "stub-second-v1" in card, rel  # the second judge named in the data is named in the card
+    edit_reliability(results, lambda d: d.update(second_judge_id=None))
+    code, _o, err, out2 = run(out=out.parent / "export2")
+    assert code == 0, err
+    for rel in cards:
+        card = (out2 / rel).read_text(encoding="utf-8")
+        assert "stub-second-v1" not in card and "re-labelled" not in card, rel
+        assert "no second judge" in card.lower(), rel
+
+
+def test_the_model_card_describes_the_fine_tuning_data_as_the_validator_defines_it_and_the_licences_as_the_notes_do(run):
+    code, *_rest, out = run()
+    assert code == 0
+    card = (out / "models" / "A1" / "README.md").read_text(encoding="utf-8")
+    assert "everyday" not in card  # not "everyday multiple-choice": the data may be a short extracted span too
+    assert "short extracted span" in card and "bare option letter" in card and "closed-form" in card and "harmless" in card
+    assert "AlignTune" in card and "MIT" in card and "LSAL-1.1" in card and "CuratorKIT" in card
+    assert not re.search(r"SafeTune[^.]*\bLSAL\b", card)  # the notes do not say which licence SafeTune has
+    assert "SafeTune repository" in card
+
+
+def test_the_gitignore_covers_the_hidden_partial_export_folder():
+    lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".*.partial/" in lines and ".export.*.partial" in lines and "export/" in lines
+
+
 # --- the code has no way to publish anything -------------------------------------------------------------------------
 
-CODE_FILES = (ROOT / "src" / "msd" / "redact.py", ROOT / "src" / "msd" / "export.py", SCRIPT)
+CODE_FILES = (ROOT / "src" / "msd" / "redact.py", ROOT / "src" / "msd" / "invisible.py", ROOT / "src" / "msd" / "export.py", SCRIPT)
 FORBIDDEN_MODULES = {
     "huggingface_hub", "requests", "urllib", "urllib3", "http", "httpx", "aiohttp", "socket", "ssl", "ftplib",
     "smtplib", "subprocess", "git", "dotenv", "webbrowser", "paramiko", "boto3", "websocket", "websockets", "asyncio",
+    "importlib",  # a module imported by a string would defeat this very check
 }
-FORBIDDEN_WORDS = re.compile(r"push|upload|create_repo|hf_token|\benviron\b|getenv", re.IGNORECASE)
+FORBIDDEN_WORDS = re.compile(r"push|upload|create_repo|hf_token|\benviron\b|getenv|__import__|importlib", re.IGNORECASE)
 
 
 def _docstrings(tree):
@@ -1011,9 +1200,10 @@ def test_the_export_code_cannot_publish_anything(path):
 
 
 def test_the_static_check_can_fail(tmp_path):
-    bad = ast.parse("import requests\nfrom huggingface_hub import HfApi\napi.upload_file()\nx = 'HF_TOKEN'\n")
-    assert {n.split(".")[0] for n in _imported(bad)} & FORBIDDEN_MODULES == {"requests", "huggingface_hub"}
-    assert sorted(w for w in _code_words(bad) if FORBIDDEN_WORDS.search(w)) == ["HF_TOKEN", "upload_file"]
+    bad = ast.parse("import requests\nfrom huggingface_hub import HfApi\napi.upload_file()\nx = 'HF_TOKEN'\n"
+                    "import importlib\nm = __import__('socket')\n")
+    assert {n.split(".")[0] for n in _imported(bad)} & FORBIDDEN_MODULES == {"requests", "huggingface_hub", "importlib"}
+    assert sorted(w for w in _code_words(bad) if FORBIDDEN_WORDS.search(w)) == ["HF_TOKEN", "__import__", "importlib", "upload_file"]
 
 
 def test_importing_the_export_loads_no_publishing_or_secret_reading_library():

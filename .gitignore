@@ -14,3 +14,7 @@ __pycache__/
 build/
 dist/
 work/
+
+# a run that is killed leaves its hidden build folder; `git add -A` must not pick up prompts and excerpts
+.*.partial/
+.export.*.partial

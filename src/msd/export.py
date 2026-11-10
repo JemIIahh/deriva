@@ -60,6 +60,7 @@ import json
 import re
 import sys
 import traceback
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,15 +83,20 @@ TRANSLATED_LICENSE = "CC-BY-NC-4.0"  # the licence of the NLLB model; marked on 
 NLLB = "NLLB"
 AGGREGATES = reportrun.OUTPUT_FILES  # tables.csv, heatmap.png, alpha_curve.png, reliability.json
 REQUIRED_AGGREGATES = ("tables.csv", "reliability.json")  # a figure with nothing to draw may be missing: a warning
+# Free text in reliability.json could carry completion text, so a string longer than this is refused. The longest value
+# make_report writes is the alpha-choice rule (about 440 characters, constant text); a verdict excerpt is at most 200.
+MAX_JSON_STRING = 600
+PIECE, PIECE_STEP = 32, 8  # a piece of a verdict excerpt of 39 characters or more (PIECE + PIECE_STEP - 1) is found outside results_public/
 
 PROMPTS_FILE, TRANSLATED_FILE = f"{DATASET}/prompts.jsonl", f"{DATASET}/prompts_translated.jsonl"
 RESULTS_ROOT, AGGREGATES_ROOT = f"{DATASET}/results_public", f"{DATASET}/aggregates"
 
-MODEL_CARD_FIELDS = frozenset({"arm", "arm_title", "base_model", "how_made", "languages", "repair_line", "report_judge"})
+MODEL_CARD_FIELDS = frozenset({"arm", "arm_title", "base_model", "how_made", "languages", "repair_line", "report_judge",
+                               "second_judge_sentence"})
 DATASET_CARD_FIELDS = frozenset({
     "arms", "dev_judge", "freeze_sha256", "languages", "n_excluded_sources", "n_prompts_en", "n_prompts_translated",
-    "n_task_rows", "n_verdict_rows", "prompt_counts_table", "report_judge", "sources_table", "tables_csv_sha256",
-    "translators_table",
+    "n_task_rows", "n_verdict_rows", "prompt_counts_table", "report_judge", "second_judge_sentence", "sources_table",
+    "tables_csv_sha256", "translators_table",
 })
 
 
@@ -169,7 +175,13 @@ def _translators(summary_path: Path, freeze_sha: str) -> dict[str, str]:
         )
     record = _json_file(summary_path, "the build record")
     freeze = record.get("freeze") if isinstance(record, dict) else None
-    if isinstance(freeze, dict) and freeze.get("sha256") not in (None, freeze_sha):
+    recorded = freeze.get("sha256") if isinstance(freeze, dict) else None
+    if not isinstance(recorded, str) or not recorded:
+        raise ExportError(
+            f"the build record {summary_path.name} holds no freeze hash, so it cannot be checked against the test set being "
+            "exported (its translators would be taken on trust); rebuild and freeze the test set with scripts/build_testset.py"
+        )
+    if recorded != freeze_sha:
         raise ExportError(f"the build record {summary_path.name} was written for another freeze of the test set; it is stale")
     languages = record.get("languages") if isinstance(record, dict) else None
     found: dict[str, str] = {}
@@ -264,10 +276,11 @@ class Results:
     n_task_rows: int
     arms: set[str]
     judges: dict[str, str | None]  # split -> redacted judge id, None when the split was not exported
+    a2_alphas: set[float]  # the alphas of arm A2 in the report split
 
 
 def _read_results(results: Path, notes: list[str]) -> Results:
-    found = Results({}, 0, 0, set(), {})
+    found = Results({}, 0, 0, set(), {}, set())
     for split in SPLITS_EXPORTED:
         try:
             loaded = reportrun.load_split(results, split)
@@ -284,6 +297,8 @@ def _read_results(results: Path, notes: list[str]) -> Results:
         found.judges[split] = None if loaded.judge_id is None else redact.public_text(loaded.judge_id)
         for cell in loaded.cells.values():
             found.arms.add(cell.arm)
+            if split == "report" and cell.arm == "A2" and cell.alpha is not None:
+                found.a2_alphas.add(cell.alpha)
             if cell.verdicts:
                 try:
                     rows = [redact.public_row(v) for v in cell.verdicts]
@@ -319,32 +334,103 @@ def _read_aggregates(folder: Path, notes: list[str]) -> dict[str, bytes]:
 
 _ARM_CARDS = {
     "A1": (
-        "drifted, after fine-tuning",
+        "after fine-tuning",
         "Tiny Aya Global fine-tuned with LoRA (AlignTune, TRL backend) on the harmless task below. This is the "
-        "\"after\" model of the study: the one whose safety may have drifted.",
+        "\"after\" model of the study: the one whose safety is compared with the original's.",
     ),
     "A2": (
-        "repaired with ReSta",
-        "The drifted model (arm A1) repaired without retraining by SafeTune's ReSta: a weight-space step that moves the "
-        "drifted weights back toward the aligned model (Tiny Aya Global) and away from the pre-alignment base (Tiny Aya "
-        "Base), scaled by a strength called alpha. No gradient step is taken.",
+        "after the ReSta repair step",
+        "The fine-tuned model (arm A1) with a weight-space step applied and no retraining: SafeTune's ReSta moves its "
+        "weights toward the aligned model (Tiny Aya Global) and away from the pre-alignment base (Tiny Aya Base), scaled "
+        "by a strength called alpha. No gradient step is taken. Whether it helps is what the study measures.",
     ),
     "A3": (
-        "safety-preserving fine-tune",
-        "Tiny Aya Global fine-tuned on the same harmless task data as arm A1, but with SafeTune's Harden, which tries to "
-        "keep safety during the fine-tune instead of repairing it afterwards.",
+        "fine-tuned with Harden",
+        "Tiny Aya Global fine-tuned on the same harmless task data as arm A1, but with SafeTune's Harden, which is meant "
+        "to keep safety during the fine-tune rather than restore it afterwards.",
     ),
 }
 
 
-def _chosen_alpha(reliability: bytes) -> float | None:
+def json_strings(value: Any) -> list[str]:
+    """Every string and every key in a decoded JSON value."""
+    found: list[str] = []
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found.append(str(key))
+            found += json_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            found += json_strings(item)
+    return found
+
+
+def _reliability(raw: bytes) -> dict[str, Any]:
+    """reliability.json decoded and checked for free text: a long string could hold completion text, so it is refused
+    (the message names the top-level key, never the text)."""
     try:
-        chosen = json.loads(reliability.decode("utf-8"))["alpha_choice"]["chosen"]
-    except (ValueError, KeyError, TypeError):
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise ExportError("reliability.json cannot be read as JSON; it was not written by make_report.py") from None
+    if not isinstance(data, dict):
+        raise ExportError("reliability.json is not a JSON object; it was not written by make_report.py")
+    for key, value in data.items():
+        longest = max((len(text) for text in json_strings(value)), default=0)
+        if longest > MAX_JSON_STRING:
+            raise ExportError(
+                f"reliability.json: the value under '{key}' holds a string of {longest} characters, longer than the "
+                f"{MAX_JSON_STRING} this file ever needs; free text that long could hold a completion, so nothing is exported"
+            )
+    return data
+
+
+def _chosen_alpha(reliability: Mapping[str, Any]) -> float | None:
+    try:
+        chosen = reliability["alpha_choice"]["chosen"]
+    except (KeyError, TypeError):
         raise ExportError("reliability.json has no alpha_choice.chosen; it was not written by make_report.py") from None
     if chosen is not None and (isinstance(chosen, bool) or not isinstance(chosen, (int, float))):
         raise ExportError("reliability.json: alpha_choice.chosen is not a number or null")
     return chosen
+
+
+def _check_tables_match_results(reliability: Mapping[str, Any], results: Results, chosen: float | None) -> dict[str, Any]:
+    """The tables were made from these results: the judges reliability.json names are the judges of the verdicts being
+    exported, and the alpha it chose is one of the A2 alphas being exported. Returns what was checked, for the manifest."""
+    recorded = reliability.get("judge_ids")
+    if not isinstance(recorded, dict):
+        raise ExportError("reliability.json has no judge_ids; it was not written by make_report.py")
+    for split in SPLITS_EXPORTED:
+        exported = results.judges.get(split)
+        if exported is None:
+            continue  # this split is not exported, so there is nothing to compare
+        named = recorded.get(split)
+        if not isinstance(named, str) or redact.public_text(named) != exported:
+            raise ExportError(
+                f"reliability.json names a different judge for the {split} split than the {split} verdicts being exported: "
+                "the tables are stale or belong to other results. Run scripts/make_report.py again, or name the folder that "
+                "holds the right tables with --aggregates"
+            )
+    if chosen is not None and chosen not in results.a2_alphas:
+        raise ExportError(
+            f"reliability.json chose alpha {chosen:g}, which is not among the A2 alphas of the report split being exported "
+            f"({', '.join(f'{a:g}' for a in sorted(results.a2_alphas)) or 'none'}): the tables are stale or belong to other "
+            "results. Run scripts/make_report.py again"
+        )
+    return {
+        "reliability_judge_ids": {split: results.judges.get(split) for split in SPLITS_EXPORTED},
+        "alpha_choice_chosen": chosen,
+        "exported_a2_alphas": sorted(results.a2_alphas),
+    }
+
+
+def _second_judge_sentence(reliability: Mapping[str, Any]) -> str:
+    second = reliability.get("second_judge_id")
+    if isinstance(second, str) and second.strip():
+        return f"A second judge (`{_cell(second)}`) re-labelled a sample."
+    return "No second judge was run on this data, so how far the labels can be trusted was not assessed."
 
 
 def _repair_line(arm: str, chosen: float | None) -> str:
@@ -399,6 +485,7 @@ _SECRET_PATTERNS = tuple((kind, re.compile(p.encode("ascii"))) for kind, p in re
 _REPLACEMENT_BYTES = bytes([0xEF, 0xBF, 0xBD])  # U+FFFD in UTF-8
 _BINARY = (".png",)
 _HIDDEN = " (hidden by characters a reader does not see)"
+_FOLDED = " (under Unicode compatibility folding)"
 _ESCAPED = " (written as JSON escapes)"
 
 
@@ -426,7 +513,7 @@ def _line(data: bytes, offset: int) -> int:
     return data.count(b"\n", 0, offset) + 1
 
 
-def _json_strings(rel: str, text: str) -> str | None:
+def _json_text(rel: str, text: str) -> str | None:
     """Every string and key in a .json file (or in each line of a .jsonl file), one per line, as the JSON reader decodes
     them (so `\\u200b` is the zero-width space it stands for); None for any other file or text that is not JSON."""
     if rel.endswith(".json"):
@@ -436,46 +523,43 @@ def _json_strings(rel: str, text: str) -> str | None:
     else:
         return None
     found: list[str] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, str):
-            found.append(value)
-        elif isinstance(value, dict):
-            for key, item in value.items():
-                found.append(str(key))
-                walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
     for chunk in chunks:
         try:
-            walk(json.loads(chunk))
+            found += json_strings(json.loads(chunk))
         except (ValueError, RecursionError):
             return None
     return "\n".join(found)
 
 
+def _looked_through(text: str) -> list[tuple[str, str]]:
+    """`text` without what a reader does not see (and U+FFFD and lone surrogates), and that under NFKC."""
+    hidden = redact.hidden_view(redact.clean_text(text))
+    views = [(_HIDDEN, hidden)] if hidden != text else []
+    folded = redact.hidden_view(unicodedata.normalize("NFKC", hidden)) if not hidden.isascii() else hidden
+    if folded != hidden:
+        views.append((_FOLDED, folded))
+    return views
+
+
 def _views(rel: str, text: str) -> list[tuple[str, str]]:
     """Every way a reader can come to see `text`: as it is, without the characters a reader does not see or the study
-    removes (`redact.clean_text`, `redact.strip_invisible`), and, for JSON, with the escapes decoded."""
-    views = [("", text)]
-    hidden = redact.strip_invisible(redact.clean_text(text))
-    if hidden != text:
-        views.append((_HIDDEN, hidden))
-    decoded = _json_strings(rel, text)
+    removes, under NFKC (fullwidth letters), and, for JSON, with the escapes decoded."""
+    views = [("", text), *_looked_through(text)]
+    decoded = _json_text(rel, text)
     if decoded is not None:
         views.append((_ESCAPED, decoded))
-        views.append((_ESCAPED + _HIDDEN, redact.strip_invisible(redact.clean_text(decoded))))
+        views += [(_ESCAPED + note, view) for note, view in _looked_through(decoded)]
     return views
 
 
 def find_leaks(files: Mapping[str, bytes], folders: Sequence[Path] = ()) -> list[str]:
     """One message per problem in `files` (path -> bytes): a home path, the path of one of `folders`, a secret-shaped
     string, the value of a secret environment variable, U+FFFD or a lone surrogate. A text file is scanned as it is, again
-    without its invisible characters (zero-width space, joiners, word joiner, soft hyphen, ...) and without U+FFFD and lone
-    surrogates, and a JSON file once more with its escapes decoded, so a secret split by any of them is found too. A
-    message names the file (and line) and the kind of thing; it never repeats the thing."""
+    without its invisible characters (`msd.invisible`: zero-width space, joiners, soft hyphen, combining grapheme joiner,
+    variation selectors, ..., and combining marks on ASCII letters) and without U+FFFD and lone surrogates, again under
+    NFKC (a fullwidth token), and a JSON file once more with its escapes decoded, so a secret split by any of them is
+    found too. Not decoded: percent-encoding and backslash-u written out in a string (a known limit). A message names
+    the file (and line) and the kind of thing; it never repeats the thing."""
     own = _folder_strings(folders)
     secrets = gen.secret_env_values()
     problems: list[str] = []
@@ -512,6 +596,30 @@ def find_leaks(files: Mapping[str, bytes], folders: Sequence[Path] = ()) -> list
     return problems
 
 
+def _excerpts_outside_results(files: Mapping[str, bytes]) -> list[str]:
+    """A piece of a published verdict excerpt (39 characters or more) in a file that is not a results file: free text in an
+    aggregate or a card that repeats a model's reply. The prompt files are left out: a model often repeats the question it
+    was asked, and prompts are published whole. Names the file, never the text."""
+    excerpts = {row["excerpt"] for rel, data in files.items()
+                if rel.startswith(f"{RESULTS_ROOT}/") and rel.endswith(".verdicts.jsonl")
+                for row in (json.loads(line) for line in data.decode("utf-8").split("\n") if line)}
+    pieces = {e[i:i + PIECE] for e in excerpts for i in range(0, len(e) - PIECE + 1, PIECE_STEP)}
+    problems: list[str] = []
+    if not pieces:
+        return problems
+    for rel in sorted(files):
+        if rel.startswith(f"{RESULTS_ROOT}/") or rel in (PROMPTS_FILE, TRANSLATED_FILE) or rel.endswith(_BINARY):
+            continue
+        text = files[rel].decode("utf-8", "replace")
+        decoded = _json_text(rel, text)
+        for body in (text, decoded) if decoded is not None else (text,):
+            if any(body[i:i + PIECE] in pieces for i in range(len(body) - PIECE + 1)):
+                problems.append(f"{rel}: contains {PIECE + PIECE_STEP - 1} or more characters of a verdict excerpt (a model's "
+                                "reply); only the results files may hold those")
+                break
+    return problems
+
+
 # --- the manifest ---------------------------------------------------------------------------------------------------
 
 
@@ -536,14 +644,15 @@ def _role(rel: str) -> str:
     return "dataset_card" if rel.startswith(f"{DATASET}/") else "model_card"
 
 
-def manifest_bytes(files: Mapping[str, bytes], freeze_sha: str) -> bytes:
-    """MANIFEST.json for `files`: sorted, indented, no clock and no absolute path, so two runs on one input match."""
+def manifest_bytes(files: Mapping[str, bytes], freeze_sha: str, checks: Mapping[str, Any] | None = None) -> bytes:
+    """MANIFEST.json for `files`: sorted, indented, no clock and no absolute path, so two runs on one input match.
+    `checks` records what tied the tables to the results (judges, chosen alpha, the A2 alphas exported)."""
     listing = {
         rel: {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "n": _rows(rel, data),
               "role": _role(rel), "optional": rel == TRANSLATED_FILE}
         for rel, data in sorted(files.items())
     }
-    body = {"format": FORMAT, "testset_freeze_sha256": freeze_sha, "files": listing}
+    body = {"format": FORMAT, "testset_freeze_sha256": freeze_sha, "checks": dict(checks or {}), "files": listing}
     return (json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
@@ -593,7 +702,10 @@ def build(inputs: Inputs) -> Built:
     results = _read_results(inputs.results, notes)
     aggregates = _read_aggregates(inputs.aggregates, notes)
     tables_sha = hashlib.sha256(aggregates[f"{AGGREGATES_ROOT}/tables.csv"]).hexdigest()
-    chosen = _chosen_alpha(aggregates[f"{AGGREGATES_ROOT}/reliability.json"])
+    reliability = _reliability(aggregates[f"{AGGREGATES_ROOT}/reliability.json"])
+    chosen = _chosen_alpha(reliability)
+    checks = _check_tables_match_results(reliability, results, chosen)
+    second_sentence = _second_judge_sentence(reliability)
 
     languages = ", ".join(LANGS)
     arms = [arm for arm in ARMS if arm in results.arms]
@@ -613,6 +725,7 @@ def build(inputs: Inputs) -> Built:
         "n_verdict_rows": str(results.n_verdict_rows),
         "prompt_counts_table": _counts_table([*english, *translated]),
         "report_judge": report_judge,
+        "second_judge_sentence": second_sentence,
         "sources_table": _sources_table(manifest, english),
         "tables_csv_sha256": tables_sha,
         "translators_table": _translators_table(translators),
@@ -623,10 +736,12 @@ def build(inputs: Inputs) -> Built:
             files[f"{MODELS}/{arm}/README.md"] = _render_file(inputs.templates / "model_card.md", {
                 "arm": arm, "arm_title": title, "base_model": MODEL_IDS["A0"], "how_made": how_made,
                 "languages": languages, "repair_line": _repair_line(arm, chosen), "report_judge": report_judge,
+                "second_judge_sentence": second_sentence,
             }).encode("utf-8")
 
-    manifest_data = manifest_bytes(files, freeze_sha)
-    leaks = find_leaks({**files, MANIFEST_NAME: manifest_data}, [inputs.results, inputs.testset, inputs.sources,
+    leaks = _excerpts_outside_results(files)
+    manifest_data = manifest_bytes(files, freeze_sha, checks)
+    leaks += find_leaks({**files, MANIFEST_NAME: manifest_data}, [inputs.results, inputs.testset, inputs.sources,
                                                                   inputs.aggregates, inputs.templates, inputs.out, inputs.root])
     if leaks:
         shown = "\n  ".join(leaks[:8])

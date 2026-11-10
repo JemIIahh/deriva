@@ -5,7 +5,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -210,6 +210,22 @@ def test_freeze_refuses_when_an_output_changed_after_it_was_recorded(tmp_path, b
     target.write_bytes(target.read_bytes().replace(b"harm", b"hurm", 1))
     with pytest.raises(testset.ConsistencyError, match="recorded"):
         testset.freeze(out, summary=summary, **freeze_kwargs)
+
+
+@pytest.mark.parametrize("fault, ascii_only", [(0xFFFD, False), (0xFFFD, True), (0xD800, True)],
+                         ids=["replacement-raw", "replacement-escaped", "lone-surrogate-escaped"])
+def test_freeze_refuses_a_prompt_with_a_decoding_fault(tmp_path, build, freeze_kwargs, fault, ascii_only):
+    # found at freeze time, not at export time after every GPU run: the export would refuse such a prompt anyway
+    summary = build()
+    out = tmp_path / "testset"
+    target = out / "ar" / "dev.jsonl"
+    rows = read_jsonl(target, Prompt)
+    rows[0] = replace(rows[0], text=rows[0].text + " " + chr(fault))
+    target.write_text("".join(json.dumps(asdict(r), ensure_ascii=ascii_only) + "\n" for r in rows), encoding="utf-8")
+    with pytest.raises(ValueError, match="decoding fault") as exc:
+        testset.freeze(out, summary=summary, **freeze_kwargs)
+    assert "ar/dev.jsonl" in str(exc.value)
+    assert not (out / "MANIFEST.json").exists()
 
 
 def test_freeze_needs_a_build_record_and_every_language_in_it(tmp_path, build, freeze_kwargs):

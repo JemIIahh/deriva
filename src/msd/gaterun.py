@@ -97,7 +97,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from msd import evalrun, gen, genrun
+from msd import evalrun, gen, genrun, invisible
 from msd.aggregate import _UNLABELLED
 from msd.config import GATE_MIN_LANGS, GATE_MIN_RISE, LANGS, NON_ENGLISH
 from msd.gate import GateResult, drift_gate
@@ -305,10 +305,11 @@ def _check_same_prompts(data: dict[tuple[str, str], ArmData], langs: Sequence[st
 
 
 def _looks_fake(judge_id: str) -> bool:
-    """Does the id say "fake"? Compared after NFKC (fullwidth letters), without invisible format characters
-    (zero-width space, soft hyphen, byte-order mark), stripped and case-folded, anywhere in the id."""
-    text = unicodedata.normalize("NFKC", judge_id)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    """Does the id say "fake"? Compared after NFKC (fullwidth letters), without invisible characters (format
+    characters such as the zero-width space and soft hyphen, and the rest of Unicode's Default_Ignorable_Code_Point set:
+    combining grapheme joiner, variation selectors, Hangul fillers, tag characters; see `msd.invisible`) and without
+    combining marks on ASCII letters, stripped and case-folded, anywhere in the id."""
+    text = invisible.hidden_view(unicodedata.normalize("NFKC", invisible.hidden_view(judge_id)))
     return "fake" in text.strip().casefold()
 
 

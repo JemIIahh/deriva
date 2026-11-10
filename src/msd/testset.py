@@ -1113,6 +1113,21 @@ def _all_files(out_dir: Path) -> list[str]:
     return sorted(rel for rel in files if rel not in _MANIFEST_FILES)
 
 
+_DECODING_FAULT = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + chr(0xFFFD) + "]")
+
+
+def _has_decoding_fault(text: str) -> bool:
+    """U+FFFD or a lone surrogate in a JSONL file, raw or written as a JSON escape (`\\ufffd`, `\\ud800`)."""
+    for line in text.split("\n"):
+        try:
+            line = json.dumps(json.loads(line), ensure_ascii=False)  # an escape becomes the character it stands for
+        except ValueError:
+            pass
+        if _DECODING_FAULT.search(line):
+            return True
+    return False
+
+
 def freeze(
     out_dir: str | Path,
     *,
@@ -1157,6 +1172,12 @@ def freeze(
         empty = [f for f in files if _row_count((out_dir / f).read_bytes()) == 0]
         if empty:
             raise ValueError(f"cannot freeze {out_dir}: empty test-set files {empty}")
+        faulty = [f for f in files if _has_decoding_fault((out_dir / f).read_text(encoding="utf-8"))]
+        if faulty:
+            raise ValueError(
+                f"cannot freeze {out_dir}: the replacement character (U+FFFD) or a lone surrogate, a decoding fault upstream, "
+                f"is in {faulty}. A frozen item is what gets evaluated and published, so fix it at its source and rebuild"
+            )
         if summary is None or raw_root is None:
             raise ValueError("a real freeze needs the build record (summary) and the raw_root of the build")
         _check_record_for_freeze(out_dir, summary, _build_config(seed, source_names, sizes, raw_hashes(raw_root, source_names, sources)))

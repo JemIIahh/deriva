@@ -15,8 +15,8 @@ tags:
 
 # Multilingual safety drift: test set and per-item results
 
-The test set, the per-item results and the tables of a study of how fine-tuning a small multilingual model (Tiny Aya)
-changes its safety, language by language: {{languages}}. It holds harmful-request prompts and harmless-but-edgy
+The test set, the per-item results and the tables of a study of whether and how fine-tuning a small multilingual model
+(Tiny Aya) changes its safety, language by language: {{languages}}. It holds harmful-request prompts and harmless-but-edgy
 prompts, the label a judge gave each reply from each model arm, the task-accuracy score of each item, and the tables
 computed from them. The article explains the study; this card explains the files and what you may do with them.
 
@@ -36,9 +36,9 @@ Arms in the results: {{arms}}.
 
 {{prompt_counts_table}}
 
-The **dev** split was used to choose settings (the repair strength, the judge prompts) and to check that a repaired
-model still works. The **report** split was used for the numbers in the article and for nothing else. No prompt is in
-both. The test set is frozen: the sha256 of its freeze manifest is `{{freeze_sha256}}`.
+The **dev** split was used to choose settings (the repair strength, the judge prompts) and to check that a model after
+the repair step still works. The **report** split was used for the numbers in the article and for nothing else. No prompt
+is in both. The test set is frozen: the sha256 of its freeze manifest is `{{freeze_sha256}}`.
 
 ## Sources and licences
 
@@ -85,8 +85,8 @@ or to attack a deployed system. We publish no full harmful completion: result ro
 ## Limits
 
 - The report split has a few hundred prompts per language; read the confidence intervals in `tables.csv`.
-- Labels come from AI judges; a second judge re-labelled a sample, and `reliability.json` records the agreement per
-  language and which languages are low-confidence.
+- Labels come from AI judges. {{second_judge_sentence}} `reliability.json` records the agreement per language, where
+  there is one, and which languages are low-confidence.
 - Non-English prompts are machine translations; no native-speaker review was done.
 - Hinglish has no closed-form task data, so it has no task-accuracy rows.
 
