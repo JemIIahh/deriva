@@ -148,12 +148,36 @@ def build_table(verdicts: Sequence[Verdict], scores: Sequence[TaskScore]) -> lis
     return rows
 
 
-def write_table_csv(rows: Sequence[dict], path: str | Path) -> None:
-    """Write `build_table` rows as UTF-8 CSV; None becomes an empty cell."""
+_FLOAT_COLUMNS = ("rate", "lo", "hi")
+
+
+def _csv_value(column: str, value: object, float_digits: int | None) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if float_digits is not None and column in _FLOAT_COLUMNS:
+        return f"{value:.{float_digits}f}"
+    return value
+
+
+def write_table_csv(
+    rows: Sequence[dict],
+    path: str | Path,
+    *,
+    columns: Sequence[str] = COLUMNS,
+    float_digits: int | None = None,
+) -> None:
+    """Write `build_table` rows as UTF-8 CSV; None becomes an empty cell, a bool becomes true / false.
+
+    `columns` names the columns and their order (default `COLUMNS`); a row that lacks one raises `KeyError`
+    naming it. `float_digits` writes the `rate`, `lo` and `hi` columns with exactly that many decimals, so the
+    file is byte-identical wherever it is written (default: Python's shortest repr).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(COLUMNS)
+        writer.writerow(columns)
         for row in rows:
-            writer.writerow(["" if row[c] is None else row[c] for c in COLUMNS])
+            writer.writerow([_csv_value(c, row[c], float_digits) for c in columns])

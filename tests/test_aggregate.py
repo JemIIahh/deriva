@@ -368,3 +368,32 @@ def test_write_table_csv_accepts_str_path_and_build_table_output(tmp_path):
         back = list(csv.DictReader(fh))
     assert [r["metric"] for r in back] == ["asr", "task_acc"]
     assert back[0]["alpha"] == "0.25"
+
+
+def test_write_table_csv_fixed_digits_and_extra_columns(tmp_path):
+    rows = [
+        {"arm": "A1", "alpha": None, "lang": "en", "metric": "asr", "rate": 0.1, "lo": 0.05, "hi": None,
+         "n": 12, "excluded": 0, "low_confidence": True},
+        {"arm": "A2", "alpha": 0.25, "lang": "hi", "metric": "task_acc", "rate": 1 / 3, "lo": 0.25, "hi": 0.5,
+         "n": 30, "excluded": 2, "low_confidence": False},
+    ]
+    path = tmp_path / "t.csv"
+    write_table_csv(rows, path, columns=(*COLUMNS, "low_confidence"), float_digits=6)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "arm,alpha,lang,metric,rate,lo,hi,n,excluded,low_confidence"
+    assert lines[1] == "A1,,en,asr,0.100000,0.050000,,12,0,true"
+    assert lines[2] == "A2,0.25,hi,task_acc,0.333333,0.250000,0.500000,30,2,false"
+
+
+def test_write_table_csv_defaults_are_unchanged(tmp_path):
+    path = tmp_path / "t.csv"
+    write_table_csv([{"arm": "A1", "alpha": None, "lang": "en", "metric": "asr", "rate": 1 / 3, "lo": None,
+                      "hi": None, "n": 12, "excluded": 0}], path)
+    assert path.read_text(encoding="utf-8").splitlines()[1] == f"A1,,en,asr,{1 / 3!r},,,12,0"
+
+
+def test_write_table_csv_names_a_missing_column(tmp_path):
+    with pytest.raises(KeyError, match="low_confidence"):
+        write_table_csv([{"arm": "A1", "alpha": None, "lang": "en", "metric": "asr", "rate": 0.1, "lo": None,
+                          "hi": None, "n": 12, "excluded": 0}], tmp_path / "t.csv",
+                        columns=(*COLUMNS, "low_confidence"))

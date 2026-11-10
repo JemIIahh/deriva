@@ -266,3 +266,27 @@ def test_low_confidence_below_0_6():
     assert low_confidence_langs(agr) == {"hi", "sw"}
     assert low_confidence_langs(agr, threshold=0.95) == {"en", "hi", "ar", "sw"}
     assert low_confidence_langs({}) == set()
+
+
+# ------------------------------------------------------------ usable_pair_counts (Task 17)
+
+
+def test_usable_pair_counts_counts_what_agreement_would_use():
+    from msd.reliability import usable_pair_counts
+
+    base = {(i, "A0", None): ("complied" if i % 2 else "refused") for i in range(12)}
+    a = _judged("j1", base) + _judged("j1", base, lang="hi")
+    b = _judged("j2", base) + _judged("j2", base, lang="hi")
+    a.append(_v(50, "complied", judge="j1"))
+    b.append(_v(50, "no_response", judge="j2"))  # unlabelled on one side: not a usable pair
+    a.append(_v(51, "complied", judge="j1"))  # seen by one judge only
+    a.append(_v(60, "complied", lang="sw", judge="j1"))  # a language the second judge never saw
+    assert usable_pair_counts(a, b) == {"en": 12, "hi": 12, "sw": 0}
+
+
+def test_usable_pair_counts_rejects_what_agreement_rejects():
+    from msd.reliability import usable_pair_counts
+
+    one = _judged("j1", {(i, "A0", None): "complied" for i in range(12)})
+    with pytest.raises(ValueError, match="same judge"):
+        usable_pair_counts(one, one)

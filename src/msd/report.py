@@ -7,6 +7,7 @@ needed beyond matplotlib's own.
 """
 
 import math
+import textwrap
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -37,7 +38,7 @@ _NO_DATA_FILL = "#e3e3e3"
 _GREY_TEXT = "#333333"
 
 # Cell pattern per style. Diagonal lines and dots look nothing alike, even in greyscale.
-_HATCH = {"solid": "", "hatched": "////", "low_confidence": "...."}
+_HATCH = {"solid": "", "hatched": "////", "low_confidence": "....", "excluded": "xxxx"}
 
 # Okabe-Ito: the standard colour-blind-safe qualitative palette (black and yellow left out).
 _LANG_COLOURS = ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9")
@@ -119,6 +120,7 @@ def _save(fig: Figure, out_path: str | Path) -> None:
 _ROW_IN = 1.05  # height of one heatmap row, inches
 _HEAD_IN = 0.95  # room above the grid for title and column headers
 _FOOT_IN = 1.75  # room below the grid for colour bar and legend
+_FOOT_EXTRA_IN = 0.35  # one more legend line, when some cell is left out
 _LEFT = 0.11  # grid's left edge, as a fraction of the figure width
 
 
@@ -174,6 +176,7 @@ def heatmap(
     low_conf: set[str],
     out_path: str | Path,
     deltas: Mapping[str, tuple[float, float, float]] | None = None,
+    excluded: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
     """One row per language, two columns (`arm_before`, `arm_after`) for one metric.
 
@@ -184,6 +187,9 @@ def heatmap(
     caller with `stats.paired_diff_ci`; a language missing from it has no interval and
     so counts as inside the noise. So does a language with an unmeasured cell (no data,
     or fewer than `MIN_N` items): its delta is ignored and "no paired interval" shown.
+    `excluded` maps (language, arm) to a short reason for a cell that was left out of the table (too many
+    judge errors, failed sanity check): it is drawn crossed and says "excluded" and the reason, not "no data".
+    A cell named there must have no row in `rows` (`ValueError` otherwise).
 
     `rows` must hold one alpha per arm: filter to it first. Raises `ValueError`
     otherwise, if no row matches `metric` and the two arms, if two rows describe the same
@@ -193,7 +199,7 @@ def heatmap(
     """
     fig = _build_heatmap_figure(
         rows, metric=metric, arm_before=arm_before, arm_after=arm_after,
-        low_conf=low_conf, deltas=deltas,
+        low_conf=low_conf, deltas=deltas, excluded=excluded,
     )
     _save(fig, out_path)
 
@@ -206,9 +212,11 @@ def _build_heatmap_figure(
     arm_after: str,
     low_conf: set[str],
     deltas: Mapping[str, tuple[float, float, float]] | None = None,
+    excluded: Mapping[tuple[str, str], str] | None = None,
 ) -> Figure:
     """The figure `heatmap` saves; split out so tests can inspect what was drawn."""
     arms = (arm_before, arm_after)
+    excluded = {key: reason for key, reason in (excluded or {}).items() if key[1] in arms}
     used = [r for r in rows if r["metric"] == metric and r["arm"] in arms]
     if not used:
         raise ValueError(f"no rows for metric {metric!r} and arms {list(arms)}; nothing to draw")
@@ -222,16 +230,23 @@ def _build_heatmap_figure(
                 f"metric {metric!r}; one of them would silently win"
             )
         cell_of[key] = r
-    langs = _lang_order({r["lang"] for r in used})
+    for lang, arm in excluded:
+        if (lang, arm) in cell_of:
+            raise ValueError(
+                f"cell {arm!r} / language {lang!r} is listed as excluded ({excluded[(lang, arm)]}) but also has a "
+                f"row for metric {metric!r}; a cell is either in the table or left out of it"
+            )
+    langs = _lang_order({r["lang"] for r in used} | {lang for lang, _ in excluded})
     deltas = deltas or {}
     shown = {lang: _shown_delta(lang, cell_of.get((lang, arm_before)),
                                 cell_of.get((lang, arm_after)), deltas.get(lang))
              for lang in langs}  # checks every supplied delta before anything is drawn
 
     n = len(langs)
-    height = _HEAD_IN + _ROW_IN * n + _FOOT_IN
+    foot = _FOOT_IN + (_FOOT_EXTRA_IN if excluded else 0.0)
+    height = _HEAD_IN + _ROW_IN * n + foot
     fig = _new_figure(9.0, height)
-    ax = fig.add_axes((_LEFT, _FOOT_IN / height, 0.63, _ROW_IN * n / height))
+    ax = fig.add_axes((_LEFT, foot / height, 0.63, _ROW_IN * n / height))
     ax.set_xlim(0, 2)
     ax.set_ylim(n, 0)
     for spine in ax.spines.values():
@@ -245,7 +260,8 @@ def _build_heatmap_figure(
         delta = shown[lang]
         style = cell_style(delta, lang, low_conf)
         for c, arm in enumerate(arms):
-            _draw_cell(ax, c, r, cell_of.get((lang, arm)), style, gid=f"cell:{lang}:{arm}")
+            _draw_cell(ax, c, r, cell_of.get((lang, arm)), style, gid=f"cell:{lang}:{arm}",
+                       left_out=excluded.get((lang, arm)))
         note = (
             f"{delta[0] * 100:+.1f} pp\n[{delta[1] * 100:+.1f}, {delta[2] * 100:+.1f}]"
             if delta is not None
@@ -259,11 +275,16 @@ def _build_heatmap_figure(
 
     fig.text(_LEFT, 1 - 0.3 / height, _METRIC_TITLES.get(metric, metric),
              fontsize=14, fontweight="bold", ha="left", va="center")
-    _draw_heatmap_key(fig, height)
+    _draw_heatmap_key(fig, height, foot, has_excluded=bool(excluded))
     return fig
 
 
-def _draw_cell(ax, col: int, row_idx: int, row: Mapping | None, style: str, *, gid: str) -> None:
+def _draw_cell(
+    ax, col: int, row_idx: int, row: Mapping | None, style: str, *, gid: str, left_out: str | None = None
+) -> None:
+    if left_out is not None:
+        _draw_left_out_cell(ax, col, row_idx, left_out, gid)
+        return
     head, _, detail = _cell_text(row).partition("\n")
     has_data = head != "no data"
     fill = _CMAP(_NORM(row["rate"])) if has_data else _NO_DATA_FILL
@@ -286,27 +307,46 @@ def _draw_cell(ax, col: int, row_idx: int, row: Mapping | None, style: str, *, g
         ax.text(col + 0.5, row_idx + 0.7, detail, fontsize=8.5, **kw)
 
 
-def _draw_heatmap_key(fig: Figure, height: float) -> None:
+def _draw_left_out_cell(ax, col: int, row_idx: int, reason: str, gid: str) -> None:
+    """A cell that was left out of the table: grey, crossed, and it says why (never a bare "no data")."""
+    rect = Rectangle(
+        (col + 0.03, row_idx + 0.04), 0.94, 0.92, facecolor=_NO_DATA_FILL, linewidth=0,
+        edgecolor="black", hatch=_HATCH["excluded"], gid=gid,
+    )
+    rect.set_hatch_linewidth(0.8)
+    ax.add_patch(rect)
+    plate = {"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "none", "alpha": 0.92}
+    ax.text(col + 0.5, row_idx + 0.40, "excluded", fontsize=12, fontweight="bold", ha="center", va="center",
+            color="black", bbox=plate)
+    ax.text(col + 0.5, row_idx + 0.68, reason, fontsize=8.5, ha="center", va="center", color="black", bbox=plate)
+
+
+def _draw_heatmap_key(fig: Figure, height: float, foot: float, *, has_excluded: bool) -> None:
     grey = {"facecolor": "#b8b8b8", "edgecolor": "black", "linewidth": 0.8}
+    handles = [
+        Patch(label="solid row: change is clear (CI excludes 0)", **grey),
+        Patch(hatch=_HATCH["hatched"],
+              label="hatched row: change between the two columns is inside the noise "
+                    "(CI includes 0) or could not be measured", **grey),
+        Patch(hatch=_HATCH["low_confidence"],
+              label="dotted row: the two judges disagree too much, or were not "
+                    "double-checked; read with care", **grey),
+    ]
+    if has_excluded:
+        handles.append(Patch(hatch=_HATCH["excluded"],
+                             label="crossed cell: left out of the table (too many judge errors, or the "
+                                   "model failed the sanity check)", **grey))
     fig.legend(
-        handles=[
-            Patch(label="solid row: change is clear (CI excludes 0)", **grey),
-            Patch(hatch=_HATCH["hatched"],
-                  label="hatched row: change between the two columns is inside the noise "
-                        "(CI includes 0) or could not be measured", **grey),
-            Patch(hatch=_HATCH["low_confidence"],
-                  label="dotted row: the two judges disagree too much, or were not "
-                        "double-checked; read with care", **grey),
-        ],
+        handles=handles,
         loc="lower left", bbox_to_anchor=(_LEFT - 0.02, 0.1 / height), frameon=False, fontsize=9.5,
         handlelength=2.2, handleheight=1.4, labelspacing=0.7,
     )
-    cax = fig.add_axes((_LEFT, 1.28 / height, 0.26, 0.17 / height))
+    cax = fig.add_axes((_LEFT, (foot - 0.47) / height, 0.26, 0.17 / height))
     bar = fig.colorbar(ScalarMappable(norm=_NORM, cmap=_CMAP), cax=cax, orientation="horizontal")
     bar.set_ticks([0, 0.25, 0.5, 0.75, 1], labels=["0%", "25%", "50%", "75%", "100%"])
     bar.outline.set_visible(False)
     cax.tick_params(labelsize=9, length=2)
-    fig.text(_LEFT + 0.28, 1.365 / height, "colour = rate; text = rate, [95% CI], n", fontsize=9.5,
+    fig.text(_LEFT + 0.28, (foot - 0.385) / height, "colour = rate; text = rate, [95% CI], n", fontsize=9.5,
              color=_GREY_TEXT, ha="left", va="center")
 
 
@@ -454,6 +494,8 @@ def alpha_curve(
     *,
     langs: Sequence[str],
     out_path: str | Path,
+    chosen_alpha: float | None = None,
+    excluded: Mapping[str, Sequence[float]] | None = None,
 ) -> None:
     """Safety against task accuracy, one line per language along the A2 alpha grid.
 
@@ -462,11 +504,34 @@ def alpha_curve(
     its alpha; A0 and A1 are single markers (square, diamond). Faint whiskers show the
     intervals that exist. A language with no A2 point is skipped; `ValueError` if that
     leaves nothing to draw.
+
+    `chosen_alpha` (the alpha picked on dev) gets a ring around each language's point at that alpha, named in
+    the legend. `excluded` maps a language to the A2 alphas whose cell was left out of the table (so they are
+    not in `rows`); a line under the plot lists them, because a gap in a line must not go unexplained.
     """
-    _save(_build_alpha_curve_figure(rows, langs=langs), out_path)
+    _save(_build_alpha_curve_figure(rows, langs=langs, chosen_alpha=chosen_alpha, excluded=excluded), out_path)
 
 
-def _build_alpha_curve_figure(rows: Sequence[Mapping], *, langs: Sequence[str]) -> Figure:
+_ALPHA_TOLERANCE = 1e-9
+
+
+def _left_out_note(excluded: Mapping[str, Sequence[float]] | None) -> str:
+    """"hi: alpha 0.5; sw: alpha 0.5, 1" for the cells left out, languages in config order; "" if none."""
+    parts = [
+        f"{lang}: alpha {', '.join(f'{a:g}' for a in sorted(set(excluded[lang])))}"
+        for lang in _lang_order(set(excluded or {}))
+        if excluded[lang]
+    ]
+    return "; ".join(parts)
+
+
+def _build_alpha_curve_figure(
+    rows: Sequence[Mapping],
+    *,
+    langs: Sequence[str],
+    chosen_alpha: float | None = None,
+    excluded: Mapping[str, Sequence[float]] | None = None,
+) -> Figure:
     """The figure `alpha_curve` saves; split out so tests can inspect what was drawn."""
     rates: dict[tuple, dict[str, Triple]] = {}
     seen: set[tuple] = set()
@@ -498,8 +563,13 @@ def _build_alpha_curve_figure(rows: Sequence[Mapping], *, langs: Sequence[str]) 
         raise ValueError(f"no A2 rows with both asr and task_acc for any of {list(langs)}")
 
     colour_of = _lang_colours(langs)
-    fig = _new_figure(9.0, 5.6)
-    ax = fig.add_axes((0.08, 0.12, 0.64, 0.72))
+    note = _left_out_note(excluded)
+    note_lines = textwrap.wrap(f"Left out (cell excluded, see reliability.json): {note}", width=110) if note else []
+    extra = 0.18 * len(note_lines)  # room under the x label for the note, inches
+    height = 5.6 + extra
+    fig = _new_figure(9.0, height)
+    ax = fig.add_axes((0.08, (0.12 * 5.6 + extra) / height, 0.64, 0.72 * 5.6 / height))
+    rung = []  # (lang, x, y) of every point at the chosen alpha
     labels, ends, markers, lines = [], [], [], []
     for lang, pts in curves:
         colour = colour_of[lang]
@@ -513,6 +583,11 @@ def _build_alpha_curve_figure(rows: Sequence[Mapping], *, langs: Sequence[str]) 
             if alpha in (pts[0][0], pts[-1][0]):
                 ends.append(label)
             markers.append((acc[0], asr[0], 3.5))
+            if chosen_alpha is not None and abs(alpha - chosen_alpha) < _ALPHA_TOLERANCE:
+                ax.plot(acc[0], asr[0], "o", markersize=13, markerfacecolor="none", markeredgecolor="black",
+                        markeredgewidth=1.6, linestyle="none", clip_on=False, zorder=6, gid=f"chosen:{lang}")
+                rung.append(lang)
+                markers.append((acc[0], asr[0], 7.0))
         for arm, marker in (("A0", "s"), ("A1", "D")):
             for _, acc, asr in points(arm, lang):
                 _draw_whiskers(ax, acc, asr, colour)
@@ -537,15 +612,21 @@ def _build_alpha_curve_figure(rows: Sequence[Mapping], *, langs: Sequence[str]) 
         plans, _ = _plan_labels(ax, ends, markers, lines)
     _draw_labels(ax, plans)
 
-    fig.text(0.08, 0.955, "Safety against task accuracy along the A2 alpha grid", fontsize=14,
+    def from_top(inches: float) -> float:
+        return 1 - inches / height
+
+    fig.text(0.08, from_top(0.25), "Safety against task accuracy along the A2 alpha grid", fontsize=14,
              fontweight="bold", ha="left", va="center")
-    fig.text(0.08, 0.915 if ends_only else 0.905, "Down and to the right is better."
+    fig.text(0.08, from_top(0.48 if ends_only else 0.53), "Down and to the right is better."
              if ends_only else "Down and to the right is better. Numbers on the line are alpha.",
              fontsize=10.5, color=_GREY_TEXT, ha="left", va="center")
     if ends_only:
-        fig.text(0.08, 0.876, "Numbers mark alpha at each line's two ends; the points between are "
+        fig.text(0.08, from_top(0.69), "Numbers mark alpha at each line's two ends; the points between are "
                  "the alphas in between, in order.", fontsize=10.5, color=_GREY_TEXT,
                  ha="left", va="center")
+    for i, line in enumerate(note_lines):
+        fig.text(0.08, (0.20 + 0.18 * (len(note_lines) - 1 - i)) / height, line,
+                 fontsize=9, color=_GREY_TEXT, ha="left", va="center")
     handles = [
         Line2D([], [], color=colour_of[lang], linewidth=1.6,
                marker="o", markersize=5.5, label=f"{lang} (A2 line)")
@@ -555,6 +636,10 @@ def _build_alpha_curve_figure(rows: Sequence[Mapping], *, langs: Sequence[str]) 
                linestyle="none", label=f"{arm} (one point)")
         for arm, marker in (("A0", "s"), ("A1", "D"))
     ]
+    if rung:
+        handles.append(Line2D([], [], color="black", marker="o", markersize=11, markerfacecolor="none",
+                              markeredgewidth=1.6, linestyle="none",
+                              label=f"ring: chosen on dev\n(alpha {chosen_alpha:g})"))  # two lines: one ran off the page
     fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.745, 0.5), frameon=False,
                fontsize=10, labelspacing=0.9)
     return fig

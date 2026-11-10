@@ -1012,6 +1012,14 @@ def _announce(
         print(f"WARNING [{lang} {args.arm}/{gen.format_alpha(args.alpha)} {args.split}]: {warning}", file=sys.stderr)
 
 
+# Public names for tooling built on this module (scripts/run_reliability.py builds a judge, writes files and
+# reports judge usage exactly as run_eval does, from these).
+build_judge = _make_judge
+report_judge_run = _report_judge_run
+atomic_replace = _atomic_replace
+write_text = _write_text
+judge_error_stats = _judge_error_stats
+
 PLAIN_ERRORS = (*genrun.PLAIN_ERRORS, EvalError, judges.JudgeSetupError)
 
 

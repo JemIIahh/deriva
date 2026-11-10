@@ -411,3 +411,86 @@ def test_alpha_curve_standard_labels_do_not_overlap_and_stay_attached_to_their_p
         for point in to_px(line.get_xydata()):
             for gid, box in boxes.items():
                 assert not box.contains(*point), f"label {gid} covers a data point"
+
+
+# ----------------------------------------------- excluded cells and the chosen alpha (Task 17)
+
+
+def _patch_of(fig, lang, arm):
+    return next(p for p in fig.axes[0].patches if p.get_gid() == f"cell:{lang}:{arm}")
+
+
+def _heatmap_without(lang, arm):
+    return [r for r in _heatmap_rows() if not (r["lang"] == lang and r["arm"] == arm)]
+
+
+def test_heatmap_draws_an_excluded_cell_crossed_with_its_reason():
+    fig = _build_heatmap_figure(
+        _heatmap_without("hi", "A1"), metric="asr", arm_before="A0", arm_after="A1", low_conf=set(),
+        excluded={("hi", "A1"): "judge errors"},
+    )
+    assert _patch_of(fig, "hi", "A1").get_hatch() == "xxxx"
+    texts = [t.get_text() for t in fig.axes[0].texts]
+    assert "excluded" in texts and "judge errors" in texts
+    assert "no data" not in texts  # it is not simply missing
+    said = " ".join(t.get_text() for t in fig.legends[0].get_texts())
+    assert "crossed" in said
+
+
+def test_heatmap_without_excluded_cells_has_no_crossed_key():
+    fig = _build()
+    said = " ".join(t.get_text() for t in fig.legends[0].get_texts())
+    assert "crossed" not in said
+
+
+def test_heatmap_refuses_an_excluded_cell_that_also_has_a_row():
+    with pytest.raises(ValueError, match="excluded"):
+        _build_heatmap_figure(
+            _heatmap_rows(), metric="asr", arm_before="A0", arm_after="A1", low_conf=set(),
+            excluded={("hi", "A1"): "judge errors"},
+        )
+
+
+def test_heatmap_ignores_a_delta_for_a_row_with_an_excluded_cell(tmp_path):
+    out = tmp_path / "heat.png"
+    heatmap(
+        _heatmap_without("hi", "A1"), metric="asr", arm_before="A0", arm_after="A1", low_conf=set(),
+        out_path=out, deltas={"hi": (0.2, 0.1, 0.3)}, excluded={("hi", "A1"): "sanity check"},
+    )
+    _assert_png(out)
+
+
+def test_alpha_curve_rings_the_chosen_alpha_and_lists_the_left_out_cells():
+    fig = _build_alpha_curve_figure(
+        _curve_rows(), langs=list(LANGS), chosen_alpha=0.25, excluded={"hi": [0.5], "sw": [0.5, 1.0]},
+    )
+    rings = [line.get_gid() for line in fig.axes[0].lines if (line.get_gid() or "").startswith("chosen:")]
+    assert sorted(rings) == sorted(f"chosen:{lang}" for lang in LANGS)
+    said = " ".join(t.get_text() for t in fig.texts)
+    assert "Left out" in said and "hi: alpha 0.5" in said and "sw: alpha 0.5, 1" in said
+    assert "chosen on dev" in " ".join(t.get_text() for t in fig.legends[0].get_texts())
+
+
+def test_alpha_curve_without_extras_is_as_before():
+    fig = _build_alpha_curve_figure(_curve_rows(), langs=list(LANGS))
+    assert not [line for line in fig.axes[0].lines if (line.get_gid() or "").startswith("chosen:")]
+    assert "Left out" not in " ".join(t.get_text() for t in fig.texts)
+    assert "chosen on dev" not in " ".join(t.get_text() for t in fig.legends[0].get_texts())
+
+
+def test_alpha_curve_chosen_alpha_missing_for_a_language_rings_only_the_others():
+    rows = [r for r in _curve_rows() if not (r["lang"] == "hi" and r["arm"] == "A2" and r["alpha"] == 0.25)]
+    fig = _build_alpha_curve_figure(rows, langs=list(LANGS), chosen_alpha=0.25)
+    rings = {line.get_gid() for line in fig.axes[0].lines if (line.get_gid() or "").startswith("chosen:")}
+    assert rings == {f"chosen:{lang}" for lang in LANGS if lang != "hi"}
+
+
+def test_alpha_curve_legend_stays_inside_the_figure_with_the_chosen_alpha_named():
+    # the "ring" entry once ran off the right edge, cutting off the alpha it names
+    fig = _build_alpha_curve_figure(_curve_rows(), langs=list(LANGS), chosen_alpha=0.25,
+                                    excluded={"hi": [0.5]})
+    fig.canvas.draw()
+    legend = fig.legends[0]
+    box, page = legend.get_window_extent(), fig.bbox
+    assert box.x0 >= page.x0 and box.x1 <= page.x1 and box.y0 >= page.y0 and box.y1 <= page.y1
+    assert "0.25" in " ".join(t.get_text() for t in legend.get_texts())

@@ -312,6 +312,9 @@ def _looks_fake(judge_id: str) -> bool:
     return "fake" in text.strip().casefold()
 
 
+looks_fake = _looks_fake  # public name: msd.reportrun applies the very same judge-id check to a report's verdicts
+
+
 def _single_judge(data: dict[tuple[str, str], ArmData], results: Path, out: Path, root: Path) -> str:
     """The one judge id of every row of every file; refuses a fake judge on real results, then a mix of judges."""
     files_by_judge: dict[str, list[Path]] = {}
@@ -525,6 +528,9 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+json_safe = _json_safe  # public name: msd.reportrun writes its JSON the same way
 
 
 def _rate(flags: Sequence[int]) -> float | None:

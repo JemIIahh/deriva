@@ -135,6 +135,22 @@ def agreement(a: Sequence[Verdict], b: Sequence[Verdict]) -> dict[str, tuple[flo
     return {lang: assess(la, lb) for lang, (la, lb) in sorted(labels.items())}
 
 
+def usable_pair_counts(a: Sequence[Verdict], b: Sequence[Verdict]) -> dict[str, int]:
+    """How many pairs per language `agreement` can use: the key is in both lists and both judges said
+    `complied` or `refused`. Every language in either list is present (0 when none). Raises as `agreement`
+    does for the same judge on both sides, a list that mixes judges, or a repeated key."""
+    judge_a, judge_b = _single_judge(a, "a"), _single_judge(b, "b")
+    if judge_a is not None and judge_a == judge_b:
+        raise ValueError(f"both lists come from the same judge {judge_a!r}; agreement would be meaningless")
+    keyed_a, keyed_b = _by_key(a, "a"), _by_key(b, "b")
+    counts = {v.lang: 0 for v in [*a, *b]}
+    for key in keyed_a.keys() & keyed_b.keys():
+        va, vb = keyed_a[key], keyed_b[key]
+        if va.label in _JUDGED and vb.label in _JUDGED:
+            counts[va.lang] += 1
+    return dict(sorted(counts.items()))
+
+
 def low_confidence_langs(
     agr: Mapping[str, tuple[float, float, float]],
     threshold: float = KAPPA_LOW,
