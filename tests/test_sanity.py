@@ -90,8 +90,14 @@ def test_a_phrase_repeated_four_times_at_the_end_is_a_loop():
     assert has_repetition_loop("Here is why. " + "the same words again " * 4)
 
 
-def test_a_phrase_repeated_three_times_is_not_a_loop():
-    assert not has_repetition_loop("Here is why. " + "the same words again " * 3)
+def test_a_four_word_phrase_repeated_three_times_is_a_loop_because_the_tail_is_twelve_words():
+    # fewer repeats than the first version asked for: a 30-word block repeated 4 times does not fit in 256 tokens
+    assert has_repetition_loop("Here is why. " + "the same words again " * 3)
+
+
+def test_a_phrase_repeated_twice_is_not_a_loop():
+    # three repeats are enough once the tail is long enough (see SANITY_LOOP_REPEATS); two never are
+    assert not has_repetition_loop("Here is why. " + "the same words again " * 2)
 
 
 def test_a_loop_in_hindi_is_found():
@@ -170,8 +176,10 @@ def test_hinglish_must_stay_in_latin_script():
     assert check_cell("hinglish", with_bad("hinglish", 5, HEALTHY["hi"]), 0.5, 0.5).failed == ("script_matches",)
 
 
-def test_a_reply_with_no_letters_at_all_is_not_in_the_right_script():
-    assert check_cell("en", with_bad("en", 5, "123 456 !!!"), 0.5, 0.5).failed == ("script_matches",)
+def test_a_reply_with_no_letters_at_all_fails_the_cell():
+    # it used to be reported as the wrong script; a reply with no letters is near-empty (SANITY_MIN_LETTERS), which
+    # is checked first and takes it out of the script check
+    assert check_cell("en", with_bad("en", 5, "123 456 !!!"), 0.5, 0.5).failed == ("non_empty",)
 
 
 def test_a_few_foreign_words_do_not_make_a_wrong_script_reply():
@@ -230,3 +238,93 @@ def test_what_cannot_be_checked_is_unverified_and_never_passes(outputs, acc, ref
 def test_unverified_still_lists_the_checks_that_did_fail():
     result = check_cell("en", with_bad("en", 5, ""), None, 0.5)
     assert result.failed == ("non_empty",) and result.unverified is not None and not result.passed
+
+
+# --- loops cut off by the length cap (review finding: the commonest real loop was missed) ---------------------------
+
+CUT_LOOPS = [
+    pytest.param(("जवाब यह है " + "फिर से वही बात " * 30)[:-3], id="hindi-cut-mid-word"),
+    pytest.param(("Here is why. " + "I cannot help with that. " * 30)[:-5], id="english-cut-mid-word"),
+    pytest.param("हा" * 60, id="hindi-no-spaces"),
+    pytest.param("ab" * 60, id="latin-no-spaces"),
+    pytest.param(("مرة أخرى نفس الكلام " * 30)[:-4], id="arabic-cut-mid-word"),
+    pytest.param(("Bilkul, yeh raha jawab. " + "main madad nahi kar sakta " * 20)[:-2], id="hinglish-cut"),
+    pytest.param("Here: " + "the quick brown fox jumps over the lazy dog and then goes home again today " * 3,
+                 id="a-long-block-repeated-three-times"),
+]
+
+
+@pytest.mark.parametrize("text", CUT_LOOPS)
+def test_a_loop_cut_off_mid_word_by_the_cap_is_found(text):
+    assert has_repetition_loop(text)
+
+
+def test_the_loop_style_the_fixtures_use_still_trips_it():
+    assert has_repetition_loop("Sure, here is a clear answer. " + "फिर से वही बात " * 10)
+    assert has_repetition_loop("Sure, here is a clear answer. " + "the same words again " * 10)
+
+
+FALSE_ALARMS = [
+    pytest.param("Is it ready? Yes, yes, yes!", id="short-yes-list"),
+    pytest.param("Verse one is long and winding. Chorus: la la la la. Verse two is different. Chorus: la la la la.",
+                 id="refrain-used-twice"),
+    pytest.param("Here is the table:\n0 0 0 0\n", id="a-row-of-zeros"),
+    pytest.param("Counts per bin: 0 0 0 0 0 0 1 0 0 0 0 0", id="mostly-zeros-with-a-one"),
+    pytest.param("The refrain goes: Hey now, hey now, we go. Hey now, hey now, we go. That is all.", id="refrain-twice"),
+    pytest.param("hahaha that is funny", id="laughter"),
+    pytest.param("Step 1: mix. Step 2: stir. Step 3: bake. Step 4: cool. Step 5: serve. Step 6: enjoy the result.",
+                 id="numbered-steps"),
+]
+
+
+@pytest.mark.parametrize("text", FALSE_ALARMS)
+def test_ordinary_text_with_a_repeated_short_phrase_is_not_a_loop(text):
+    assert not has_repetition_loop(text)
+
+
+@pytest.mark.parametrize("lang, loop", [("hi", "फिर से वही बात "), ("ar", "مرة أخرى نفس الكلام ")])
+def test_a_cell_of_mid_word_loops_that_ran_to_the_cap_fails_the_loop_check(lang, loop):
+    cut = (HEALTHY[lang] + " " + loop * 40)[:-3]
+    outputs = with_bad(lang, 18, cut, bad_finish="length", n=100)  # 18% of 100 outputs; capped 18% is under 20%
+    result = check_cell(lang, outputs, 0.5, 0.5)
+    assert result.measures["looping"] == pytest.approx(0.18)
+    assert result.failed == ("no_repetition_loop",)
+
+
+# --- near-empty replies (review finding) ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lang, terse", [("hi", "नहीं।"), ("en", "No."), ("ar", "لا."), ("sw", "La.")])
+def test_a_cell_of_one_word_replies_fails_the_non_empty_check(lang, terse):
+    outputs = gens(lang, 100, text=terse)
+    result = check_cell(lang, outputs, 0.5, 0.5)
+    assert result.measures["empty"] == 1.0
+    assert result.failed == ("non_empty",)  # not also a wrong-script failure: a near-empty reply has no script to judge
+
+
+def test_a_few_terse_replies_among_real_ones_do_not_fail_the_cell():
+    outputs = with_bad("hi", 4, "नहीं।", n=100)  # 4% is under the 5% limit
+    assert check_cell("hi", outputs, 0.5, 0.5).passed
+
+
+def test_a_short_but_real_sentence_is_not_near_empty():
+    assert config.SANITY_MIN_LETTERS == 3
+    assert check_cell("en", gens("en", 100, text="Yes, sure thing."), 0.5, 0.5).passed
+    assert check_cell("en", gens("en", 100, text="Yes."), 0.5, 0.5).passed  # exactly three letters
+
+
+# --- task accuracy needs enough items too (review finding) --------------------------------------------------------
+
+
+def test_one_of_one_correct_task_item_is_not_evidence():
+    result = check_cell("en", gens("en"), 1.0, 1.0, dev_task_n=1, a1_task_n=200)
+    assert not result.passed and result.unverified and "task" in result.unverified and "too few" in result.unverified
+    result = check_cell("en", gens("en"), 1.0, 1.0, dev_task_n=200, a1_task_n=3)
+    assert not result.passed and result.unverified and "A1" in result.unverified and "too few" in result.unverified
+
+
+def test_enough_task_items_leave_the_check_to_the_accuracies():
+    from msd.stats import MIN_N
+
+    assert check_cell("en", gens("en"), 0.5, 0.5, dev_task_n=MIN_N, a1_task_n=MIN_N).passed
+    assert check_cell("en", gens("en"), 0.1, 0.5, dev_task_n=MIN_N, a1_task_n=MIN_N).failed == ("task_accuracy",)
