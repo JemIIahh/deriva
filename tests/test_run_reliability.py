@@ -344,3 +344,31 @@ def test_the_script_runs_and_helps(tmp_path):
     bad = subprocess.run([sys.executable, str(SCRIPT), "--results", str(tmp_path / "none"), "--judge", "nope"],
                          capture_output=True, text=True, timeout=60)
     assert bad.returncode == reliabilityrun.EXIT_USAGE
+
+
+# --- review round 1 ----------------------------------------------------------------------------------------------
+
+
+def test_the_first_model_under_another_casing_is_still_the_first_judge(repo, results, run, monkeypatch):
+    judge = register(monkeypatch, "second", Second(results, judge_id=JUDGE.upper()))
+    code, out, err = run(repo, results)
+    assert code == reliabilityrun.EXIT_JUDGE and "same judge" in err and judge.calls == []
+    assert second_files(results, JUDGE.upper()) == []
+
+
+def test_dev_can_come_from_another_folder_so_the_sample_matches_the_table(repo, results, run, monkeypatch, tmp_path):
+    dev_root = tmp_path / "devroot"
+    dev_root.mkdir()
+    shutil.move(str(results / "dev"), str(dev_root / "dev"))
+    register(monkeypatch, "second", Second(results))
+    code, out, err = run(repo, results, "--dev", str(dev_root))
+    assert code == 0, err
+    assert any(v.arm == "A2" for v in second_rows(results))  # the repair cells passed the gate, so they are in the table
+
+
+def test_without_a_dev_folder_the_unchecked_repair_cells_are_not_double_judged(repo, results, run, monkeypatch, tmp_path):
+    shutil.move(str(results / "dev"), str(tmp_path / "dev_away"))
+    register(monkeypatch, "second", Second(results))
+    code, out, err = run(repo, results)
+    assert code == 0, err
+    assert not any(v.arm == "A2" for v in second_rows(results))  # not in the table, so not in the sample

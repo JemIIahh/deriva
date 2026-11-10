@@ -509,6 +509,7 @@ def test_second_judge_rows_that_sit_in_the_wrong_file_are_refused(tree, run):
 
 FAULTS = [
     ("empty", "non_empty"),
+    ("terse", "non_empty"),  # one-word replies ("No.") are near-empty: no letters to speak of
     ("capped", "not_capped"),
     ("loop", "no_repetition_loop"),
     ("script", "script_matches"),
@@ -818,7 +819,8 @@ def test_make_report_reads_what_run_eval_writes(tmp_path, monkeypatch, run):
     monkeypatch.setattr(gen, "hf_backend", backend_factory)
     monkeypatch.setitem(evalrun.JUDGE_REGISTRY, "stub", Stub)
     results = tmp_path / "results"
-    for split, arm, alpha in (("dev", "A1", None), ("dev", "A2", "0.25"), ("report", "A1", None),
+    # dev A0 is the over-refusal reference of the alpha choice (with A1): without it no alpha can be chosen
+    for split, arm, alpha in (("dev", "A0", None), ("dev", "A1", None), ("dev", "A2", "0.25"), ("report", "A1", None),
                               ("report", "A2", "0.25")):
         argv = ["--arm", arm, "--split", split, "--out", str(results), "--judge", "stub", "--model", "org/m",
                 "--langs", ",".join(langs)]
@@ -838,3 +840,246 @@ def _prompt(pid, lang, kind, split):
     from msd.schema import Prompt
 
     return Prompt(pid, lang, kind, f"prompt {pid}", split, "fixture", "fixture")
+
+
+# --- review round 1: over-refusal in the alpha choice --------------------------------------------------------------
+
+
+def test_the_alpha_with_the_lowest_asr_is_not_chosen_when_it_refuses_too_much(tree, run):
+    assert reliability(run(tree)[3])["alpha_choice"]["chosen"] == 0.5  # without the fault 0.5 wins on ASR
+    edit_cell(tree, "dev", "A2", 0.5, "sw", over=0.9)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    choice = reliability(out_dir)["alpha_choice"]
+    assert choice["chosen"] == 0.25
+    worse = {c["alpha"]: c for c in choice["candidates"]}[0.5]
+    assert worse["eligible"] is False and any("sw" in r and "over-refusal" in r for r in worse["reasons"])
+    assert "over-refusal" in choice["rule"]
+
+
+def test_every_alpha_refusing_too_much_chooses_none_and_says_so_plainly(tree, run):
+    for alpha in ALPHAS:
+        edit_cell(tree, "dev", "A2", alpha, "en", over=0.9)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    rel = reliability(out_dir)
+    assert rel["alpha_choice"]["chosen"] is None
+    assert (rel["heatmap"]["before"]["arm"], rel["heatmap"]["after"]["arm"]) == ("A0", "A1")  # the drift, not a repair
+    assert "no alpha" in err and "over-refusal" in err and "Traceback" not in err
+
+
+def test_without_the_dev_references_no_alpha_is_chosen(tmp_path, run):
+    tree = build_tree(tmp_path / "results", dev_arms=("A1", "A2"))  # no dev A0: nothing to compare over-refusal with
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    choice = reliability(out_dir)["alpha_choice"]
+    assert choice["chosen"] is None
+    assert all(not c["eligible"] and any("A0" in r for r in c["reasons"]) for c in choice["candidates"])
+
+
+def test_the_figures_say_which_alphas_were_not_eligible_to_be_chosen(tree, run, monkeypatch):
+    seen = {}
+    real = report.alpha_curve
+
+    def spy(rows, **kwargs):
+        seen.update(kwargs)
+        return real(rows, **kwargs)
+
+    monkeypatch.setattr(report, "alpha_curve", spy)
+    edit_cell(tree, "dev", "A2", 0.5, "sw", over=0.9)
+    assert run(tree)[0] == 0
+    assert list(seen["not_chosen"]) == [0.5] and "sw" in seen["not_chosen"][0.5][0]
+
+
+# --- review round 1: numbers come from the verified counts ---------------------------------------------------------
+
+
+def _rewrite_eval(path, change):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    change(data)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def test_the_judge_error_rate_comes_from_the_counts_not_from_eval_json(tree, run):
+    edit_cell(tree, "report", "A1", None, "hi", judge_errors=8)  # 8 of 40 harmful verdicts are judge errors
+    def lie(data):
+        data["judge_error"]["rate"] = 0.0
+        for stat in data["judge_error"]["by_kind"].values():
+            stat["rate"] = 0.0
+    _rewrite_eval(evalrun.eval_path(tree, "report", "A1", None, "hi"), lie)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    excluded = [e for e in reliability(out_dir)["excluded_cells"] if e["reason"] == "judge_error"]
+    assert [(e["arm"], e["lang"]) for e in excluded] == [("A1", "hi")]
+    assert "asr" not in metrics_of(table(out_dir), "A1", "", "hi")
+
+
+def test_dev_task_accuracy_comes_from_the_scored_items_not_from_eval_json(tree, run):
+    edit_cell(tree, "dev", "A2", 0.25, "ar", acc=0.1)  # 2 of 20 items correct
+    _rewrite_eval(evalrun.eval_path(tree, "dev", "A2", 0.25, "ar"), lambda d: d["tasks"].update(accuracy=0.5))
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    cell = [c for c in reliability(out_dir)["sanity_gate"]["cells"] if (c["alpha"], c["lang"]) == (0.25, "ar")][0]
+    assert cell["failed_checks"] == ["task_accuracy"]
+    assert cell["measures"]["task_acc"] == pytest.approx(0.1)
+
+
+def test_a_dev_task_set_too_small_to_compare_leaves_the_cell_unverified(tree, run):
+    edit_cell(tree, "dev", "A2", 0.25, "ar", n_task=3)
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    cell = [c for c in reliability(out_dir)["sanity_gate"]["cells"] if (c["alpha"], c["lang"]) == (0.25, "ar")][0]
+    assert cell["passed"] is False and "too few" in cell["unverified"] and "task" in cell["unverified"]
+
+
+# --- review round 1: the same model is the same judge --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("hf:Org/Model:tabcdef012345", "hf:org/model:t0123456789ab", True),
+    ("anthropic:claude-x", "ANTHROPIC:Claude-X", True),
+    ("anthropic:claude-x:t000000000001", "anthropic:claude-x", True),
+    ("stub-judge-v1", "STUB-JUDGE-V1", True),
+    ("hf:org/model:tabcdef012345", "hf:org/other:tabcdef012345", False),
+    ("anthropic:claude-x", "hf:claude-x", False),
+    ("stub-judge-v1", "stub-second-v1", False),
+])
+def test_same_judge_compares_provider_and_model_ignoring_case_and_template_fingerprint(a, b, same):
+    assert reportrun.same_judge(a, b) is same
+
+
+def test_a_second_judge_that_is_the_first_model_in_other_casing_is_refused(tmp_path, run):
+    tree = build_tree(tmp_path / "results")
+    write_second_judge(tree, judge=JUDGE.upper())
+    code, out, err, _ = run(tree)
+    assert code == reportrun.EXIT_JUDGE and "same judge" in err
+
+
+def test_a_second_judge_that_is_the_first_model_with_another_template_fingerprint_is_refused(tmp_path, run):
+    first = "hf:org/model:tabcdef012345"
+    tree = build_tree(tmp_path / "results", overrides={(..., ..., ..., ...): {"judge": first}})
+    write_second_judge(tree, judge="hf:org/model:t0123456789ab", primary_judge=first)
+    code, out, err, _ = run(tree)
+    assert code == reportrun.EXIT_JUDGE and "same judge" in err and "second judge" in err
+    other = build_tree(tmp_path / "results2", overrides={(..., ..., ..., ...): {"judge": first}})
+    write_second_judge(other, judge="hf:org/other:t0123456789ab", primary_judge=first)
+    assert run(other)[0] == 0  # another model is another judge
+
+
+# --- review round 1: dev gens are checked against their path like every other file ----------------------------------
+
+
+def test_a_dev_gens_file_copied_from_another_alpha_is_refused(tree, run):
+    shutil.copy(gen.gens_path(tree, "dev", "A2", 0.1, "hi"), gen.gens_path(tree, "dev", "A2", 0.25, "hi"))
+    code, out, err, _ = run(tree)
+    assert code == reportrun.EXIT_ERROR and "A2/0.25/hi" in err and "gens" in err and "Traceback" not in err
+
+
+# --- review round 1: excluded A0 / A1 markers are listed under the alpha curve -------------------------------------
+
+
+def test_an_excluded_a1_marker_is_listed_for_the_alpha_curve(tree, run, monkeypatch):
+    seen = {}
+    real = report.alpha_curve
+
+    def spy(rows, **kwargs):
+        seen.update(kwargs)
+        return real(rows, **kwargs)
+
+    monkeypatch.setattr(report, "alpha_curve", spy)
+    edit_cell(tree, "report", "A1", None, "hi", judge_errors=8)
+    edit_cell(tree, "report", "A0", None, "ar", judge_errors=8)
+    edit_cell(tree, "dev", "A2", 0.5, "sw", style="empty")
+    assert run(tree)[0] == 0
+    assert seen["excluded"] == {"hi": ["A1"], "ar": ["A0"], "sw": [0.5]}
+
+
+# --- review round 1: a failed figure leaves no partial set -----------------------------------------------------------
+
+
+def test_a_figure_error_leaves_no_partial_set_and_no_stale_one(tree, tmp_path, run, monkeypatch):
+    out_dir = tmp_path / "out"
+    assert run(tree, out=out_dir)[0] == 0 and written(out_dir) == sorted(OUTPUTS)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("the figure broke")
+
+    monkeypatch.setattr(report, "alpha_curve", boom)
+    code, out, err, _ = run(tree, out=out_dir)
+    assert code == reportrun.EXIT_ERROR
+    assert written(out_dir) == []  # not a fresh tables.csv without its reliability.json, and not the old set either
+
+
+# --- review round 1: A3 is a safety arm too -------------------------------------------------------------------------
+
+
+def _a3_tree(root, *, dev_arms, overrides=None):
+    return build_tree(root, report_arms=("A0", "A1", "A2", "A3"), dev_arms=dev_arms, overrides=overrides)
+
+
+def test_a3_is_gated_like_the_repair_arms(tmp_path, run):
+    tree = _a3_tree(tmp_path / "results", dev_arms=("A0", "A1", "A2", "A3"),
+                    overrides={("dev", "A3", None, "hi"): {"style": "empty"}})
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    rel, rows = reliability(out_dir), table(out_dir)
+    cells = {c["lang"]: c for c in rel["sanity_gate"]["cells"] if c["arm"] == "A3"}
+    assert sorted(cells) == sorted(LANGS) and cells["hi"]["failed_checks"] == ["non_empty"]
+    assert all(c["passed"] for lang, c in cells.items() if lang != "hi")
+    assert "asr" not in metrics_of(rows, "A3", "", "hi")
+    assert metrics_of(rows, "A3", "", "ar") == ["asr", "over_refusal", "task_acc"]
+    assert [(e["arm"], e["alpha"], e["lang"]) for e in rel["excluded_cells"] if e["arm"] == "A3"] == [("A3", None, "hi")]
+
+
+def test_an_a3_cell_with_no_dev_run_is_unchecked_and_excluded(tmp_path, run):
+    tree = _a3_tree(tmp_path / "results", dev_arms=("A0", "A1", "A2"))
+    code, out, err, out_dir = run(tree)
+    assert code == 0, err
+    rel, rows = reliability(out_dir), table(out_dir)
+    cells = [c for c in rel["sanity_gate"]["cells"] if c["arm"] == "A3"]
+    assert len(cells) == len(LANGS) and all(not c["passed"] and "dev" in c["unverified"] for c in cells)
+    assert all("asr" not in metrics_of(rows, "A3", "", lang) for lang in LANGS)
+    assert all("task_acc" in metrics_of(rows, "A3", "", lang) for lang in LANGS)  # judge-free, kept
+
+
+# --- review round 1: dev from another folder (the paid-judge rejudge goes into a fresh report folder) -----------------
+
+
+@pytest.fixture
+def split_tree(tree, tmp_path):
+    """The usual tree with its dev split moved into a separate folder: (report folder, dev folder)."""
+    dev_root = tmp_path / "devroot"
+    dev_root.mkdir()
+    shutil.move(str(tree / "dev"), str(dev_root / "dev"))
+    return tree, dev_root
+
+
+def test_without_a_dev_folder_no_alpha_is_chosen_and_it_says_so(split_tree, run):
+    tree, _ = split_tree
+    code, out, err, out_dir = run(tree)
+    assert code == 0 and reliability(out_dir)["alpha_choice"]["chosen"] is None and "no dev split" in err
+
+
+def test_dev_can_come_from_another_folder(split_tree, run):
+    tree, dev_root = split_tree
+    code, out, err, out_dir = run(tree, "--dev", str(dev_root))
+    assert code == 0, err
+    rel = reliability(out_dir)
+    assert rel["alpha_choice"]["chosen"] == 0.5 and "no dev split" not in err
+    assert all(c["passed"] for c in rel["sanity_gate"]["cells"])
+
+
+def test_a_dev_folder_with_another_judge_is_warned_not_refused(split_tree, run):
+    tree, dev_root = split_tree
+    for lang in LANGS:
+        for arm, alpha in (("A0", None), ("A1", None)) + tuple(("A2", a) for a in ALPHAS):
+            edit_cell(dev_root, "dev", arm, alpha, lang, judge="stand-in-v1")
+    code, out, err, out_dir = run(tree, "--dev", str(dev_root))
+    assert code == 0, err
+    rel = reliability(out_dir)
+    assert rel["judge_ids"] == {"dev": "stand-in-v1", "report": JUDGE} and "stand-in-v1" in err
+
+
+def test_a_dev_folder_that_does_not_exist_is_a_plain_error(tree, tmp_path, run):
+    code, out, err, _ = run(tree, "--dev", str(tmp_path / "nowhere"))
+    assert code == reportrun.EXIT_ERROR and "--dev" in err and "Traceback" not in err

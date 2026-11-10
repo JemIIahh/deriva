@@ -2,6 +2,7 @@
 """Build the report tables and figures from a results folder (reads only; deterministic).
 
     python scripts/make_report.py --verdicts results/ --out results/
+    python scripts/make_report.py --verdicts results_paid/ --dev results/ --out results_paid/   # dev split elsewhere
 
 Writes tables.csv, heatmap.png, alpha_curve.png and reliability.json (judge ids, kappa per language, the
 low-confidence languages, the excluded cells with the sanity check each failed, the alpha chosen on dev). Run

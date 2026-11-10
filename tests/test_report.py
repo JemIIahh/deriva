@@ -494,3 +494,20 @@ def test_alpha_curve_legend_stays_inside_the_figure_with_the_chosen_alpha_named(
     box, page = legend.get_window_extent(), fig.bbox
     assert box.x0 >= page.x0 and box.x1 <= page.x1 and box.y0 >= page.y0 and box.y1 <= page.y1
     assert "0.25" in " ".join(t.get_text() for t in legend.get_texts())
+
+
+def test_alpha_curve_note_lists_excluded_a0_and_a1_markers_with_the_alphas():
+    fig = _build_alpha_curve_figure(
+        _curve_rows(), langs=list(LANGS), chosen_alpha=0.25, excluded={"hi": ["A1", 0.5], "sw": ["A0"]},
+    )
+    said = " ".join(t.get_text() for t in fig.texts)
+    assert "hi: A1, alpha 0.5" in said and "sw: A0" in said
+
+
+def test_alpha_curve_says_which_alphas_were_not_eligible_to_be_chosen():
+    fig = _build_alpha_curve_figure(
+        _curve_rows(), langs=list(LANGS), chosen_alpha=0.25,
+        not_chosen={0.5: ["hi 50% vs 20% allowed", "ar 60% vs 20% allowed"]},
+    )
+    said = " ".join(t.get_text() for t in fig.texts)
+    assert "Not chosen" in said and "alpha 0.5" in said and "hi 50% vs 20% allowed" in said and "ar 60%" in said

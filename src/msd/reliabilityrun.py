@@ -78,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=0, help="seed of the sample (default 0); the same data and seed "
                                                         "give the same items")
     ap.add_argument("--testset-dir", type=Path, default=None, help="default: data/testset under the repository root")
+    ap.add_argument("--dev", type=Path, default=None,
+                    help="results folder that holds the dev split, when it is not --results (as for make_report.py: "
+                         "the sample must be the one the tables are made from); default: --results")
     return ap
 
 
@@ -136,7 +139,7 @@ def _load_generations(results: Path, cells: dict[CellKey, list[Key]]) -> dict[Ce
             rows = read_jsonl(path, Generation)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise reportrun.ReportError(f"{path} cannot be read as generations ({type(exc).__name__})") from None
-        reportrun._check_rows_match_path(path, [_Tagged(g, lang) for g in rows], arm, alpha, lang)
+        reportrun._check_rows_match_path(path, [reportrun._Tagged(g, lang) for g in rows], arm, alpha, lang)
         by_id = {g.prompt_id: g for g in rows}
         missing = sorted({item[0] for item in items} - set(by_id))
         if missing:
@@ -146,13 +149,6 @@ def _load_generations(results: Path, cells: dict[CellKey, list[Key]]) -> dict[Ce
             )
         gens[(arm, alpha, lang)] = by_id
     return gens
-
-
-class _Tagged:
-    """A Generation seen with its language (a gens file has none), so the path check can use it."""
-
-    def __init__(self, generation: Generation, lang: str) -> None:
-        self.arm, self.alpha, self.lang = generation.arm, generation.alpha, lang
 
 
 def _check_existing_labels(folder: Path, judge_id: str, wanted: dict[str, set[Key]]) -> None:
@@ -197,7 +193,8 @@ def _agreement_lines(
 def run(args: argparse.Namespace, *, root: Path) -> dict[str, list[str]]:
     """Do the run; returns the low-confidence languages with their reasons. Raises the errors listed in `main`."""
     results = Path(args.results)
-    analysis = reportrun.analyze(results, with_second_judge=False)  # the first judge's checks run here, first
+    # the first judge's checks run here, first; the dev split decides which repair cells are in the tables
+    analysis = reportrun.analyze(results, with_second_judge=False, dev_root=args.dev)
     first_id = analysis.report.judge_id
     if first_id is None or not analysis.report_verdicts:
         raise reportrun.ReportError(
@@ -212,10 +209,11 @@ def run(args: argparse.Namespace, *, root: Path) -> dict[str, list[str]]:
             f"judge {args.judge!r} is a test judge (its id says fake) whose canned labels must never end up among "
             f"real results, and --results {results} is the real results directory. Use a scratch directory."
         )
-    if judge.id == first_id:
+    if reportrun.same_judge(judge.id, first_id):
         raise reportrun.JudgeError(
-            f"judge {reportrun._rid(judge.id)!r} is the same judge that made the report verdicts; a judge agrees with itself by "
-            "construction, so it cannot be its own second opinion. Use another judge"
+            f"judge {reportrun._rid(judge.id)!r} is the same judge (the same provider and model, whatever its case or "
+            "template fingerprint) that made the report verdicts; a judge agrees with itself by construction, so it "
+            "cannot be its own second opinion. Use another judge"
         )
 
     in_scope = [v for v in analysis.report_verdicts if v.lang in args.langs]

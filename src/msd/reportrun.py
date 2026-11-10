@@ -1,6 +1,7 @@
 """The report builder: tables.csv, heatmap.png, alpha_curve.png and reliability.json from a results folder.
 
     python scripts/make_report.py --verdicts results/ --out results/
+    python scripts/make_report.py --verdicts results_paid/ --dev results/ --out results_paid/   # dev lives elsewhere
 
 It reads, and only reads, the result layout run_eval.py writes (`msd.evalrun`):
 
@@ -31,13 +32,21 @@ What counts
     Judge errors.  A cell whose `judge_error` rate (overall, or for either kind) is above the allowance recorded in
               its eval.json (and never above `evalrun.JUDGE_ERROR_MAX`) is excluded and named: its safety rates
               (asr, over_refusal) are left out of the table. Its task accuracy needs no judge and stays.
-    Sanity gate (`msd.sanity`).  Every (arm, alpha, language) of a repair arm (A2, A2n) is checked on the dev
-              benign-edgy outputs and dev task accuracy against A1's. A cell that fails, or cannot be checked
-              (never run on dev, outputs missing), is excluded like a judge-error cell and listed with the failed
-              check. BASE, A0, A1 and A3 take no alpha and are not gated.
+    Sanity gate (`msd.sanity`).  Every (arm, alpha, language) of a gated arm (`GATED_ARMS`: A2, A2n with its blend
+              value in the alpha slot, and A3) is checked on the dev benign-edgy outputs and dev task accuracy
+              against A1's. A cell that fails, or cannot be checked (never run on dev, outputs missing, too few task
+              items), is excluded like a judge-error cell and listed with the failed check. BASE, A0 and A1 are what
+              the others are compared with and are not gated.
     Alpha.    Chosen on dev only (`choose_alpha`): the A2 alpha with the lowest mean dev attack-success rate over
-              the non-English languages, among alphas whose cell passed the gate in EVERY language. None if there
-              is none; the heatmap then shows the drift (A0 to A1) and says so.
+              the non-English languages, among alphas that in EVERY language passed the gate and whose dev
+              over-refusal is at most the larger of A0's and A1's plus `config.OVER_REFUSAL_MARGIN` (so a "repair"
+              that refuses everything cannot win; when A0's or A1's dev over-refusal is missing, no alpha is
+              eligible). None if there is none; the heatmap then shows the drift (A0 to A1) and says so, and the
+              reasons are in the warning and in reliability.json.
+    Dev.      `--dev PATH` names the folder that holds the dev split when it is not the --verdicts folder (a report
+              rejudged into a fresh folder has none). A dev split judged by another judge than the report is
+              warned about and recorded in reliability.json, not refused: the stand-in judge may cover dev and the
+              paid judge the report split.
     Low confidence.  A language is low-confidence when no second judge was run, when its inter-judge kappa could not
               be assessed, when the lower bound of its kappa interval is below `config.KAPPA_LOW`, or when fewer than
               `config.RELIABILITY_MIN_PAIRS` of its double-judged items could be compared. It is marked in
@@ -48,10 +57,11 @@ Files written
     heatmap.png       attack success rate, A1 against A2 at the chosen alpha, one row per language
     alpha_curve.png   safety against task accuracy along the A2 alpha grid
     reliability.json  judge ids, kappa per language, low-confidence languages, excluded cells, the sanity gate,
-                      the alpha choice, what the heatmap compares, warnings. Counts and numbers only: no prompt,
+                      the alpha choice (every candidate with its reasons), what the heatmap compares, warnings. Counts and numbers only: no prompt,
                       completion or excerpt text. Sorted keys, NaN as null, no timestamps.
 
-Previous outputs are deleted before anything is read, so a failed run cannot leave tables that look current.
+Previous outputs are deleted before anything is read, and again if writing fails half way (a figure error), so a
+failed run leaves no tables that look current and no partial set: either all four files are new or none exists.
 
 Exit codes: 0 done; 1 a data problem (an unreadable, stale or inconsistent file, an unexpected folder, more than
 one second-judge folder, a write error); 2 usage error; 3 no report split to read; 4 a judge problem (a verdict
@@ -63,9 +73,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 import traceback
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +89,7 @@ from msd.config import (
     KAPPA_LOW,
     LANGS,
     NON_ENGLISH,
+    OVER_REFUSAL_MARGIN,
     RELIABILITY_MIN_PAIRS,
     SANITY_MAX_CAPPED,
     SANITY_MAX_EMPTY,
@@ -96,13 +109,18 @@ TABLE_COLUMNS: tuple[str, ...] = (*aggregate.COLUMNS, "low_confidence")
 FLOAT_DIGITS = 6  # decimals of rate / lo / hi in tables.csv
 
 DEV, REPORT = "dev", "report"
-GATED_ARMS: frozenset[str] = gen.ALPHA_REQUIRED_ARMS  # the repair arms that take an alpha: A2 and A2n
+# Every safety arm that is not a reference: the repair arms that take an alpha (A2, and A2n with its blend value in
+# the alpha slot) and A3 (Harden, no alpha). BASE, A0 and A1 are what the others are compared with.
+GATED_ARMS: frozenset[str] = gen.ALPHA_REQUIRED_ARMS | {"A3"}
+REFERENCE_ARMS: tuple[str, ...] = ("A0", "A1")  # their dev over-refusal bounds the over-refusal of a chosen alpha
 CHOICE_ARM = "A2"  # the alpha of this arm is the one chosen
 
 CHOICE_RULE = (
-    "lowest mean dev attack-success rate over the non-English languages among the A2 alphas whose cell passed "
-    "the sanity gate in every language (and had a measurable rate); ties go to the higher mean dev task "
-    "accuracy, then to the smaller alpha"
+    "lowest mean dev attack-success rate over the non-English languages among the A2 alphas that, in every "
+    "language, passed the sanity gate, had a measurable attack-success rate, and had a dev over-refusal rate no "
+    "higher than the larger of A0's and A1's plus the over-refusal margin (an alpha is not eligible when A0's or "
+    "A1's over-refusal, or its own, is unavailable); ties go to the higher mean dev task accuracy, then to the "
+    "smaller alpha"
 )
 
 _SKIPPED_FOLDERS = ("reliability",)  # besides every name that starts with "_" (_cache, _replaced) or "."
@@ -112,6 +130,20 @@ _SHOWN = 3  # file names or ids quoted in one message
 def _rid(judge_id: str | None) -> str | None:
     """A judge id as it may be printed or stored: token-shaped parts hidden, as every other record does."""
     return None if judge_id is None else gen._redact(judge_id)
+
+
+_FINGERPRINT = re.compile(r":t[0-9a-f]{6,}$")  # the template fingerprint a judge id ends with: hf:<model>:t<hex>
+
+
+def judge_family(judge_id: str) -> str:
+    """The judge without its template fingerprint, NFKC and case-folded: provider and model only."""
+    return _FINGERPRINT.sub("", unicodedata.normalize("NFKC", judge_id).strip().casefold())
+
+
+def same_judge(a: str, b: str) -> bool:
+    """Are two judge ids the same provider and model? A rerun of the same model under a changed template, or
+    with its name in another case, is still that judge: agreement with oneself says nothing."""
+    return judge_family(a) == judge_family(b)
 
 
 class ReportError(RuntimeError):
@@ -307,14 +339,16 @@ def _check_judge_error_section(eval_file: Path, data: dict, rows: Sequence[Verdi
 def judge_error_breaches(cell: Cell) -> list[str]:
     """What is above the cell's judge_error allowance: the whole cell and/or one kind, each with its rate.
 
-    The allowance is the one recorded in the cell's eval.json, but never looser than `evalrun.JUDGE_ERROR_MAX`.
+    The rates are computed from the verdicts (whose counts were checked against eval.json when it was read), never
+    taken from the derived `rate` fields of eval.json. The allowance is the one recorded in the cell's eval.json,
+    but never looser than `evalrun.JUDGE_ERROR_MAX`.
     """
     if cell.verdicts is None:
         return []
-    section = cell.eval["judge_error"]
-    allowance = min(section["max_allowed"], evalrun.JUDGE_ERROR_MAX)
+    stats = evalrun.judge_error_stats(cell.verdicts)
+    allowance = min(cell.eval["judge_error"]["max_allowed"], evalrun.JUDGE_ERROR_MAX)
     breaches = []
-    for name, stat in (("overall", section), *section["by_kind"].items()):
+    for name, stat in (("overall", stats), *stats["by_kind"].items()):
         rate = stat.get("rate")
         if rate is not None and rate > allowance:
             breaches.append(
@@ -466,7 +500,7 @@ def read_second_judge_folder(
         )
     if looks_fake(ids[0]) and not allow_test_judge:
         raise JudgeError(f"the second judge {_rid(ids[0])!r} is a test judge; its canned labels say nothing about agreement")
-    if ids[0] == primary:
+    if primary is not None and same_judge(ids[0], primary):
         raise JudgeError(
             f"the second judge {_rid(ids[0])!r} is the same judge as the first; agreement with oneself is meaningless"
         )
@@ -491,8 +525,16 @@ def load_second_judge(root: Path, primary: str | None) -> tuple[str | None, list
 # --- the sanity gate ----------------------------------------------------------------------------------------------
 
 
+class _Tagged:
+    """A Generation seen with its language (a gens file has none), so the path check can use it."""
+
+    def __init__(self, generation: Generation, lang: str) -> None:
+        self.arm, self.alpha, self.lang = generation.arm, generation.alpha, lang
+
+
 def _dev_benign_outputs(root: Path, cell: Cell) -> list[Generation] | None:
-    """The generations of a dev cell for its benign-edgy prompts, or None when they cannot be found."""
+    """The generations of a dev cell for its benign-edgy prompts (replies to safety prompts, never task items),
+    or None when they cannot be found. `root` is the folder that holds the dev split."""
     if cell.verdicts is None:
         return None  # the benign prompts are told apart by their verdicts
     ids = {v.prompt_id for v in cell.verdicts if v.kind == "benign_edgy"}
@@ -503,22 +545,26 @@ def _dev_benign_outputs(root: Path, cell: Cell) -> list[Generation] | None:
         gens = read_jsonl(path, Generation)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise ReportError(f"{path} cannot be read as generations ({type(exc).__name__})") from None
+    _check_rows_match_path(path, [_Tagged(g, cell.lang) for g in gens], cell.arm, cell.alpha, cell.lang)
     outputs = [g for g in gens if g.prompt_id in ids]
     return outputs if len(outputs) == len(ids) else None
 
 
-def _task_accuracy(cell: Cell | None) -> float | None:
-    section = cell.eval.get("tasks") if cell is not None else None
-    if not isinstance(section, dict) or not _is_count(section.get("n")) or section["n"] == 0:
-        return None
-    accuracy = section.get("accuracy")
-    return float(accuracy) if isinstance(accuracy, (int, float)) and not isinstance(accuracy, bool) else None
+def _task_counts(cell: Cell | None) -> tuple[float | None, int | None]:
+    """(accuracy, number of items) of a cell from its scored items, which were checked against eval.json when it
+    was read; never from the derived `accuracy` field of eval.json. (None, None) without any task items."""
+    if cell is None or not cell.scores:
+        return None, None
+    return sum(score.correct for score in cell.scores) / len(cell.scores), len(cell.scores)
 
 
-def run_sanity_gate(root: Path, dev: Split, report_split: Split) -> dict[tuple[str, float | None, str], sanity.SanityResult]:
-    """The five checks for every (arm, alpha, language) of a repair arm that appears in either split."""
+def run_sanity_gate(
+    dev_root: Path, dev: Split, report_split: Split
+) -> dict[tuple[str, float | None, str], sanity.SanityResult]:
+    """The five checks for every (arm, alpha, language) of a gated arm (`GATED_ARMS`) in either split. They run on
+    the dev split, which lives under `dev_root`."""
     keys = {key for split in (dev, report_split) for key in split.cells if key[0] in GATED_ARMS}
-    a1_accuracy = {lang: _task_accuracy(dev.cells.get(("A1", None, lang))) for lang in LANGS}
+    a1_accuracy = {lang: _task_counts(dev.cells.get(("A1", None, lang))) for lang in LANGS}
     results = {}
     for key in sorted(keys, key=lambda k: _order(*k)):
         arm, alpha, lang = key
@@ -528,8 +574,10 @@ def run_sanity_gate(root: Path, dev: Split, report_split: Split) -> dict[tuple[s
                 (), "this cell was not run on the dev split, so it was never checked", {}
             )
             continue
+        accuracy, n_items = _task_counts(cell)
+        a1_acc, a1_n = a1_accuracy[lang]
         results[key] = sanity.check_cell(
-            lang, _dev_benign_outputs(root, cell), _task_accuracy(cell), a1_accuracy[lang]
+            lang, _dev_benign_outputs(dev_root, cell), accuracy, a1_acc, dev_task_n=n_items, a1_task_n=a1_n
         )
     return results
 
@@ -545,6 +593,7 @@ class Candidate:
     mean_asr: float | None
     mean_over_refusal: float | None
     mean_task_acc: float | None
+    over_refusal_failures: tuple[str, ...] = ()  # "hi 50% vs 20% allowed": the languages that refused too much
 
 
 @dataclass(frozen=True)
@@ -557,6 +606,12 @@ def _mean(values: Sequence[float]) -> float | None:
     return statistics.fmean(values) if values else None
 
 
+def _pct(rate: float) -> str:
+    """"20%", or "12.5%" when the rate is not a whole percent."""
+    value = rate * 100
+    return f"{value:.0f}%" if abs(value - round(value)) < 0.05 else f"{value:.1f}%"
+
+
 def choose_alpha(
     rows: Sequence[Mapping],
     blocked: Mapping[tuple[float, str], Sequence[str]],
@@ -567,20 +622,42 @@ def choose_alpha(
     """Choose the alpha of `arm` from DEV table rows (`aggregate.build_table`), see `CHOICE_RULE`.
 
     `blocked` maps (alpha, language) to the reasons a cell must not count (failed or unverified sanity gate,
-    judge errors). An alpha is eligible only if every language in `langs` has a cell that is not blocked and an
-    attack-success rate from at least `MIN_N` items. The mean is over the non-English languages of `langs`, or
-    over all of them when there is none. The caller must pass dev rows only: nothing here can tell.
+    judge errors). An alpha is eligible only if every language in `langs` has a cell that is not blocked, an
+    attack-success rate from at least `MIN_N` items, and a dev over-refusal rate (from at least `MIN_N` items) no
+    higher than the larger of A0's and A1's in that language plus `OVER_REFUSAL_MARGIN`: otherwise the lowest
+    attack-success rate would go to an alpha that refuses everything. Fail closed: when A0's or A1's over-refusal
+    (rows of arm A0 / A1, no alpha) or the alpha's own is missing or rests on too few items, the alpha is not
+    eligible and the reason says which. The mean is over the non-English languages of `langs`, or over all of
+    them when there is none. The caller must pass dev rows only: nothing here can tell.
     """
     cells: dict[tuple[float, str], dict[str, Mapping]] = defaultdict(dict)
+    refs: dict[tuple[str, str], Mapping] = {}
     for r in rows:
         if r["arm"] == arm and r["alpha"] is not None:
             cells[(r["alpha"], r["lang"])][r["metric"]] = r
+        elif r["arm"] in REFERENCE_ARMS and r["alpha"] is None and r["metric"] == "over_refusal":
+            refs[(r["arm"], r["lang"])] = r
+
+    def usable(row: Mapping | None) -> bool:
+        return row is not None and row["rate"] is not None and row["n"] >= MIN_N
+
+    allowed: dict[str, tuple[float, str] | list[str]] = {}  # lang -> (limit, how it came about) or the missing arms
+    for lang in langs:
+        missing = [ref for ref in REFERENCE_ARMS if not usable(refs.get((ref, lang)))]
+        if missing:
+            allowed[lang] = missing
+        else:
+            rates = {ref: refs[(ref, lang)]["rate"] for ref in REFERENCE_ARMS}
+            limit = max(rates.values()) + OVER_REFUSAL_MARGIN
+            allowed[lang] = (limit, f"the larger of A0 {_pct(rates['A0'])} and A1 {_pct(rates['A1'])}, plus "
+                                    f"{_pct(OVER_REFUSAL_MARGIN)}")
     alphas = sorted({alpha for alpha, _ in cells} | {alpha for alpha, _ in blocked})
     scored = [lang for lang in langs if lang in NON_ENGLISH] or list(langs)
 
     candidates = []
     for alpha in alphas:
-        reasons = []
+        reasons: list[str] = []
+        failures: list[str] = []
         for lang in langs:
             reasons.extend(f"{lang}: {why}" for why in blocked.get((alpha, lang), ()))
             metrics = cells.get((alpha, lang))
@@ -591,6 +668,17 @@ def choose_alpha(
             asr = metrics.get("asr")
             if asr is None or asr["rate"] is None or asr["n"] < MIN_N:
                 reasons.append(f"{lang}: attack success rate not measured on enough items")
+            limit = allowed[lang]
+            over = metrics.get("over_refusal")
+            if isinstance(limit, list):
+                reasons.append(f"{lang}: over-refusal reference not available (no usable {' or '.join(limit)} dev "
+                               "over-refusal rate)")
+            elif not usable(over):
+                reasons.append(f"{lang}: over-refusal not measured on enough items")
+            elif over["rate"] > limit[0] + 1e-9:
+                reasons.append(f"{lang}: over-refusal {_pct(over['rate'])} is above the {_pct(limit[0])} allowed "
+                               f"({limit[1]})")
+                failures.append(f"{lang} {_pct(over['rate'])} vs {_pct(limit[0])} allowed")
 
         def mean(metric: str, over) -> float | None:
             return _mean([cells[(alpha, lang)][metric]["rate"] for lang in over
@@ -599,6 +687,7 @@ def choose_alpha(
         candidates.append(Candidate(
             alpha=alpha, eligible=not reasons, reasons=tuple(reasons), mean_asr=mean("asr", scored),
             mean_over_refusal=mean("over_refusal", scored), mean_task_acc=mean("task_acc", scored),
+            over_refusal_failures=tuple(failures),
         ))
     eligible = [c for c in candidates if c.eligible and c.mean_asr is not None]
     best = min(
@@ -681,7 +770,8 @@ class Analysis:
     heat: dict[str, Any] | None
     deltas: dict[str, tuple[float, float, float]]
     heat_excluded: dict[tuple[str, str], str]
-    curve_excluded: dict[str, list[float]]
+    curve_excluded: dict[str, list[float | str]]
+    not_chosen: dict[float, list[str]]  # alphas not eligible because they refuse too much -> "hi 50% vs 20% allowed"
     notes: list[str]
     warnings: list[str]
 
@@ -732,13 +822,17 @@ def _paired_deltas(
     return deltas, warnings
 
 
-def analyze(root: Path, *, with_second_judge: bool = True) -> Analysis:
+def analyze(root: Path, *, with_second_judge: bool = True, dev_root: Path | None = None) -> Analysis:
     """Read the results folder and decide everything; writes nothing. Raises ReportError, JudgeError, NoDataError.
 
     `with_second_judge=False` leaves the second judge's folder unread (scripts/run_reliability.py, which is about
-    to write it): every language then counts as having no second judge.
+    to write it): every language then counts as having no second judge. `dev_root` is the folder that holds the
+    `dev` split when it is not `root` (a report rejudged into a fresh folder has no dev split of its own).
     """
     root = Path(root)
+    if dev_root is not None and not Path(dev_root).is_dir():
+        raise ReportError(f"--dev {dev_root} is not a folder: expected a results folder with a dev/ split in it")
+    dev_root = Path(dev_root) if dev_root is not None else root
     if not root.is_dir():
         raise NoDataError(f"{root} is not a folder: there are no results to report")
     report_split = load_split(root, REPORT)
@@ -747,13 +841,14 @@ def analyze(root: Path, *, with_second_judge: bool = True) -> Analysis:
             f"no report split under {root}: expected {root / REPORT}/<arm>/<alpha>/<lang>.eval.json files "
             f"(run run_eval.py with --split {REPORT})"
         )
-    dev = load_split(root, DEV)
+    dev = load_split(dev_root, DEV)
     notes = [*dev.notes, *report_split.notes]
     warnings: list[str] = []
     if not dev.cells:
+        where = "" if dev_root == root else f" under --dev {dev_root}"
         warnings.append(
-            "there is no dev split: the sanity gate cannot be run, so every repair cell is excluded and no alpha "
-            "can be chosen"
+            f"there is no dev split{where}: the sanity gate cannot be run, so every repair cell is excluded and no "
+            "alpha can be chosen"
         )
     if dev.judge_id and report_split.judge_id and dev.judge_id != report_split.judge_id:
         warnings.append(
@@ -773,7 +868,7 @@ def analyze(root: Path, *, with_second_judge: bool = True) -> Analysis:
                                             "; ".join(breaches)))
 
     # the sanity gate
-    gate = run_sanity_gate(root, dev, report_split)
+    gate = run_sanity_gate(dev_root, dev, report_split)
     for key, result in gate.items():
         cell = report_split.cells.get(key)
         if cell is not None and not result.passed:
@@ -787,7 +882,7 @@ def analyze(root: Path, *, with_second_judge: bool = True) -> Analysis:
     for (split_name, (arm, alpha, lang)), breaches in judge_blocked.items():
         if split_name == DEV and arm == CHOICE_ARM:
             blocked[(alpha, lang)].append("judge errors over the allowance: " + "; ".join(breaches))
-    dev_cells = [c for c in dev.cells.values() if c.arm == CHOICE_ARM]
+    dev_cells = [c for c in dev.cells.values() if c.arm in (CHOICE_ARM, *REFERENCE_ARMS)]  # A0 / A1: over-refusal references
     dev_rows = aggregate.build_table(
         [v for c in dev_cells if (DEV, c.key) not in judge_blocked for v in c.verdicts or []],
         [s for c in dev_cells for s in c.scores or []],
@@ -828,9 +923,11 @@ def analyze(root: Path, *, with_second_judge: bool = True) -> Analysis:
         before, after = ("A1", None), (CHOICE_ARM, choice.chosen)
     else:
         before, after = ("A0", None), ("A1", None)
+        why = "; ".join(f"alpha {c.alpha:g}: {c.reasons[0]}" for c in choice.candidates if c.reasons)
         warnings.append(
-            "no alpha is eligible (none passed the sanity gate in every language, or there is no dev run), so none "
-            "was chosen; the heatmap shows the drift from A0 to A1 instead of the repair"
+            "no alpha is eligible, so none was chosen"
+            + (f" ({why})" if why else " (there is no dev run of A2)")
+            + "; the heatmap shows the drift from A0 to A1 instead of the repair"
         )
     shown = {(r["arm"], r["alpha"]) for r in rows if r["metric"] == "asr"}
     deltas: dict[str, tuple[float, float, float]] = {}
@@ -848,14 +945,23 @@ def analyze(root: Path, *, with_second_judge: bool = True) -> Analysis:
         for e in exclusions
         if e.split == REPORT and heat is not None and (e.arm, e.alpha) in (before, after)
     }
-    curve_excluded: dict[str, list[float]] = defaultdict(list)
+    # what the alpha curve cannot draw: A2 points and the single-model markers (A0, A1) that were left out
+    left_alphas: dict[str, set[float]] = defaultdict(set)
+    left_arms: dict[str, set[str]] = defaultdict(set)
     for e in exclusions:
-        if e.split == REPORT and e.arm == CHOICE_ARM and e.alpha is not None:
-            curve_excluded[e.lang].append(e.alpha)
+        if e.split != REPORT:
+            continue
+        if e.arm == CHOICE_ARM and e.alpha is not None:
+            left_alphas[e.lang].add(e.alpha)
+        elif e.arm in REFERENCE_ARMS:
+            left_arms[e.lang].add(e.arm)
+    curve_excluded = {lang: [*sorted(left_arms[lang]), *sorted(left_alphas[lang])]
+                      for lang in sorted(set(left_alphas) | set(left_arms))}
+    not_chosen = {c.alpha: list(c.over_refusal_failures) for c in choice.candidates if c.over_refusal_failures}
 
     return Analysis(
         root, dev, report_split, second_id, exclusions, gate, choice, rows, verdicts, agr, pairs, low, heat, deltas,
-        heat_excluded, {lang: sorted(set(a)) for lang, a in curve_excluded.items()}, notes, warnings,
+        heat_excluded, curve_excluded, not_chosen, notes, warnings,
     )
 
 
@@ -875,10 +981,12 @@ def reliability_json(a: Analysis) -> dict[str, Any]:
             "arm": CHOICE_ARM,
             "candidates": [
                 {"alpha": c.alpha, "eligible": c.eligible, "reasons": list(c.reasons), "mean_asr": c.mean_asr,
-                 "mean_over_refusal": c.mean_over_refusal, "mean_task_acc": c.mean_task_acc}
+                 "mean_over_refusal": c.mean_over_refusal, "mean_task_acc": c.mean_task_acc,
+                 "over_refusal_failures": list(c.over_refusal_failures)}
                 for c in a.choice.candidates
             ],
             "chosen": a.choice.chosen,
+            "over_refusal_margin": OVER_REFUSAL_MARGIN,
             "rule": CHOICE_RULE,
             "split": DEV,
         },
@@ -920,6 +1028,15 @@ def clear_outputs(out_dir: Path) -> None:
             path.unlink()
 
 
+def discard_outputs(out_dir: Path) -> None:
+    """Best-effort removal of the four outputs after a failed write: no partial set may stay behind."""
+    for name in OUTPUT_FILES:
+        try:
+            (out_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def write_outputs(a: Analysis, out_dir: Path) -> list[Path]:
     """Write the four files (each through a temp file and a rename); figures that have nothing to draw are skipped."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -943,7 +1060,8 @@ def write_outputs(a: Analysis, out_dir: Path) -> list[Path]:
     try:
         path = out_dir / "alpha_curve.png"
         evalrun.atomic_replace(path, lambda tmp: report.alpha_curve(
-            a.table, langs=langs, out_path=tmp, chosen_alpha=a.choice.chosen, excluded=a.curve_excluded))
+            a.table, langs=langs, out_path=tmp, chosen_alpha=a.choice.chosen, excluded=a.curve_excluded,
+            not_chosen=a.not_chosen))
         written.append(path)
     except ValueError as exc:
         a.warnings.append(f"alpha_curve.png was not written: {exc}")
@@ -964,6 +1082,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="results root with dev/ and report/ folders (default: results/ under the repository root)")
     ap.add_argument("--out", type=Path, default=None, help="where tables.csv, heatmap.png, alpha_curve.png and "
                                                            "reliability.json go (default: the --verdicts folder)")
+    ap.add_argument("--dev", type=Path, default=None,
+                    help="results folder that holds the dev split, when it is not the --verdicts folder (a report "
+                         "rejudged into a fresh folder has none); default: the --verdicts folder. A dev split judged "
+                         "by another judge than the report is warned about and recorded, not refused")
     return ap
 
 
@@ -996,8 +1118,12 @@ def _say(a: Analysis, written: Sequence[Path]) -> None:
 
 def run(args: argparse.Namespace) -> Analysis:
     clear_outputs(Path(args.out))
-    analysis = analyze(args.verdicts)
-    written = write_outputs(analysis, Path(args.out))
+    analysis = analyze(args.verdicts, dev_root=args.dev)
+    try:
+        written = write_outputs(analysis, Path(args.out))
+    except BaseException:
+        discard_outputs(Path(args.out))  # a failed figure must not leave a fresh tables.csv without its reliability.json
+        raise
     _say(analysis, written)
     return analysis
 
