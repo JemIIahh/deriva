@@ -305,11 +305,14 @@ def _check_same_prompts(data: dict[tuple[str, str], ArmData], langs: Sequence[st
 
 
 def _looks_fake(judge_id: str) -> bool:
-    """Does the id say "fake"? Compared after NFKC (fullwidth letters), without invisible characters (format
-    characters such as the zero-width space and soft hyphen, and the rest of Unicode's Default_Ignorable_Code_Point set:
-    combining grapheme joiner, variation selectors, Hangul fillers, tag characters; see `msd.invisible`) and without
-    combining marks on ASCII letters, stripped and case-folded, anywhere in the id."""
-    text = invisible.hidden_view(unicodedata.normalize("NFKC", invisible.hidden_view(judge_id)))
+    """Does the id say "fake"? Compared without the replacement character (U+FFFD) and lone surrogates, without invisible
+    characters (format characters such as the zero-width space and soft hyphen, and the rest of Unicode's
+    Default_Ignorable_Code_Point set: combining grapheme joiner, variation selectors, Hangul fillers, tag characters; see
+    `msd.invisible`), after NFKD (fullwidth letters; a letter and its mark apart) and without combining marks on ASCII
+    letters, stripped and case-folded, anywhere in the id. Every judge check of the study (report, second judge,
+    reliability run, export) is this function."""
+    text = invisible.strip_decoding_faults(judge_id)
+    text = invisible.hidden_view(unicodedata.normalize("NFKD", invisible.hidden_view(text)))
     return "fake" in text.strip().casefold()
 
 

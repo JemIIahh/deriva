@@ -1014,7 +1014,7 @@ def test_the_scan_has_no_false_alarm_on_ordinary_paths_and_words():
 
 
 def test_a_long_free_text_value_in_reliability_json_is_refused_by_name_only(run, results, tmp_path):
-    plant_in_reliability(results, "SENTINEL-LONG " + "words " * 120)
+    plant_in_reliability(results, "SENTINEL-LONG " + "words " * 800)  # 4,800 characters of prose: a completion, not a reason
     code, out_text, err_text, out = run()
     assert code == export.EXIT_ERROR
     assert "reliability.json" in err_text and "long" in err_text and "warnings" in err_text
@@ -1101,16 +1101,39 @@ def test_a_build_record_without_a_freeze_hash_is_refused_not_skipped(run, frozen
         assert_nothing_written(tmp_path, out)
 
 
+# What no card may say as a fact: the study's outcome (whether fine-tuning drifted, whether a repair helped, whether safety
+# was kept). A card says what an arm IS and where the numbers are.
+OUTCOME_PHRASES = ("quietly", "less safe", "win much", "win back", "wins back", "that is the point of the study", "drifted",
+                   "was protected", "protected during", "safety was kept", "restored", "recovered", "stays safe", "kept safe")
+
+
+def every_card(out):
+    return {rel: (out / rel).read_text(encoding="utf-8") for rel in files_under(out) if rel.endswith("README.md")}
+
+
+def assert_cards_state_no_result(cards):
+    for rel, card in cards.items():
+        low = " ".join(card.lower().split())
+        for phrase in OUTCOME_PHRASES:
+            assert phrase not in low, (rel, phrase)
+
+
+def write_arm(results, arm):
+    for split in ("dev", "report"):
+        for lang in config.LANGS:
+            write_cell(results, default_spec(split, arm, None, lang))
+
+
 def test_the_cards_state_no_result_and_name_the_second_judge_only_when_there_was_one(run, results, made_results):
+    for arm in export._ARM_CARDS:
+        if arm not in ("A1", "A2"):
+            write_arm(results, arm)  # every arm that has a card is rendered, A3 included
     code, _o, err, out = run()
     assert code == 0, err
-    cards = {rel: (out / rel).read_text(encoding="utf-8") for rel in files_under(out) if rel.endswith("README.md")}
-    assert len(cards) == 3
-    for rel, card in cards.items():
-        low = card.lower()
-        for phrase in ("quietly", "less safe", "win much", "win back", "wins back", "that is the point of the study", "drifted"):
-            assert phrase not in low, (rel, phrase)
-        assert "stub-second-v1" in card, rel  # the second judge named in the data is named in the card
+    cards = every_card(out)
+    assert sorted(cards) == ["dataset/README.md", *(f"models/{arm}/README.md" for arm in sorted(export._ARM_CARDS))]
+    assert_cards_state_no_result(cards)
+    assert all("stub-second-v1" in card for card in cards.values())  # the second judge named in the data is named in the card
     edit_reliability(results, lambda d: d.update(second_judge_id=None))
     code, _o, err, out2 = run(out=out.parent / "export2")
     assert code == 0, err
@@ -1118,6 +1141,28 @@ def test_the_cards_state_no_result_and_name_the_second_judge_only_when_there_was
         card = (out2 / rel).read_text(encoding="utf-8")
         assert "stub-second-v1" not in card and "re-labelled" not in card, rel
         assert "no second judge" in card.lower(), rel
+
+
+def test_the_a3_card_says_what_the_arm_is_meant_to_do_and_sends_the_reader_to_the_tables(run, results):
+    write_arm(results, "A3")
+    code, _o, err, out = run()
+    assert code == 0, err
+    card = " ".join((out / "models" / "A3" / "README.md").read_text(encoding="utf-8").split())
+    assert "No repair step was applied" in card
+    assert "meant to keep safety during the fine-tune" in card and "whether it did is in the tables" in card
+    assert "protected" not in card
+
+
+def test_the_cards_of_a_run_where_no_alpha_passed_state_no_result_either(run, no_alpha_results, tmp_path):
+    results = tmp_path / "no-alpha-results"
+    shutil.copytree(no_alpha_results, results)
+    write_arm(results, "A3")
+    code, _o, err, out = run(results=results)
+    assert code == 0, err
+    cards = every_card(out)
+    assert len(cards) == 4
+    assert "No alpha passed" in cards["models/A2/README.md"]
+    assert_cards_state_no_result(cards)
 
 
 def test_the_model_card_describes_the_fine_tuning_data_as_the_validator_defines_it_and_the_licences_as_the_notes_do(run):
@@ -1134,6 +1179,99 @@ def test_the_model_card_describes_the_fine_tuning_data_as_the_validator_defines_
 def test_the_gitignore_covers_the_hidden_partial_export_folder():
     lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".*.partial/" in lines and ".export.*.partial" in lines and "export/" in lines
+
+
+# --- fix round 2: the honest no-alpha warning, a fullwidth secret with marks, the card's wording of the cut ----------------
+
+
+@pytest.fixture(scope="module", params=["mixed-reasons", "judge-errors-everywhere"])
+def no_alpha_results(request, tmp_path_factory):
+    """A results tree on the study's real alpha grid (config.ALPHAS, the positive ones) in which no alpha can be chosen,
+    with the four report outputs written by the real `reportrun.main`: the warning in its reliability.json is the one the
+    pipeline writes, not one typed here. "mixed" holds judge-error, sanity-gate and over-refusal reasons; the other has the
+    longest reason there is (judge errors in every kind) for every alpha."""
+    alphas = tuple(a for a in config.ALPHAS if a > 0)
+    root = build_tree(tmp_path_factory.mktemp("noalpha") / "results", alphas=alphas)
+    for i, alpha in enumerate(alphas):
+        if request.param == "judge-errors-everywhere" or i < 3:
+            edit_cell(root, "dev", "A2", alpha, "en", judge_errors=12, benign_judge_errors=12)
+        elif i < 5:
+            edit_cell(root, "dev", "A2", alpha, "hi", style="empty")
+        else:
+            edit_cell(root, "dev", "A2", alpha, "en", over=0.9)
+    write_second_judge(root)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        assert reportrun.main(["--verdicts", str(root), "--out", str(root)], root=root.parent / "repo") == 0
+    return root
+
+
+def test_an_honest_run_where_no_alpha_passed_is_exported_and_not_refused_for_its_long_warning(run, no_alpha_results):
+    data = json.loads((no_alpha_results / "reliability.json").read_text(encoding="utf-8"))
+    assert data["alpha_choice"]["chosen"] is None
+    assert len(data["alpha_choice"]["candidates"]) == len([a for a in config.ALPHAS if a > 0])
+    warning = next(w for w in data["warnings"] if w.startswith("no alpha is eligible"))
+    assert len(warning) > 600, len(warning)  # longer than the first limit: the pipeline's own text, one reason per alpha
+    assert len(warning) < export.MAX_JSON_STRING, (len(warning), export.MAX_JSON_STRING)
+    code, _o, err, out = run(results=no_alpha_results)
+    assert code == 0, err
+    assert (out / "dataset" / "aggregates" / "reliability.json").read_bytes() == (no_alpha_results / "reliability.json").read_bytes()
+    manifest = json.loads((out / "MANIFEST.json").read_text(encoding="utf-8"))
+    assert manifest["checks"]["alpha_choice_chosen"] is None
+
+
+def test_a_long_free_text_value_is_refused_under_any_key_not_only_under_warnings(run, results, tmp_path):
+    edit_reliability(results, lambda d: d.update(note="SENTINEL-LONG " + "words " * 800))
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR and "reliability.json" in err_text and "'note'" in err_text
+    assert "SENTINEL-LONG" not in out_text + err_text
+    assert_nothing_written(tmp_path, out)
+
+
+def fullwidth_marked(text):
+    """Every character made fullwidth where Unicode has a fullwidth form, each followed by a combining acute accent."""
+    return "".join(fullwidth(ch) + chr(0x0301) for ch in text)
+
+
+MARKED_SECRETS = {
+    "hugging-face-token": TOKEN,
+    "api-key": "sk-" + "A1b2C3d4E5F6g7H8i9J0k1",
+    "github-token": "ghp_" + "A1b2C3d4E5F6g7H8i9J0k1L2m3",
+    "aws-key-id": "AKIA" + "ABCDEFGHIJKLMNOP",
+    "macos-path": SECRET_PATH,
+    "linux-path": HOME + "/runner/work/secret/file.txt",
+    "windows-path": "C:" + chr(92) + "Users" + chr(92) + "someone" + chr(92) + "secret.txt",
+}
+
+
+@pytest.mark.parametrize("kind", list(MARKED_SECRETS))
+def test_the_scan_finds_a_fullwidth_secret_with_a_mark_on_every_letter(kind):
+    marked = fullwidth_marked(MARKED_SECRETS[kind])
+    files = {
+        "dataset/README.md": f"see {marked} now\n".encode("utf-8"),
+        "dataset/aggregates/notes.json": json.dumps({"warnings": [marked]}, ensure_ascii=False).encode("utf-8"),
+        "dataset/aggregates/escaped.json": json.dumps({"warnings": [marked]}).encode("ascii"),
+    }
+    for rel, data in files.items():
+        assert export.find_leaks({rel: data}), (kind, rel)
+
+
+def test_a_fullwidth_token_with_a_mark_on_every_letter_in_an_excerpt_is_exported_redacted(run, results):
+    set_excerpts(results, "report", "A1", None, "hi", [f"see {fullwidth_marked(TOKEN)} here"])
+    code, _o, err, out = run()
+    assert code == 0, err
+    rows = read_rows(out / "dataset" / "results_public" / "report" / "A1" / "none" / "hi.verdicts.jsonl")
+    assert rows and all(row["excerpt"] == "see *** here" for row in rows)
+    assert_no_fragments_anywhere(out)
+
+
+def test_the_dataset_card_explains_how_an_excerpt_was_cut(run):
+    code, _o, err, out = run()
+    assert code == 0, err
+    card = " ".join((out / "dataset" / "README.md").read_text(encoding="utf-8").lower().split())
+    for phrase in ("at most 200 characters", "first 200 characters", "ellipsis", "the last word is dropped",
+                   "shorter than 200 characters", "no space", "ellipsis alone"):
+        assert phrase in card, phrase
+    assert "cut at a character boundary" not in card
 
 
 # --- the code has no way to publish anything -------------------------------------------------------------------------

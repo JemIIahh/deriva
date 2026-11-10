@@ -83,9 +83,13 @@ TRANSLATED_LICENSE = "CC-BY-NC-4.0"  # the licence of the NLLB model; marked on 
 NLLB = "NLLB"
 AGGREGATES = reportrun.OUTPUT_FILES  # tables.csv, heatmap.png, alpha_curve.png, reliability.json
 REQUIRED_AGGREGATES = ("tables.csv", "reliability.json")  # a figure with nothing to draw may be missing: a warning
-# Free text in reliability.json could carry completion text, so a string longer than this is refused. The longest value
-# make_report writes is the alpha-choice rule (about 440 characters, constant text); a verdict excerpt is at most 200.
-MAX_JSON_STRING = 600
+# Free text in reliability.json could carry completion text, so a string longer than this is refused. What make_report
+# writes is reasons and warnings of its own: the alpha-choice rule is about 440 characters of constant text, and when no
+# alpha is eligible ONE warning joins the first reason of every candidate alpha (config.ALPHAS has seven positive ones):
+# about 900 characters with ordinary over-refusal reasons and 1,984 when every alpha fails on judge errors in every kind,
+# the longest reason there is. So the limit sits at twice that. A verdict excerpt is at most 200 characters, and a piece of
+# one found in any other file is refused anyway (`_excerpts_outside_results`): that is the real guard against completion text.
+MAX_JSON_STRING = 4000
 PIECE, PIECE_STEP = 32, 8  # a piece of a verdict excerpt of 39 characters or more (PIECE + PIECE_STEP - 1) is found outside results_public/
 
 PROMPTS_FILE, TRANSLATED_FILE = f"{DATASET}/prompts.jsonl", f"{DATASET}/prompts_translated.jsonl"
@@ -442,7 +446,8 @@ def _repair_line(arm: str, chosen: float | None) -> str:
         return ("Repair: ReSta. No alpha passed the dev checks (the sanity gate and the over-refusal bound), so no alpha is "
                 f"named; `reliability.json` in the dataset lists every candidate and why it failed. {sides}")
     if arm == "A3":
-        return "No repair step was applied: safety was protected during the fine-tune instead."
+        return ("No repair step was applied to this model: this arm is meant to keep safety during the fine-tune; "
+                "whether it did is in the tables of the dataset.")
     return "No repair step was applied to this model."
 
 
@@ -532,12 +537,18 @@ def _json_text(rel: str, text: str) -> str | None:
 
 
 def _looked_through(text: str) -> list[tuple[str, str]]:
-    """`text` without what a reader does not see (and U+FFFD and lone surrogates), and that under NFKC."""
+    """`text` without what a reader does not see (and U+FFFD and lone surrogates), and that under NFKC and NFKD (a
+    fullwidth letter with a combining mark composes under NFKC into one non-ASCII letter; decomposed, the mark is a mark
+    on an ASCII letter and goes)."""
     hidden = redact.hidden_view(redact.clean_text(text))
     views = [(_HIDDEN, hidden)] if hidden != text else []
-    folded = redact.hidden_view(unicodedata.normalize("NFKC", hidden)) if not hidden.isascii() else hidden
-    if folded != hidden:
-        views.append((_FOLDED, folded))
+    seen = {text, hidden}
+    if not hidden.isascii():
+        for form in ("NFKC", "NFKD"):
+            folded = redact.hidden_view(unicodedata.normalize(form, hidden))
+            if folded not in seen:
+                seen.add(folded)
+                views.append((_FOLDED, folded))
     return views
 
 

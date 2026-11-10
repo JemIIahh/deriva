@@ -382,7 +382,8 @@ def test_a_cell_without_the_judge_error_allowance_in_its_eval_json_is_refused(tr
 # --- one judge per number set -----------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fake", ["fake-judge-v1", "FAKE", "Ｆａｋｅ-judge", "my-fa\u200bke-judge"])
+@pytest.mark.parametrize("fake", ["fake-judge-v1", "FAKE", "Ｆａｋｅ-judge", "my-fa\u200bke-judge",
+                                  "my-fa" + chr(0xFFFD) + "ke-judge"])  # a decoding fault in the middle of the word
 def test_a_fake_judge_id_is_refused_everywhere(tmp_path, run, fake):
     tree = build_tree(tmp_path / "results", overrides={("report", ..., ..., ...): {"judge": fake}})
     code, out, err, out_dir = run(tree)
@@ -456,6 +457,13 @@ def test_a_second_judge_that_is_the_first_judge_is_refused(tmp_path, run):
 def test_a_fake_second_judge_is_refused(tmp_path, run):
     tree = build_tree(tmp_path / "results")
     write_second_judge(tree, judge="fake-second-v1")
+    code, out, err, _ = run(tree)
+    assert code == reportrun.EXIT_JUDGE and "test judge" in err
+
+
+def test_a_fake_second_judge_hidden_by_a_decoding_fault_is_refused(tmp_path, run):
+    tree = build_tree(tmp_path / "results")
+    write_second_judge(tree, judge="fake-second-v1".replace("fake", "fa" + chr(0xFFFD) + "ke"))
     code, out, err, _ = run(tree)
     assert code == reportrun.EXIT_JUDGE and "test judge" in err
 

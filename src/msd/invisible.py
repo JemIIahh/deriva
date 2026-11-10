@@ -18,6 +18,10 @@ text as it is, and publish it only when it exposed something (see `msd.redact.pu
 ordinary Devanagari, Arabic and Persian text survive. Marks are removed only after an ASCII character, never from a
 non-ASCII word.
 
+`strip_decoding_faults(text)` removes the two things a decoding fault leaves, U+FFFD and lone surrogates. They are not
+invisible (a reader sees the replacement character), but they split a secret or the word "fake" just as well, so every
+check that looks through disguises removes them first.
+
 Nothing here reads a file, the environment or the network.
 """
 
@@ -48,6 +52,7 @@ DEFAULT_IGNORABLE: tuple[tuple[int, int], ...] = (
     (0x1D173, 0x1D17A),  # musical symbol beam and slur controls
     (0xE0000, 0xE0FFF),  # tag characters and variation selectors 17-256, and the unassigned code points between
 )
+_FAULTS = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + chr(0xFFFD) + "]")  # written as code points, never typed
 _KEPT_CONTROLS = range(0x09, 0x0E)  # tab, line feed, vertical tab, form feed, carriage return stay in text
 
 
@@ -73,6 +78,11 @@ def _patterns() -> tuple[re.Pattern[str], re.Pattern[str]]:
         elif code >= 0x300 and category in ("Mn", "Me"):
             marks.append(code)
     return re.compile(_class(sorted(invisible)) + "+"), re.compile(r"([\x00-\x7f])" + _class(marks) + "+")
+
+
+def strip_decoding_faults(text: str) -> str:
+    """`text` without the replacement character (U+FFFD) and lone surrogates."""
+    return _FAULTS.sub("", text)
 
 
 def strip_invisible(text: str) -> str:

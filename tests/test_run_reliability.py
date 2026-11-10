@@ -256,6 +256,23 @@ def test_a_test_judge_is_refused_on_the_real_results_directory(repo, tmp_path, r
     assert not (real / "report" / "reliability").exists()
 
 
+def test_a_test_judge_hidden_by_a_decoding_fault_is_refused_on_the_real_results_directory(repo, tmp_path, run, monkeypatch):
+    real = repo / "results"
+    shutil.copytree(repo / "scratch_results", real)
+    # not `is_fake`: only the id says it, so only the id check (`looks_fake`) can refuse it
+    register(monkeypatch, "second", Second(real, judge_id="fa" + chr(0xFFFD) + "ke-second-v1"))
+    code, out, err = run(repo, real)
+    assert code == reliabilityrun.EXIT_USAGE and "test judge" in err
+    assert not (real / "report" / "reliability").exists()
+
+
+def test_a_test_judge_hidden_by_a_decoding_fault_is_still_called_a_test_judge_in_a_scratch_directory(repo, results, run, monkeypatch):
+    register(monkeypatch, "second", evalrun.FakeJudge("fa" + chr(0xFFFD) + "ke-second-v1"))
+    code, out, err = run(repo, results)
+    assert code == 0, err
+    assert "test judge" in err and "canned" in err  # the note, and make_report refuses to read it (the same check)
+
+
 def test_a_test_judge_works_in_a_scratch_directory(repo, results, run, monkeypatch):
     register(monkeypatch, "second", evalrun.FakeJudge("fake-second-v1"))
     code, out, err = run(repo, results)

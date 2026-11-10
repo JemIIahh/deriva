@@ -513,3 +513,97 @@ def test_the_cut_never_removes_more_than_a_cluster_from_a_long_chain():
     chain = "a" + chr(0x0301) * 60
     assert len(cut_excerpt(chain, 40)) >= 28  # the back-off is capped: a long chain cannot empty the excerpt
     assert cut_excerpt("ab" + "क" + VIRAMA + "ष", 3) == "ab"  # a short cluster still moves back whole
+
+
+# --- fix round 2: a fullwidth secret with a mark on every letter; an environment value with spaces; a decoding fault in a judge id ----
+
+
+def fullwidth_marked(text):
+    """Every character made fullwidth where Unicode has a fullwidth form, each followed by a combining acute accent. NFKC
+    composes some of these into one non-ASCII letter (a fullwidth o and the accent become one o-acute), which hides the
+    letter from a pattern; NFKD does not."""
+    wide = lambda ch: chr(ord(ch) + 0xFEE0) if 0x21 <= ord(ch) <= 0x7E else ch  # noqa: E731
+    return "".join(wide(ch) + chr(0x0301) for ch in text)
+
+
+def folded(text):
+    """`text` as a reader who removes marks and folds compatibility forms (NFKD) sees it."""
+    return hidden_view(unicodedata.normalize("NFKD", text))
+
+
+SECRET_KINDS = {
+    "hugging-face-token": TOKEN,
+    "api-key": "sk-" + "A1b2C3d4E5F6g7H8i9J0k1",
+    "github-token": "ghp_" + "A1b2C3d4E5F6g7H8i9J0k1L2m3",
+    "aws-key-id": "AKIA" + "ABCDEFGHIJKLMNOP",
+    "macos-path": HOME_PATH,
+    "linux-path": LINUX_PATH,
+    "windows-path": "C:" + chr(92) + "Users" + chr(92) + "ram" + chr(92) + "secret" + chr(92) + "file.txt",
+}
+
+
+def fragments(secret):
+    return [secret[i:i + 5] for i in range(3, len(secret) - 5)]
+
+
+@pytest.mark.parametrize("kind", list(SECRET_KINDS))
+def test_a_fullwidth_secret_with_a_mark_on_every_letter_is_redacted(kind):
+    secret = SECRET_KINDS[kind]
+    for field in ("excerpt", "judge_id"):
+        text = f"see {fullwidth_marked(secret)} here"
+        row = public_row(verdict(text, judge_id=text))
+        shown = folded(row[field])
+        assert "***" in shown, (kind, field, shown)
+        assert not any(part in shown for part in fragments(secret)), (kind, field, shown)
+
+
+def test_a_fullwidth_environment_value_with_a_mark_on_every_letter_is_redacted(monkeypatch):
+    value = "plain-secret-value-0123456789"
+    monkeypatch.setenv("MSD_FIX_API_KEY", value)
+    shown = folded(public_row(verdict(f"it was {fullwidth_marked(value)} here"))["excerpt"])
+    assert "***" in shown and "secret-value" not in shown
+
+
+def test_ordinary_fullwidth_text_with_marks_is_not_changed_when_nothing_is_secret():
+    text = "Ｈｅｌｌｏ" + chr(0x0301) + " wörld, कि और क्षेत्र"
+    assert public_row(verdict(text))["excerpt"] == text
+
+
+MULTI_WORD = "correct horse battery staple 99"  # an environment value with spaces: a pass phrase, not a key
+
+
+@pytest.mark.parametrize("start", [60, 120, 165, 167, 168, 169])
+def test_a_multi_word_environment_value_inside_the_excerpt_is_redacted_whole(monkeypatch, start):
+    monkeypatch.setenv("MSD_FIX_API_KEY", MULTI_WORD)
+    text = upstream(WORDS[:start] + MULTI_WORD + "." + " and then more words" * 10)
+    assert MULTI_WORD in text and len(text) == 200  # the whole value is inside what the judge stored, and the text is cut
+    shown = public_row(verdict(text))["excerpt"]
+    assert not any(word in shown for word in ("correct", "horse", "battery", "staple")), (start, shown)
+    assert shown.endswith(MARK) and len(shown) <= 200
+    assert ("***" in shown) == (start < 167)  # from 167 on the value ends in the last chunk, dropped with its replacement
+
+
+@pytest.mark.parametrize("start", [175, 180, 190, 195])
+def test_a_multi_word_environment_value_cut_by_the_upstream_limit_loses_the_word_the_cut_split(monkeypatch, start):
+    # known limit (module docstring): the words before the cut are no longer the whole value, so they can stay
+    monkeypatch.setenv("MSD_FIX_API_KEY", MULTI_WORD)
+    text = upstream(WORDS[:start] + MULTI_WORD + " and then more words")
+    assert not text.endswith(MULTI_WORD)
+    shown = public_row(verdict(text))["excerpt"]
+    assert shown.endswith(MARK) and len(shown) <= 200
+    assert "99" not in shown and "stap" not in shown and "sta" not in shown.replace("start", "")
+
+
+@pytest.mark.parametrize("fault", [chr(0xFFFD), chr(0xD800), chr(0xDC00)], ids=["replacement", "high-surrogate", "low-surrogate"])
+def test_a_test_judge_hidden_by_a_decoding_fault_is_refused_by_the_check_itself(fault):
+    for judge in ("fa" + fault + "ke-judge", "f" + fault + "a" + fault + "k" + fault + "e", "FAKE" + fault, fault + "Fake-judge"):
+        assert looks_fake(judge), judge
+        with pytest.raises(ValueError, match="test judge"):
+            public_row(verdict(judge_id=judge))
+    assert not looks_fake("real" + fault + "-judge-v1") and not looks_fake(fault)
+
+
+def test_every_judge_check_is_the_one_function_that_sees_through_a_decoding_fault():
+    from msd import gaterun, redact, reliabilityrun, reportrun
+    assert reportrun.looks_fake is gaterun.looks_fake and reliabilityrun.looks_fake is gaterun.looks_fake
+    assert redact.looks_fake is gaterun.looks_fake

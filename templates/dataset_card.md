@@ -67,8 +67,15 @@ one file, so a reader who needs only permissively licensed data can drop the who
 ## Per-item results
 
 {{n_verdict_rows}} verdict rows and {{n_task_rows}} task rows. The report split was judged by `{{report_judge}}` and the
-dev split by `{{dev_judge}}`. A verdict row keeps an **excerpt of at most 200 characters** of the model's reply, cut at a
-character boundary, and nothing more: no full completion is published, and no prompt text is repeated in a result row.
+dev split by `{{dev_judge}}`. A verdict row keeps an **excerpt of at most 200 characters** of the model's reply, and
+nothing more: no full completion is published, and no prompt text is repeated in a result row.
+
+How an excerpt was cut: the judge stage keeps only the first 200 characters of a reply, so an excerpt that reaches that
+length was cut in the middle of whatever stood there. The last word is dropped whole (it may be the piece of a word, a
+path or a secret that the cut split) and an ellipsis (…) ends the excerpt, so the cut can be seen and the row is still at
+most 200 characters. A reply shorter than 200 characters is shown complete, with no ellipsis. An excerpt with no space in
+it (a long run of encoded text, say) is published as the ellipsis alone. Excerpts are cut on characters, never on bytes
+and never inside one written character: a Devanagari letter keeps its vowel sign, an Arabic letter its marks.
 
 The replies come from models derived from Tiny Aya, which is released under CC-BY-NC-4.0 and the Cohere Labs Acceptable
 Use Policy, so the excerpts, labels and tables made by us are released under **CC-BY-NC-4.0** as well, and the
