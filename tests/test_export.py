@@ -1014,7 +1014,7 @@ def test_the_scan_has_no_false_alarm_on_ordinary_paths_and_words():
 
 
 def test_a_long_free_text_value_in_reliability_json_is_refused_by_name_only(run, results, tmp_path):
-    plant_in_reliability(results, "SENTINEL-LONG " + "words " * 800)  # 4,800 characters of prose: a completion, not a reason
+    plant_in_reliability(results, "SENTINEL-LONG " + "words " * 1700)  # 10,200 characters of prose: above any reason the pipeline writes
     code, out_text, err_text, out = run()
     assert code == export.EXIT_ERROR
     assert "reliability.json" in err_text and "long" in err_text and "warnings" in err_text
@@ -1184,33 +1184,46 @@ def test_the_gitignore_covers_the_hidden_partial_export_folder():
 # --- fix round 2: the honest no-alpha warning, a fullwidth secret with marks, the card's wording of the cut ----------------
 
 
-@pytest.fixture(scope="module", params=["mixed-reasons", "judge-errors-everywhere"])
+NO_ALPHA_CASES = ["mixed-reasons", "judge-errors-everywhere", "references-excluded-en", "references-excluded-hinglish"]
+
+
+@pytest.fixture(scope="module", params=NO_ALPHA_CASES)
 def no_alpha_results(request, tmp_path_factory):
     """A results tree on the study's real alpha grid (config.ALPHAS, the positive ones) in which no alpha can be chosen,
     with the four report outputs written by the real `reportrun.main`: the warning in its reliability.json is the one the
-    pipeline writes, not one typed here. "mixed" holds judge-error, sanity-gate and over-refusal reasons; the other has the
-    longest reason there is (judge errors in every kind) for every alpha."""
+    pipeline writes, not one typed here. "mixed" holds judge-error, sanity-gate and over-refusal reasons;
+    "judge-errors-everywhere" has judge errors in every kind for every alpha; "references-excluded-<language>" is the
+    longest case: the dev A0 and A1 cells (the over-refusal references) of that language are excluded for judge errors
+    while every A2 cell is clean, so each alpha's first reason embeds both reference notes."""
     alphas = tuple(a for a in config.ALPHAS if a > 0)
     root = build_tree(tmp_path_factory.mktemp("noalpha") / "results", alphas=alphas)
-    for i, alpha in enumerate(alphas):
-        if request.param == "judge-errors-everywhere" or i < 3:
-            edit_cell(root, "dev", "A2", alpha, "en", judge_errors=12, benign_judge_errors=12)
-        elif i < 5:
-            edit_cell(root, "dev", "A2", alpha, "hi", style="empty")
-        else:
-            edit_cell(root, "dev", "A2", alpha, "en", over=0.9)
+    if request.param.startswith("references-excluded-"):
+        lang = request.param.removeprefix("references-excluded-")
+        for arm in ("A0", "A1"):
+            edit_cell(root, "dev", arm, None, lang, judge_errors=12, benign_judge_errors=12)
+    else:
+        for i, alpha in enumerate(alphas):
+            if request.param == "judge-errors-everywhere" or i < 3:
+                edit_cell(root, "dev", "A2", alpha, "en", judge_errors=12, benign_judge_errors=12)
+            elif i < 5:
+                edit_cell(root, "dev", "A2", alpha, "hi", style="empty")
+            else:
+                edit_cell(root, "dev", "A2", alpha, "en", over=0.9)
     write_second_judge(root)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         assert reportrun.main(["--verdicts", str(root), "--out", str(root)], root=root.parent / "repo") == 0
     return root
 
 
-def test_an_honest_run_where_no_alpha_passed_is_exported_and_not_refused_for_its_long_warning(run, no_alpha_results):
+def test_an_honest_run_where_no_alpha_passed_is_exported_and_not_refused_for_its_long_warning(run, no_alpha_results, request):
     data = json.loads((no_alpha_results / "reliability.json").read_text(encoding="utf-8"))
     assert data["alpha_choice"]["chosen"] is None
     assert len(data["alpha_choice"]["candidates"]) == len([a for a in config.ALPHAS if a > 0])
     warning = next(w for w in data["warnings"] if w.startswith("no alpha is eligible"))
     assert len(warning) > 600, len(warning)  # longer than the first limit: the pipeline's own text, one reason per alpha
+    if request.node.callspec.params["no_alpha_results"].startswith("references-excluded-"):
+        assert len(warning) > 4000, len(warning)  # and than the second one: both reference notes in every alpha's reason
+        assert "over-refusal reference not available" in warning
     assert len(warning) < export.MAX_JSON_STRING, (len(warning), export.MAX_JSON_STRING)
     code, _o, err, out = run(results=no_alpha_results)
     assert code == 0, err
@@ -1219,8 +1232,19 @@ def test_an_honest_run_where_no_alpha_passed_is_exported_and_not_refused_for_its
     assert manifest["checks"]["alpha_choice_chosen"] is None
 
 
+def test_the_length_limit_is_exact_a_string_of_the_limit_passes_and_one_more_character_is_refused(run, results, tmp_path):
+    prose = "reason " * (export.MAX_JSON_STRING // 7 + 2)
+    edit_reliability(results, lambda d: d.update(note=prose[:export.MAX_JSON_STRING]))
+    code, _o, err, out = run()
+    assert code == 0, err
+    edit_reliability(results, lambda d: d.update(note=prose[:export.MAX_JSON_STRING + 1]))
+    code, _o, err, out2 = run(out=out.parent / "export2")
+    assert code == export.EXIT_ERROR and f"{export.MAX_JSON_STRING + 1} characters" in err
+    assert_nothing_written(tmp_path, out2)
+
+
 def test_a_long_free_text_value_is_refused_under_any_key_not_only_under_warnings(run, results, tmp_path):
-    edit_reliability(results, lambda d: d.update(note="SENTINEL-LONG " + "words " * 800))
+    edit_reliability(results, lambda d: d.update(note="SENTINEL-LONG " + "words " * 1700))
     code, out_text, err_text, out = run()
     assert code == export.EXIT_ERROR and "reliability.json" in err_text and "'note'" in err_text
     assert "SENTINEL-LONG" not in out_text + err_text

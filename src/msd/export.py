@@ -83,13 +83,18 @@ TRANSLATED_LICENSE = "CC-BY-NC-4.0"  # the licence of the NLLB model; marked on 
 NLLB = "NLLB"
 AGGREGATES = reportrun.OUTPUT_FILES  # tables.csv, heatmap.png, alpha_curve.png, reliability.json
 REQUIRED_AGGREGATES = ("tables.csv", "reliability.json")  # a figure with nothing to draw may be missing: a warning
-# Free text in reliability.json could carry completion text, so a string longer than this is refused. What make_report
-# writes is reasons and warnings of its own: the alpha-choice rule is about 440 characters of constant text, and when no
-# alpha is eligible ONE warning joins the first reason of every candidate alpha (config.ALPHAS has seven positive ones):
-# about 900 characters with ordinary over-refusal reasons and 1,984 when every alpha fails on judge errors in every kind,
-# the longest reason there is. So the limit sits at twice that. A verdict excerpt is at most 200 characters, and a piece of
-# one found in any other file is refused anyway (`_excerpts_outside_results`): that is the real guard against completion text.
-MAX_JSON_STRING = 4000
+# A tripwire, not the defence against completion text: a string in reliability.json longer than this means something is
+# off (a pasted block, a loop) and nothing is exported. What make_report writes is reasons and warnings of its own, and
+# they can be long: the alpha-choice rule is about 440 characters of constant text, and when no alpha is eligible ONE
+# warning joins the first reason of every candidate alpha (config.ALPHAS has seven positive ones). Measured with the real
+# reportrun on fixture trees: 815 characters with ordinary over-refusal reasons, 1,204 mixed, 1,984 when every alpha fails
+# on judge errors in every kind, 4,014 (en) and 4,056 (hinglish) when both over-refusal references of the first language are
+# excluded for judge errors (each reason then embeds both reference notes; 4,140 and 4,182 in the re-review), and 5,638 with
+# absurd six-digit counts. 8,000 is above all of them. One completion is at most `max_new_tokens` = 256 tokens (the
+# default of run_eval and generate), about a thousand characters, so no limit that an honest file can stay under would stop
+# a completion either: the real guard against completion text is `_excerpts_outside_results` (a piece of 39 or more
+# characters of a published verdict excerpt in any other file refuses the export), and a verdict excerpt is at most 200.
+MAX_JSON_STRING = 8000
 PIECE, PIECE_STEP = 32, 8  # a piece of a verdict excerpt of 39 characters or more (PIECE + PIECE_STEP - 1) is found outside results_public/
 
 PROMPTS_FILE, TRANSLATED_FILE = f"{DATASET}/prompts.jsonl", f"{DATASET}/prompts_translated.jsonl"
@@ -372,8 +377,8 @@ def json_strings(value: Any) -> list[str]:
 
 
 def _reliability(raw: bytes) -> dict[str, Any]:
-    """reliability.json decoded and checked for free text: a long string could hold completion text, so it is refused
-    (the message names the top-level key, never the text)."""
+    """reliability.json decoded and checked for a string longer than `MAX_JSON_STRING`, which is refused (the message
+    names the top-level key and the length, never the text)."""
     try:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -385,7 +390,7 @@ def _reliability(raw: bytes) -> dict[str, Any]:
         if longest > MAX_JSON_STRING:
             raise ExportError(
                 f"reliability.json: the value under '{key}' holds a string of {longest} characters, longer than the "
-                f"{MAX_JSON_STRING} this file ever needs; free text that long could hold a completion, so nothing is exported"
+                f"{MAX_JSON_STRING} this file ever needs; something is off (a pasted block of text?), so nothing is exported"
             )
     return data
 
@@ -554,7 +559,8 @@ def _looked_through(text: str) -> list[tuple[str, str]]:
 
 def _views(rel: str, text: str) -> list[tuple[str, str]]:
     """Every way a reader can come to see `text`: as it is, without the characters a reader does not see or the study
-    removes, under NFKC (fullwidth letters), and, for JSON, with the escapes decoded."""
+    removes, under NFKC and NFKD (fullwidth letters, also with a combining mark on each), and, for JSON, with the
+    escapes decoded."""
     views = [("", text), *_looked_through(text)]
     decoded = _json_text(rel, text)
     if decoded is not None:
@@ -568,7 +574,8 @@ def find_leaks(files: Mapping[str, bytes], folders: Sequence[Path] = ()) -> list
     string, the value of a secret environment variable, U+FFFD or a lone surrogate. A text file is scanned as it is, again
     without its invisible characters (`msd.invisible`: zero-width space, joiners, soft hyphen, combining grapheme joiner,
     variation selectors, ..., and combining marks on ASCII letters) and without U+FFFD and lone surrogates, again under
-    NFKC (a fullwidth token), and a JSON file once more with its escapes decoded, so a secret split by any of them is
+    NFKC and NFKD (a fullwidth token, also with a combining mark on each letter), and a JSON file once more with its
+    escapes decoded, so a secret split by any of them is
     found too. Not decoded: percent-encoding and backslash-u written out in a string (a known limit). A message names
     the file (and line) and the kind of thing; it never repeats the thing."""
     own = _folder_strings(folders)

@@ -40,8 +40,8 @@ Refused before any statistics (exit 1 unless said otherwise)
     * the two arms not covering the same harmful prompt ids (counts and a few ids are named; no silent
       intersection);
     * more than one judge id across all rows of all files (one judge per number set);
-    * a judge id that contains "fake" (after Unicode NFKC normalisation, dropping invisible format characters and
-      ignoring case) when --results or --out is, or is inside, the real results directory (exit 2, like
+    * a judge id that contains "fake" (after Unicode NFKD normalisation, dropping U+FFFD, lone surrogates, invisible
+      characters and combining marks on ASCII letters, and ignoring case) when --results or --out is, or is inside, the real results directory (exit 2, like
       run_eval.py);
     * a harmful judge_error rate above `evalrun.JUDGE_ERROR_MAX` (strictly above; judged = complied + refused +
       judge_error, no_response excluded, as run_eval.py counts it) in any verdicts file. This is computed from the
