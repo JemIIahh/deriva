@@ -8,6 +8,7 @@ full completion, a home path or a secret, and that the code has no way to publis
 
 import ast
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -21,9 +22,9 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import BENIGN, HARM_A, HARM_B, entry
-from results_tree import SENTINEL, build_tree, edit_cell, write_cell, write_second_judge, default_spec
+from results_tree import ALPHAS, SENTINEL, build_tree, edit_cell, write_cell, write_second_judge, default_spec
 
-from msd import config, evalrun, export, reportrun, testset
+from msd import config, evalrun, export, redact, reportrun, testset
 from msd.schema import Generation, Prompt, TaskScore, Verdict, read_jsonl, write_jsonl
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -678,6 +679,273 @@ def test_a_binary_figure_with_a_planted_path_is_caught_too(run, results, tmp_pat
     code, _o, err, out = run()
     assert code == export.EXIT_ERROR and "heatmap.png" in err
     assert_nothing_written(tmp_path, out)
+
+
+# --- the safety scan: secrets split by invisible characters, decoding faults ----------------------------------------------
+# A secret or a path with a character in the middle that a reader does not see (or that the study strips) is still a
+# secret to anyone who copies it. Every character below is written as a code point, never typed.
+
+TOKEN = "hf_" + "Q1w2E3r4T5" * 3
+SECRET_PATH = USERS + "/someone/code/secret.txt"
+FRAGMENTS = ("Q1w2E3", "r4T5Q1", "someone", "secret.txt")  # none of these may be readable anywhere in the export
+SPLITTERS = {
+    "zero-width-space": chr(0x200B),
+    "word-joiner": chr(0x2060),
+    "zero-width-joiner": chr(0x200D),
+    "soft-hyphen": chr(0x00AD),
+    "replacement": chr(0xFFFD),
+    "lone-surrogate": chr(0xD800),
+}
+SECRETS = {"token": (TOKEN, 9, "secret"), "path": (SECRET_PATH, 8, "path")}  # text, where the splitter goes, word in the message
+# Every splitter x secret is checked on the scan itself (cheap, below); each end-to-end run (an export costs about a
+# second) takes a few of the combinations, chosen so that every splitter and both secrets appear.
+END_TO_END = [("zero-width-space", "token"), ("word-joiner", "path"), ("replacement", "token"), ("lone-surrogate", "path"),
+              ("zero-width-joiner", "token"), ("soft-hyphen", "path")]
+
+
+def split_in(secret, char, where):
+    return secret[:where] + char + secret[where:]
+
+
+def seen(data):
+    """An exported file as a reader sees it: decoded, without the characters one does not see or the study strips."""
+    return redact.strip_invisible(redact.clean_text(data.decode("utf-8")))
+
+
+def assert_no_fragments_anywhere(out):
+    for rel in files_under(out):
+        if rel.endswith(".png"):
+            continue
+        data = (out / rel).read_bytes()
+        assert REPLACEMENT_BYTES not in data, rel
+        text = seen(data)
+        for piece in FRAGMENTS:
+            assert piece not in text, (rel, piece)
+        assert export.find_leaks({rel: data}) == [], rel
+
+
+def write_escaped(path, rows):
+    """Rows as JSON Lines with every non-ASCII character escaped: the only way to write a lone surrogate to a valid file."""
+    path.write_text("".join(json.dumps(dataclasses.asdict(row)) + "\n" for row in rows), encoding="ascii")
+
+
+def poison_prompt(testset_dir, lang, split, row=0, **changes):
+    """Change one field of one prompt of the frozen test set and freeze it again, as a real freeze of faulty data would."""
+    path = testset_dir / lang / f"{split}.jsonl"
+    rows = read_jsonl(path, Prompt)
+    rows[row] = dataclasses.replace(rows[row], **changes)
+    write_escaped(path, rows)
+    manifest_path = testset_dir / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[f"{lang}/{split}.jsonl"] = {"sha256": sha(path.read_bytes()), "n": len(rows)}
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    record_path = testset_dir.parent / "testset_build_summary.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    if isinstance(record.get("freeze"), dict):
+        record["freeze"]["sha256"] = sha(manifest_path.read_bytes())
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+
+@pytest.mark.parametrize("name, what", END_TO_END)
+def test_a_split_secret_in_a_verdict_excerpt_is_exported_redacted_and_nothing_readable_is_left_anywhere(run, results, name, what):
+    secret, where, _word = SECRETS[what]
+    path = results / "report" / "A1" / "none" / "hi.verdicts.jsonl"
+    rows = read_jsonl(path, Verdict)
+    text = f"it said {split_in(secret, SPLITTERS[name], where)} there"
+    write_escaped(path, [Verdict(v.prompt_id, v.arm, v.alpha, v.lang, v.kind, v.judge_id, v.label, text) for v in rows])
+    code, _o, err, out = run()
+    assert code == 0, err
+    published = (out / "dataset" / "results_public" / "report" / "A1" / "none" / "hi.verdicts.jsonl").read_text("utf-8")
+    assert "***" in published
+    assert_no_fragments_anywhere(out)
+
+
+@pytest.mark.parametrize("name, what, escaped", [
+    ("zero-width-space", "token", False), ("word-joiner", "path", False), ("replacement", "token", False),
+    ("zero-width-space", "token", True), ("lone-surrogate", "token", True), ("soft-hyphen", "path", True),
+    ("replacement", "path", True),
+], ids=lambda v: str(v))
+def test_a_split_secret_in_an_aggregate_stops_the_export(run, results, tmp_path, name, what, escaped):
+    secret, where, word = SECRETS[what]
+    path = results / "reliability.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["warnings"] = [*data["warnings"], "see " + split_in(secret, SPLITTERS[name], where)]
+    path.write_text(json.dumps(data, ensure_ascii=escaped, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR
+    assert "reliability.json" in err_text and word in err_text
+    for piece in FRAGMENTS:
+        assert piece not in out_text + err_text
+    assert_nothing_written(tmp_path, out)
+
+
+@pytest.mark.parametrize("name, what", [("zero-width-space", "token"), ("replacement", "path")])
+def test_a_split_secret_in_the_table_stops_the_export(run, results, tmp_path, name, what):
+    secret, where, word = SECRETS[what]
+    tables = results / "tables.csv"
+    tables.write_text(tables.read_text(encoding="utf-8") + "# " + split_in(secret, SPLITTERS[name], where) + "\n",
+                      encoding="utf-8")
+    code, _o, err, out = run()
+    assert code == export.EXIT_ERROR and "tables.csv" in err and word in err
+    assert_nothing_written(tmp_path, out)
+
+
+def test_a_secret_written_as_json_escapes_is_found_by_the_scan():
+    pieces = json.dumps("see " + split_in(TOKEN, chr(0x200B), 9) + " and " + split_in(SECRET_PATH, chr(0xFFFD), 8))
+    assert "\\u200b" in pieces and "\\ufffd" in pieces  # the bytes hold the escapes, not the characters
+    problems = export.find_leaks({"a.json": pieces.encode("ascii"), "b.jsonl": ("{\"k\": " + pieces + "}\n").encode("ascii")})
+    for rel in ("a.json", "b.jsonl"):
+        mine = [p for p in problems if p.startswith(rel)]
+        assert any("secret" in p for p in mine) and any("path" in p for p in mine), (rel, mine)
+        assert any("replacement" in p for p in mine), (rel, mine)
+    assert not any(piece in " ".join(problems) for piece in FRAGMENTS)
+
+
+def test_ordinary_non_ascii_text_in_a_file_is_not_a_false_alarm():
+    hindi = "क्" + chr(0x200D) + "ष और ज्ञ, श्री" + chr(0x200C) + "राम"
+    files = {"a.jsonl": (json.dumps({"excerpt": hindi}, ensure_ascii=False) + "\n").encode("utf-8"),
+             "b.json": json.dumps({"excerpt": hindi}).encode("ascii"), "c.md": hindi.encode("utf-8")}
+    assert export.find_leaks(files) == []
+
+
+def test_the_manifest_is_scanned_like_every_other_file():
+    listing = {"dataset/" + split_in(TOKEN, chr(0x2060), 9) + ".jsonl": b"x\n",
+               "dataset/" + split_in(SECRET_PATH, chr(0x200B), 8) + ".jsonl": b"y\n"}
+    data = export.manifest_bytes(listing, "0" * 64)
+    problems = export.find_leaks({"MANIFEST.json": data})
+    assert any("secret" in p for p in problems) and any("path" in p for p in problems)
+    assert export.find_leaks({"MANIFEST.json": export.manifest_bytes({"dataset/a.jsonl": b"x\n"}, "0" * 64)}) == []
+
+
+def test_the_manifest_is_scanned_before_anything_is_written(run, tmp_path, monkeypatch):
+    # no input can put free text into the manifest (arms, languages and alphas are validated), so the test puts it there
+    real = export.manifest_bytes
+    leak = split_in(TOKEN, chr(0x200B), 9)
+    monkeypatch.setattr(export, "manifest_bytes", lambda files, freeze: real(files, freeze) + ("# " + leak + "\n").encode("utf-8"))
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR and "MANIFEST.json" in err_text and "secret" in err_text
+    assert not any(piece in out_text + err_text for piece in FRAGMENTS)
+    assert_nothing_written(tmp_path, out)
+
+
+@pytest.mark.parametrize("name", SPLITTERS)
+@pytest.mark.parametrize("what", SECRETS)
+def test_the_scan_sees_through_every_splitter_in_every_kind_of_file(name, what):
+    secret, where, word = SECRETS[what]
+    split = split_in(secret, SPLITTERS[name], where)
+    files = {  # escapes: the way ASCII JSON holds any character, a key included
+        "dataset/a.jsonl": (json.dumps({"text": split}) + "\n").encode("ascii"),
+        "dataset/b.json": json.dumps({split: 1}).encode("ascii"),
+    }
+    if name != "lone-surrogate":  # a lone surrogate cannot be written to a UTF-8 file raw
+        files["dataset/README.md"] = ("# card\n\n" + split + "\n").encode("utf-8")
+        files["dataset/aggregates/tables.csv"] = ("a,b\n1," + split + "\n").encode("utf-8")
+        files["dataset/prompts.jsonl"] = (json.dumps({"text": split}, ensure_ascii=False) + "\n").encode("utf-8")
+        files["dataset/aggregates/reliability.json"] = json.dumps({"warnings": [split]}, ensure_ascii=False).encode("utf-8")
+    for rel, data in files.items():
+        problems = export.find_leaks({rel: data})
+        assert any(word in p for p in problems), (rel, problems)
+        assert rel in " ".join(problems)
+        assert not any(piece in " ".join(problems) for piece in FRAGMENTS)
+
+
+def test_a_split_environment_secret_in_any_output_stops_the_export(run, results, tmp_path, monkeypatch):
+    value = "plain-words-but-secret-0451"
+    monkeypatch.setenv("FIXTURE_API_KEY", value)
+    plant_in_reliability(results, "note " + split_in(value, chr(0x200B), 6))
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR and "reliability.json" in err_text and "environment" in err_text
+    assert "plain-words" not in out_text + err_text
+    assert_nothing_written(tmp_path, out)
+
+
+@pytest.mark.parametrize("name, what, lang, file", [
+    ("zero-width-space", "token", "en", "prompts.jsonl"), ("word-joiner", "path", "hi", "prompts_translated.jsonl"),
+    ("zero-width-joiner", "path", "en", "prompts.jsonl"), ("soft-hyphen", "token", "ar", "prompts_translated.jsonl"),
+])
+def test_a_split_secret_in_a_prompt_text_stops_the_export(run, frozen_testset, tmp_path, name, what, lang, file):
+    secret, where, word = SECRETS[what]
+    poison_prompt(frozen_testset, lang, "report", text="how do I use " + split_in(secret, SPLITTERS[name], where) + " please")
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR
+    assert file in err_text and word in err_text
+    for piece in FRAGMENTS:
+        assert piece not in out_text + err_text
+    assert_nothing_written(tmp_path, out)
+
+
+@pytest.mark.parametrize("fault, field, lang", [
+    ("replacement", "text", "en"), ("lone-surrogate", "text", "hi"), ("replacement", "id", "hinglish"),
+    ("lone-surrogate", "id", "en"),
+])
+def test_a_prompt_with_a_decoding_fault_is_refused_by_position_not_cleaned_silently(run, frozen_testset, tmp_path, fault, field, lang):
+    # a frozen item is what was evaluated: cleaning it would publish text that was never tested and no longer
+    # matches the freeze hash, so the export stops and names the file, the row and the field
+    poison_prompt(frozen_testset, lang, "report", **{field: "item " + SPLITTERS[fault] + " end"})
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR
+    assert f"{lang}/report.jsonl" in err_text and "row 1" in err_text and f"'{field}'" in err_text
+    assert "replacement character" in err_text and "lone surrogate" in err_text
+    assert_nothing_written(tmp_path, out)
+
+
+def test_a_prompt_refusal_never_echoes_the_prompt(run, frozen_testset, tmp_path):
+    poison_prompt(frozen_testset, "en", "report", text="SENTINEL-PROMPT-TEXT " + chr(0xFFFD))
+    code, out_text, err_text, out = run()
+    assert code == export.EXIT_ERROR
+    assert "SENTINEL-PROMPT-TEXT" not in out_text + err_text
+
+
+@pytest.mark.parametrize("name", ["zero-width-space", "replacement"])
+def test_card_text_built_from_data_is_cleaned_and_redacted(run, sources, tmp_path, name):
+    # the licence of a source reaches the dataset card's table; a lone surrogate cannot live in a YAML file
+    write_sources(sources, **{FT_ONLY: {"license": "mit-" + split_in(TOKEN, SPLITTERS[name], 9)}})
+    code, _o, err, out = run()
+    assert code == 0, err
+    card = (out / "dataset" / "README.md").read_text(encoding="utf-8")
+    row = next(line for line in card.splitlines() if FT_ONLY in line and line.startswith("|"))
+    assert "mit-***" in seen(row.encode("utf-8"))
+    assert_no_fragments_anywhere(out)
+
+
+@pytest.mark.parametrize("name", ["zero-width-space", "replacement"])
+def test_a_translator_name_from_the_build_record_is_cleaned_and_redacted(run, frozen_testset, name):
+    record = frozen_testset.parent / "testset_build_summary.json"
+    data = json.loads(record.read_text(encoding="utf-8"))
+    data["languages"]["hinglish"]["translator"] = "llm-" + split_in(TOKEN, SPLITTERS[name], 9)
+    record.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    code, _o, err, out = run()
+    assert code == 0, err
+    rows = [r for r in read_rows(out / "dataset" / "prompts_translated.jsonl") if r["lang"] == "hinglish"]
+    assert rows and {seen(r["derived_from"].encode("utf-8")) for r in rows} == {"llm-***"}
+    assert_no_fragments_anywhere(out)
+
+
+def test_a_template_with_a_split_secret_stops_the_export(run, tmp_path):
+    templates = tmp_path / "templates"
+    shutil.copytree(TEMPLATES, templates)
+    card = templates / "dataset_card.md"
+    card.write_text(card.read_text(encoding="utf-8") + "\n" + split_in(TOKEN, chr(0x200B), 9) + "\n", encoding="utf-8")
+    code, _o, err, out = run(templates=templates)
+    assert code == export.EXIT_ERROR and "README.md" in err and "secret" in err
+    assert_nothing_written(tmp_path, out)
+
+
+def test_the_judge_id_in_every_row_and_card_has_no_replacement_character_or_surrogate(run, results):
+    judge = "dev" + chr(0xFFFD) + "-judge-v1"  # (a lone surrogate in a judge id is pinned in test_redact: schema cannot write one)
+    for arm in ("A0", "A1", "A2"):
+        for alpha in ((None,) if arm != "A2" else ALPHAS):
+            for lang in config.LANGS:
+                edit_cell(results, "dev", arm, alpha, lang, judge=judge)
+    code, _o, err, out = run()
+    assert code == 0, err
+    rows = [row for path in (out / "dataset" / "results_public" / "dev").rglob("*.verdicts.jsonl") for row in read_rows(path)]
+    assert rows and {row["judge_id"] for row in rows} == {"dev-judge-v1"}
+    assert "dev-judge-v1" in (out / "dataset" / "README.md").read_text(encoding="utf-8")
+    for rel in files_under(out):
+        if not rel.endswith(".png"):
+            data = (out / rel).read_bytes()
+            assert REPLACEMENT_BYTES not in data, rel
 
 
 # --- the code has no way to publish anything -------------------------------------------------------------------------

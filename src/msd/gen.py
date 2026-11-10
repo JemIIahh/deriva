@@ -57,7 +57,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from msd.config import ARMS, LANGS
 from msd.schema import SPLITS, Generation, Prompt
@@ -467,13 +467,24 @@ _SECRET_ENV_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|API_?KEY|KEY", re.IGNORECA
 _MIN_SECRET_LEN = 8
 
 
+def secret_env_values() -> tuple[str, ...]:
+    """The values of the secret-looking environment variables (long enough to be one). A caller that redacts many
+    strings reads them once and passes them to `redact_with`."""
+    return tuple(value for name, value in os.environ.items()
+                 if len(value) >= _MIN_SECRET_LEN and _SECRET_ENV_NAME.search(name))
+
+
+def redact_with(text: str, secrets: Iterable[str]) -> str:
+    """`text` with anything token-shaped, and every value in `secrets`, replaced by ***."""
+    text = _TOKEN_SHAPED.sub("***", text)
+    for value in secrets:
+        text = text.replace(value, "***")
+    return text
+
+
 def _redact(text: str) -> str:
     """Replace anything token-shaped, and the value of any secret-looking environment variable, with ***."""
-    text = _TOKEN_SHAPED.sub("***", text)
-    for name, value in os.environ.items():
-        if len(value) >= _MIN_SECRET_LEN and _SECRET_ENV_NAME.search(name):
-            text = text.replace(value, "***")
-    return text
+    return redact_with(text, secret_env_values())
 
 
 def git_commit(cwd: str | Path | None = None) -> str | None:

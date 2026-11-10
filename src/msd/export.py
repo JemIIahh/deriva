@@ -30,10 +30,18 @@ What is read, and what never is
     excluded, or missing from the manifest is refused by name (`msd.testset.check_usable`).
 
 The safety scan
-    Before anything is written, every file about to be exported is scanned: no home path (macOS, Linux or Windows),
-    none of the input or output folders' own paths, no string shaped like a token or key, no value of a secret-looking
-    environment variable, and no U+FFFD. A hit refuses the whole export and names the file and the kind of thing, never
-    the thing itself.
+    Before anything is written, every file about to be exported (the manifest too) is scanned: no home path (macOS,
+    Linux or Windows), none of the input or output folders' own paths, no string shaped like a token or key, no value of
+    a secret-looking environment variable, and no U+FFFD or lone surrogate. A file is scanned as it is, again without the
+    characters a reader does not see (zero-width space, joiners, soft hyphen, ...) and without U+FFFD and lone surrogates,
+    and a JSON file once more with its escapes decoded: a secret split by any of them is still a secret. A hit refuses the
+    whole export and names the file and the kind of thing, never the thing itself.
+
+Free text from data
+    Verdict rows, ids, judge ids and every string a card prints from data (source names and licences, translator names)
+    pass through `msd.redact.public_text`: cleaned, then redacted. Prompts are the exception: a frozen item is what was
+    evaluated, so it is neither cleaned nor redacted. A prompt with U+FFFD or a lone surrogate is refused by file, row and
+    field, and a prompt with a secret or a path in it is refused by the scan.
 
 Cards
     Templates are plain markdown with `{{name}}` placeholders. A placeholder without a value, a blank value, or a
@@ -177,7 +185,7 @@ def _translators(summary_path: Path, freeze_sha: str) -> dict[str, str]:
                 f"the build record says {lang} was 'translated' with the identity translator: its texts are copies of "
                 "the English ones, not translations, and must not be published"
             )
-        found[lang] = name.strip()
+        found[lang] = redact.public_text(name.strip())  # it is printed in a card and on every translated row
     return found
 
 
@@ -206,6 +214,9 @@ def _check_sources(rows: Sequence[Prompt], manifest: Sequence[Mapping[str, Any]]
             )
 
 
+_PROMPT_FIELDS = ("id", "lang", "kind", "split", "source", "license", "text")  # the fields of a Prompt that are published
+
+
 def _read_prompts(testset_dir: Path) -> list[Prompt]:
     rows: list[Prompt] = []
     for lang in LANGS:
@@ -215,7 +226,15 @@ def _read_prompts(testset_dir: Path) -> list[Prompt]:
                 part = read_jsonl(path, Prompt)
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 raise ExportError(f"{lang}/{split}.jsonl cannot be read as prompts ({type(exc).__name__})") from None
-            for row in part:
+            for number, row in enumerate(part, 1):
+                for field in _PROMPT_FIELDS:
+                    value = getattr(row, field)
+                    if redact.clean_text(value) != value:
+                        raise ExportError(
+                            f"{lang}/{split}.jsonl row {number}: the '{field}' holds a replacement character (U+FFFD) or a "
+                            "lone surrogate, a decoding fault upstream. A frozen item is what was evaluated, so it is not "
+                            "cleaned here: fix it at its source, then rebuild and freeze the test set"
+                        )
                 if row.lang != lang or row.split != split:
                     raise ExportError(f"{lang}/{split}.jsonl holds a row for {row.lang}/{row.split}; the test set is inconsistent")
             rows.extend(part)
@@ -262,7 +281,7 @@ def _read_results(results: Path, notes: list[str]) -> Results:
             notes.append(f"no dev split under {results}: the export holds the report split only")
             found.judges[split] = None
             continue
-        found.judges[split] = None if loaded.judge_id is None else redact.redact_text(loaded.judge_id)
+        found.judges[split] = None if loaded.judge_id is None else redact.public_text(loaded.judge_id)
         for cell in loaded.cells.values():
             found.arms.add(cell.arm)
             if cell.verdicts:
@@ -341,9 +360,9 @@ def _repair_line(arm: str, chosen: float | None) -> str:
     return "No repair step was applied to this model."
 
 
-def _cell(text: str) -> str:
-    """A table cell: one line, the pipe escaped."""
-    return " ".join(str(text).split()).replace("|", "\\|")
+def _cell(text: Any) -> str:
+    """A table cell: cleaned and redacted like every string from data (`redact.public_text`), one line, the pipe escaped."""
+    return " ".join(redact.public_text(str(text)).split()).replace("|", "\\|")
 
 
 def _sources_table(manifest: Sequence[Mapping[str, Any]], english: Sequence[Mapping[str, Any]]) -> str:
@@ -353,7 +372,8 @@ def _sources_table(manifest: Sequence[Mapping[str, Any]], english: Sequence[Mapp
         if e["used_for"] == "excluded":
             continue
         shared = "no (evaluation only)" if e.get("redistribute") is False else "yes"
-        lines.append(f"| [{_cell(e['name'])}]({e['url']}) | {_cell(e['license'])} | {e['used_for']} | {shared} | {counts[e['name']]} |")
+        lines.append(f"| [{_cell(e['name'])}]({_cell(e['url'])}) | {_cell(e['license'])} | {_cell(e['used_for'])} | {shared} | "
+                     f"{counts[e['name']]} |")
     return "\n".join(lines)
 
 
@@ -374,17 +394,12 @@ def _translators_table(translators: Mapping[str, str]) -> str:
 
 # --- the safety scan ------------------------------------------------------------------------------------------------
 
-_HOME_PATH = re.compile(rb"(?<![\w.~-])/(?:Users|home)/[A-Za-z0-9._-]+")
-_WINDOWS_PATH = re.compile(rb"(?<![A-Za-z])[A-Za-z]:[\\/]+(?:Users|Documents and Settings)")
-_SECRET_SHAPES = (
-    ("a Hugging Face token", re.compile(rb"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{16,}")),
-    ("an API key", re.compile(rb"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}")),
-    ("a GitHub token", re.compile(rb"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
-    ("an AWS key id", re.compile(rb"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}")),
-    ("a private key", re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-)
+_HOME_PATTERNS = tuple(re.compile(p.encode("ascii")) for p in (redact.HOME_PATH, redact.WINDOWS_PATH))
+_SECRET_PATTERNS = tuple((kind, re.compile(p.encode("ascii"))) for kind, p in redact.SECRET_SHAPES)
 _REPLACEMENT_BYTES = bytes([0xEF, 0xBF, 0xBD])  # U+FFFD in UTF-8
 _BINARY = (".png",)
+_HIDDEN = " (hidden by characters a reader does not see)"
+_ESCAPED = " (written as JSON escapes)"
 
 
 def _folder_strings(folders: Sequence[Path]) -> list[bytes]:
@@ -396,41 +411,104 @@ def _folder_strings(folders: Sequence[Path]) -> list[bytes]:
     return sorted(found)
 
 
+def _matches(data: bytes, own: Sequence[bytes]) -> list[tuple[int, str]]:
+    """(offset, what) of every path, folder path and secret shape in `data`."""
+    hits = [(m.start(), "an absolute path (a home folder)") for pattern in _HOME_PATTERNS for m in pattern.finditer(data)]
+    for folder in own:
+        start = data.find(folder)
+        if start >= 0:
+            hits.append((start, "an absolute path (the path of an input or output folder of this run)"))
+    hits += [(m.start(), f"a secret-shaped string ({kind})") for kind, pattern in _SECRET_PATTERNS for m in pattern.finditer(data)]
+    return hits
+
+
+def _line(data: bytes, offset: int) -> int:
+    return data.count(b"\n", 0, offset) + 1
+
+
+def _json_strings(rel: str, text: str) -> str | None:
+    """Every string and key in a .json file (or in each line of a .jsonl file), one per line, as the JSON reader decodes
+    them (so `\\u200b` is the zero-width space it stands for); None for any other file or text that is not JSON."""
+    if rel.endswith(".json"):
+        chunks = [text]
+    elif rel.endswith(".jsonl"):
+        chunks = [line for line in text.split("\n") if line.strip()]
+    else:
+        return None
+    found: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            found.append(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                found.append(str(key))
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for chunk in chunks:
+        try:
+            walk(json.loads(chunk))
+        except (ValueError, RecursionError):
+            return None
+    return "\n".join(found)
+
+
+def _views(rel: str, text: str) -> list[tuple[str, str]]:
+    """Every way a reader can come to see `text`: as it is, without the characters a reader does not see or the study
+    removes (`redact.clean_text`, `redact.strip_invisible`), and, for JSON, with the escapes decoded."""
+    views = [("", text)]
+    hidden = redact.strip_invisible(redact.clean_text(text))
+    if hidden != text:
+        views.append((_HIDDEN, hidden))
+    decoded = _json_strings(rel, text)
+    if decoded is not None:
+        views.append((_ESCAPED, decoded))
+        views.append((_ESCAPED + _HIDDEN, redact.strip_invisible(redact.clean_text(decoded))))
+    return views
+
+
 def find_leaks(files: Mapping[str, bytes], folders: Sequence[Path] = ()) -> list[str]:
     """One message per problem in `files` (path -> bytes): a home path, the path of one of `folders`, a secret-shaped
-    string, the value of a secret environment variable, U+FFFD. A message names the file (and line) and the kind of
-    thing; it never repeats the thing."""
+    string, the value of a secret environment variable, U+FFFD or a lone surrogate. A text file is scanned as it is, again
+    without its invisible characters (zero-width space, joiners, word joiner, soft hyphen, ...) and without U+FFFD and lone
+    surrogates, and a JSON file once more with its escapes decoded, so a secret split by any of them is found too. A
+    message names the file (and line) and the kind of thing; it never repeats the thing."""
     own = _folder_strings(folders)
+    secrets = gen.secret_env_values()
     problems: list[str] = []
-
-    def at(rel: str, data: bytes, start: int, what: str) -> None:
-        line = data.count(b"\n", 0, start) + 1
-        problems.append(f"{rel}:{line}: contains {what}")
-
     for rel in sorted(files):
         data = files[rel]
-        binary = rel.endswith(_BINARY)
-        for pattern in (_HOME_PATH, _WINDOWS_PATH):
-            for m in pattern.finditer(data):
-                at(rel, data, m.start(), "an absolute path (a home folder)")
-        for folder in own:
-            start = data.find(folder)
-            if start >= 0:
-                at(rel, data, start, "an absolute path (the path of an input or output folder of this run)")
-        for kind, pattern in _SECRET_SHAPES:
-            for m in pattern.finditer(data):
-                at(rel, data, m.start(), f"a secret-shaped string ({kind})")
-        if binary:
-            continue
-        if _REPLACEMENT_BYTES in data:
-            at(rel, data, data.index(_REPLACEMENT_BYTES), "the replacement character U+FFFD (a decoding fault upstream)")
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            problems.append(f"{rel}: is not valid UTF-8")
-            continue
-        if gen._redact(text) != text and not any(p.startswith(f"{rel}:") and "secret-shaped" in p for p in problems):
-            problems.append(f"{rel}: contains the value of a secret environment variable")
+        views = [("", data)]
+        texts: list[str] = []
+        if not rel.endswith(_BINARY):
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                problems.append(f"{rel}: is not valid UTF-8")
+                continue
+            if _REPLACEMENT_BYTES in data:
+                problems.append(f"{rel}:{_line(data, data.index(_REPLACEMENT_BYTES))}: contains the replacement "
+                                "character U+FFFD (a decoding fault upstream)")
+            seen = _views(rel, text)
+            texts = [view for _note, view in seen]
+            views = [(note, view.encode("utf-8", "surrogatepass")) for note, view in seen]
+            decoded = [view for note, view in seen if note == _ESCAPED]
+            if decoded and redact.clean_text(decoded[0]) != decoded[0]:
+                problems.append(f"{rel}: contains a replacement character (U+FFFD) or a lone surrogate{_ESCAPED}")
+        found: set[str] = set()
+        for note, blob in views:
+            for start, what in sorted(_matches(blob, own)):
+                if note and what in found:
+                    continue  # already reported for the file as it is
+                found.add(what)
+                where = f":{_line(blob, start)}" if _ESCAPED not in note else ""
+                problems.append(f"{rel}{where}: contains {what}{note}")
+        if texts and not any("secret-shaped" in what for what in found):
+            if any(gen.redact_with(view, secrets) != view for view in texts):
+                problems.append(f"{rel}: contains the value of a secret environment variable")
     return problems
 
 
