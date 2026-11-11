@@ -11,7 +11,7 @@ article is good, and it does not read the results. The rules, in the order they 
                      (use level 3 for subsections). Headings inside code blocks are ignored.
   heading-levels     no heading level is skipped (a level 4 under a level 2 is an error).
   source-licenses    every entry of the source list that is not `excluded` is named, with its licence, on one line of
-                     the "Models and licenses" or the "Datasets and licenses" section. An entry with
+                     the "Models used and their licenses" or the "Datasets and benchmarks used and their licenses" section. An entry with
                      `redistribute: false` must also say "evaluation only" on that line.
   licenses-and-tools the licences and tools the study depends on are written out (Tiny Aya's licence, gated access
                      and use policy; AlignTune MIT with its CuratorKIT dependency under LSAL-1.1; unsloth AGPL and
@@ -32,8 +32,8 @@ article is good, and it does not read the results. The rules, in the order they 
 Exit codes: 0 every rule passed; 1 at least one rule failed (each is printed as "FAIL [rule] line N: what is wrong");
 2 a usage problem (a file cannot be read, the source list is malformed).
 
-The headings are the sections of the organizers' submission checklist as the project brief words them. The checklist
-slide (reference/kickoff-slides-text.txt, slide 29) words several of them longer; if the organizers want their wording,
+The headings are the nine sections of the organizers' submission checklist, word for word as slide 29 of
+reference/kickoff-slides-text.txt gives them (a test compares them with that file). If the organizers change a title,
 change REQUIRED_HEADINGS and the article's headings together.
 """
 
@@ -50,19 +50,20 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from msd.sources import load_sources  # noqa: E402
 
+# The nine section titles of the organizers' submission checklist (reference/kickoff-slides-text.txt, slide 29), word for word.
 REQUIRED_HEADINGS: tuple[str, ...] = (
-    "Problem and approach",
-    "Repos used and for what",
-    "Models and licenses",
-    "Datasets and licenses",
-    "Model collection",
-    "Data collection",
-    "Experiments and what else was tried",
-    "Approach with before/after results",
-    "Teammates",
+    "Problem statement and approach, in brief",
+    "Hackathon repos used: which ones, for what, and which features",
+    "Models used and their licenses",
+    "Datasets and benchmarks used and their licenses",
+    "Model artifacts (weights, adapters, …) public, as an HF collection",
+    "Data artifacts (datasets, logs, benchmarks, …) public, as an HF collection",
+    "Experiments run, findings and what else was tested",
+    "With more credits: your approach, before and after results",
+    "Teammates tagged",
 )
-MODELS, DATASETS, REPOS = "Models and licenses", "Datasets and licenses", "Repos used and for what"
-DATA_COLLECTION = "Data collection"
+REPOS, MODELS, DATASETS = REQUIRED_HEADINGS[1], REQUIRED_HEADINGS[2], REQUIRED_HEADINGS[3]
+MODEL_ARTIFACTS, DATA_ARTIFACTS, TEAMMATES = REQUIRED_HEADINGS[4], REQUIRED_HEADINGS[5], REQUIRED_HEADINGS[8]
 
 MARKER_KINDS: tuple[str, ...] = ("RESULT", "LINK", "OWNER")
 MIN_PROSE_WORDS = 12  # a section with fewer words of its own (links and placeholders do not count) is "links only"
@@ -178,7 +179,7 @@ REQUIRED_MENTIONS: tuple[Mention, ...] = (
     Mention("that the AlignTune package bundles unsloth, which has AGPL parts", (REPOS, MODELS), (r"unsloth", r"agpl")),
     Mention("that the AlignTune package bundles mergekit, which is LGPL", (REPOS, MODELS), (r"mergekit", r"lgpl")),
     Mention("that only the TRL backend of AlignTune is used", (REPOS, MODELS), (r"\btrl\b", r"backend")),
-    Mention("NLLB and its CC-BY-NC licence, for the machine translations", (REPOS, MODELS, DATASETS, DATA_COLLECTION), (r"nllb", _lic("CC-BY-NC"))),
+    Mention("NLLB and its CC-BY-NC licence, for the machine translations", (REPOS, MODELS, DATASETS, DATA_ARTIFACTS), (r"nllb", _lic("CC-BY-NC"))),
     Mention("the MultiJail ethics statement", (DATASETS,), (r"multijail", r"ethics statement")),
     Mention("SafeTune, the repair toolkit, and what it is used for", (REPOS,), (r"safetune",)),
     Mention("AuditKIT, and whether it was used", (REPOS,), (r"auditkit",)),
@@ -431,7 +432,7 @@ def check_disclosure(doc: Doc, report: Report) -> None:
     report.add(
         "disclosure",
         "No paragraph says that Claude Code, an AI coding assistant, helped build the work. Add one plain paragraph "
-        "that names Claude Code and says it is an AI assistant (the 'Teammates' section is the natural place).",
+        "that names Claude Code and says it is an AI assistant (the 'Teammates tagged' section is the natural place).",
     )
 
 
@@ -495,7 +496,7 @@ def check_figures(doc: Doc, article: Path, fill_in: str | None, report: Report) 
         report.add(
             "figures",
             "The per-language heatmap is not shown. Add an image whose file name contains 'heatmap' "
-            "(for example ![Heatmap of ...](heatmap.png)) to the before/after section.",
+            "(for example ![Heatmap of ...](heatmap.png)) to the before and after results section.",
         )
     for number, _, path in figures:
         if not _is_local(path):

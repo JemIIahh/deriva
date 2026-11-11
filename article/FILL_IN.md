@@ -13,7 +13,7 @@ Value paths below are relative to the repository, after the report and the expor
 
 ## Placeholders, one line each
 
-- `<<OWNER: author name as it should appear>>`: the owner. Appears in the byline and in Teammates; use the same name in both.
+- `<<OWNER: author name as it should appear>>`: the owner. Appears in the byline and in the last section (Teammates tagged); use the same name in both.
 - `<<LINK: code repository>>`: the URL of the public code repository, after the owner publishes it.
 - `<<LINK: dataset on Hugging Face>>`: the URL of the dataset the owner uploads from `export/dataset/` (its card is `export/dataset/README.md`).
 - `<<LINK: model collection on Hugging Face>>`: the URL of the model collection the owner creates for the arms in `export/models/`.
@@ -56,7 +56,7 @@ Value paths below are relative to the repository, after the report and the expor
 - `<<LINK: reproduction notebook>>`: the URL of notebooks/reproduce.ipynb as published in the code repository (or its Kaggle or Colab copy).
 - `<<RESULT: reproduction check outcome>>`: the notebook's own pass or fail line: the sha256 of the rebuilt `tables.csv` against the `export/MANIFEST.json` entry. Write it as the notebook prints it.
 - `<<OWNER: confirm what you personally checked, for example the sources, the design decisions and the results>>`: the owner, in one plain sentence about what they checked. Do not claim more than they did.
-- `<<OWNER: decision to keep this disclosure paragraph>>`: the owner decides whether to keep the Claude Code disclosure paragraph in Teammates. The checker requires a paragraph that names Claude Code, so keep it unless the check rules change.
+- `<<OWNER: decision to keep this disclosure paragraph>>`: the owner decides whether to keep the Claude Code disclosure paragraph in the last section (Teammates tagged). The checker requires a paragraph that names Claude Code, so keep it unless the check rules change.
 
 ## Figures still to be added
 
@@ -77,4 +77,5 @@ These statements in the draft were written from the repository as it stood when 
 - SafeTune and its licence: see the SafeTune marker above. The DARE default (rate 0.3, seed 0) and the alpha grid are from `src/msd/config.py` and `docs/toolkit-notes.md`; recheck them if the code changes.
 - The gate's pass rates (0%, 0.3%, 25%, 51%, 84%, about 43%) are a reviewer's simulation at 150 harmful prompts per language, copied as the review recorded them. The simulation settings are not saved in the repository.
 - Limits that come from the working log: held-out interval about 7 points, dev floor 31% against 27 to 28%, 18 near-duplicate template pairs (4 at 0.8 or more), one source twin (astronomy test items 9 and 116). Recompute them if the data is rebuilt.
-- The checklist's own wording of the nine section titles is longer than the project brief's (the slide at `reference/kickoff-slides-text.txt`, slide 29). The article and `scripts/check_article.py` use the brief's titles. If the organizers want theirs, change `REQUIRED_HEADINGS` in the script and the article's headings together.
+- The nine level-2 headings are the organizers' checklist titles, word for word (slide 29 of `reference/kickoff-slides-text.txt`; a test compares them). If the organizers change a title, change `REQUIRED_HEADINGS` in `scripts/check_article.py` and the article's headings together.
+- The sentence under the "With more credits" heading says that no extra credits were used, only free Colab or Kaggle compute. If the final run used anything else, change that sentence and the GPU marker together.

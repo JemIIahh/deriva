@@ -8,7 +8,7 @@ In one line: <<RESULT: headline answer in one sentence>>
 
 This is a research study. Nothing in it is a safety guarantee for any model.
 
-## Problem and approach
+## Problem statement and approach, in brief
 
 People often fine-tune a small language model for a narrow, harmless job, such as answering exam questions. Fine-tuning changes the model's weights, the numbers inside it that decide what it writes. The worry is that this can weaken the model's safety training even when every training example is harmless. A second worry is that the weakening is not the same in every language. These are worries, not findings. This study measures them.
 
@@ -41,7 +41,7 @@ Two measures are used throughout. The attack success rate is the share of harmfu
 4. Judge every reply with one judge model per set of numbers. A second judge re-labels a sample so that agreement between judges can be measured and reported.
 5. Report the numbers from the report split, language by language, with intervals.
 
-## Repos used and for what
+## Hackathon repos used: which ones, for what, and which features
 
 | Repo | What we use it for | Licence |
 |---|---|---|
@@ -59,7 +59,7 @@ SafeTune is used for one thing: the ReSta repair. We call it through a small wra
 
 AuditKIT is another Lexsi Labs toolkit. It is not used in this study, and nothing in our code calls it. The study does use three other Lexsi Labs toolkits, each for one step: CuratorKIT for the data, AlignTune for the fine-tune and SafeTune for the repair.
 
-## Models and licenses
+## Models used and their licenses
 
 | Model | Licence | Role in the study | Access |
 |---|---|---|---|
@@ -75,7 +75,7 @@ The two judge models named above are the ones chosen before any run: Qwen3-4B as
 
 Hinglish translations, and every back-translation used in the translation check, come from a chat model reached through an API endpoint. <<OWNER: name of the model behind that endpoint and the terms it was used under>> The translated prompts are all marked CC-BY-NC-4.0 in the released data, because the NLLB weights are under that licence and we do not split the translated file by translator.
 
-## Datasets and licenses
+## Datasets and benchmarks used and their licenses
 
 Every source below was read at its card or repository on the date recorded in the study's source manifest, data/sources.yaml in the code repository. A source was used only if its licence allowed the use we make of it. Sources whose licence was non-commercial, share-alike, unclear or self-contradicting were left out.
 
@@ -122,7 +122,7 @@ Twenty-five further sources were checked and not used. The reasons are in data/s
 
 Released: the English prompts and the machine-translated prompts, each row with its source and licence; one label per judged reply, with an excerpt cut to 200 characters; one correct or incorrect mark per task question; and the tables and figures. Not released: any model reply beyond the 200-character excerpt, and any item of an evaluation-only source. The released dataset card says all of this again next to the files. Dataset: <<LINK: dataset on Hugging Face>>.
 
-## Model collection
+## Model artifacts (weights, adapters, …) public, as an HF collection
 
 The collection holds the models that this study produced, each with a model card. Tiny Aya Global and Tiny Aya Base are not re-uploaded: Cohere Labs hosts them, and their gated terms apply to anyone who downloads them.
 
@@ -141,7 +141,11 @@ ReSta takes three models: the drifted one, the aligned one and the base one. It 
 
 SafeTune's own documentation says that on Tiny Aya, alpha of 1 breaks the model, that 0.5 or more also breaks it, and that about 0.25 is a sensible value. We did not check that claim ourselves before the run. We read it before any model was run and changed the grid of alpha values because of it: the first grid was 0, 0.25, 0.5, 0.75 and 1, and the grid now is 0, 0.05, 0.1, 0.15, 0.25, 0.35, 0.5 and 1. SafeTune's trainer applies a random thinning step called DARE, with a drop rate of 0.3 and seed 0, by default; we keep that default on and record it beside each repaired model. The alpha used is chosen on the dev split by the rule in Section 7. <<RESULT: alpha chosen on dev, with the reason>>
 
-## Data collection
+## Data artifacts (datasets, logs, benchmarks, …) public, as an HF collection
+
+### The public data artifacts
+
+The data this study produced is published as one Hugging Face dataset: <<LINK: dataset on Hugging Face>>. It holds the prompts, one label per judged reply with a short excerpt, one correct or incorrect mark per task question, and the tables and figures. Its card lists every file and the licence of every source. Section 4 says what is released and what is withheld.
 
 ### The test set
 
@@ -167,11 +171,7 @@ There are 6,000 training rows (1,500 per language), 800 held-out rows (200 per l
 
 There are no Hinglish fine-tuning rows. The fine-tune therefore uses four of the five test languages. It never sees a Hinglish row, so Hinglish is measured as a language that the fine-tune did not train on.
 
-### The public data artifacts
-
-The data this study produced is published as one Hugging Face dataset: <<LINK: dataset on Hugging Face>>. It holds the prompts, one label per judged reply with a short excerpt, one correct or incorrect mark per task question, and the tables and figures. Its card lists every file and the licence of every source. Section 4 says what is released and what is withheld.
-
-## Experiments and what else was tried
+## Experiments run, findings and what else was tested
 
 ### What was run
 
@@ -238,7 +238,9 @@ This list is built from the study's working log. It is short because the study h
 - The judges are models, and their agreement is measured on a sample only.
 - Tiny Aya Global is one small model, and the fine-tune is one harmless task and one recipe. The study does not say anything about other models, other tasks or other languages.
 
-## Approach with before/after results
+## With more credits: your approach, before and after results
+
+No extra credits were used for this study, only the free Colab or Kaggle compute that the organizers allow. This section holds the approach's before and after results.
 
 ### Short answers
 
@@ -290,8 +292,8 @@ The curve shows, along the grid of alpha values, how the safety of the repaired 
 
 A reproduction notebook rebuilds tables.csv from the public per-item results on an ordinary CPU, with no GPU and no API key: <<LINK: reproduction notebook>>. The check passes when the sha256 of the rebuilt tables.csv equals the one recorded in the export's MANIFEST.json. Choices that rest on data that is not public, such as the alpha choice on dev, are read from reliability.json as recorded and are not recomputed. An optional GPU section re-runs generations; it is not guaranteed to give the same replies, because generation depends on the hardware. The notebook also rebuilds both figures. Reproduction check: <<RESULT: reproduction check outcome>>
 
-## Teammates
+## Teammates tagged
 
-There are no teammates. This is a solo project by <<OWNER: author name as it should appear>>.
+There is nobody to tag, because there are no teammates. This is a solo project by <<OWNER: author name as it should appear>>.
 
 The work was done by the owner together with Claude Code, an AI coding assistant from Anthropic. Claude Code wrote and reviewed much of the code and the draft of this text. <<OWNER: confirm what you personally checked, for example the sources, the design decisions and the results>> Every result in this article comes from the exported files described above, and the code that produced them is in the repository. <<OWNER: decision to keep this disclosure paragraph>>

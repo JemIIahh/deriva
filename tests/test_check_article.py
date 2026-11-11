@@ -30,17 +30,19 @@ def _load_script():
 
 check_article = _load_script()
 
+# The nine titles of the organizers' submission checklist (reference/kickoff-slides-text.txt, slide 29), word for word.
 HEADINGS = [
-    "Problem and approach",
-    "Repos used and for what",
-    "Models and licenses",
-    "Datasets and licenses",
-    "Model collection",
-    "Data collection",
-    "Experiments and what else was tried",
-    "Approach with before/after results",
-    "Teammates",
+    "Problem statement and approach, in brief",
+    "Hackathon repos used: which ones, for what, and which features",
+    "Models used and their licenses",
+    "Datasets and benchmarks used and their licenses",
+    "Model artifacts (weights, adapters, …) public, as an HF collection",
+    "Data artifacts (datasets, logs, benchmarks, …) public, as an HF collection",
+    "Experiments run, findings and what else was tested",
+    "With more credits: your approach, before and after results",
+    "Teammates tagged",
 ]
+PROBLEM, REPOS, MODELS, DATASETS, MODEL_ARTIFACTS, DATA_ARTIFACTS, EXPERIMENTS, APPROACH, TEAMMATES = HEADINGS
 
 # --- a small, valid article ------------------------------------------------------------------------------------------
 # Each named piece below is one sentence or paragraph a rule looks for, so a test can drop exactly one.
@@ -104,23 +106,23 @@ def make_article(*, drop=(), extra="", sections=None, heading_overrides=None) ->
     """The nine sections with every named piece in it, minus the pieces named in `drop`."""
     keep = {name: text for name, text in PIECES.items() if name not in drop}
     body = {
-        "Problem and approach": keep.get("question", ""),
-        "Repos used and for what": "\n\n".join(
+        PROBLEM: keep.get("question", ""),
+        REPOS: "\n\n".join(
             keep[name] for name in ("repos", "aligntune_mit", "curatorkit_lsal", "aligntune_depends", "unsloth", "mergekit", "trl")
             if name in keep
         ),
-        "Models and licenses": "\n\n".join(keep[name] for name in ("tiny_licence", "gated", "aup", "nllb") if name in keep),
-        "Datasets and licenses": (
+        MODELS: "\n\n".join(keep[name] for name in ("tiny_licence", "gated", "aup", "nllb") if name in keep),
+        DATASETS: (
             "These are the public sources the study uses, with the licence of each one.\n\n"
             "| Source | Licence | Use |\n| --- | --- | --- |\n"
             + "\n".join(row for name, row in SOURCE_ROWS.items() if name not in drop)
             + ("\n\n" + keep["multijail"] if "multijail" in keep else "")
         ),
-        "Model collection": PLAIN_COLLECTION,
-        "Data collection": PLAIN_DATA,
-        "Experiments and what else was tried": PLAIN_EXPERIMENTS,
-        "Approach with before/after results": PLAIN_APPROACH,
-        "Teammates": "None. " + keep.get("disclosure", "Nobody else worked on it, and nobody else helped in any way at all."),
+        MODEL_ARTIFACTS: PLAIN_COLLECTION,
+        DATA_ARTIFACTS: PLAIN_DATA,
+        EXPERIMENTS: PLAIN_EXPERIMENTS,
+        APPROACH: PLAIN_APPROACH,
+        TEAMMATES: "None. " + keep.get("disclosure", "Nobody else worked on it, and nobody else helped in any way at all."),
     }
     body.update(sections or {})
     names = [(heading_overrides or {}).get(h, h) for h in HEADINGS]
@@ -202,6 +204,26 @@ def test_nine_required_headings(tmp_path):
     assert run(tmp_path, make_article()).ok
 
 
+SLIDES = ROOT / "reference" / "kickoff-slides-text.txt"
+
+
+@pytest.mark.skipif(not SLIDES.is_file(), reason="the kickoff slide text is not in this checkout")
+def test_required_headings_are_the_organizers_checklist_word_for_word():
+    # slide 29 lists the nine sections; the titles are read from that file, never retyped
+    import re
+
+    lines = SLIDES.read_text(encoding="utf-8").splitlines()
+    start = next(n for n, line in enumerate(lines) if line.strip() == "===== SECTION 29 =====")
+    titles = []
+    for line in lines[start : start + 16]:
+        m = re.match(r"^\s*([1-9])\s+(\S.*?)\s*$", line)
+        if m and int(m.group(1)) == len(titles) + 1:
+            titles.append(m.group(2))
+    assert len(titles) == 9
+    assert list(check_article.REQUIRED_HEADINGS) == titles
+    assert HEADINGS == titles
+
+
 @pytest.mark.parametrize("missing", HEADINGS)
 def test_a_missing_required_heading_is_named(tmp_path, missing):
     article = make_article().replace(f"## {missing}\n", f"### {missing}\n")
@@ -213,18 +235,18 @@ def test_a_missing_required_heading_is_named(tmp_path, missing):
 
 def test_headings_in_the_wrong_order_fail(tmp_path):
     article = make_article()
-    article = article.replace("## Model collection", "## @@").replace("## Data collection", "## Model collection").replace("## @@", "## Data collection")
+    article = article.replace(f"## {MODEL_ARTIFACTS}", "## @@").replace(f"## {DATA_ARTIFACTS}", f"## {MODEL_ARTIFACTS}").replace("## @@", f"## {DATA_ARTIFACTS}")
     report = run(tmp_path, article)
     assert "headings" in rules(report)
     assert "order" in messages(report)
-    assert "Data collection" in messages(report)
+    assert DATA_ARTIFACTS in messages(report)
 
 
 def test_a_duplicated_heading_fails_and_names_both_lines(tmp_path):
-    article = make_article(extra="\n## Teammates\n\nNone again, in plain words, so that the section has some prose to read.\n")
+    article = make_article(extra=f"\n## {TEAMMATES}\n\nNone again, in plain words, so that the section has some prose to read.\n")
     report = run(tmp_path, article)
     assert "headings" in rules(report)
-    assert "'Teammates'" in messages(report)
+    assert f"'{TEAMMATES}'" in messages(report)
     assert "twice" in messages(report)
 
 
@@ -236,7 +258,7 @@ def test_an_extra_level_two_heading_fails(tmp_path):
 
 
 def test_level_three_subsections_are_allowed(tmp_path):
-    article = make_article(sections={"Experiments and what else was tried": PLAIN_EXPERIMENTS + "\n\n### What failed\n\nNothing has been run yet, so this part stays short and plain.\n"})
+    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n### What failed\n\nNothing has been run yet, so this part stays short and plain.\n"})
     assert run(tmp_path, article).ok
 
 
@@ -246,17 +268,17 @@ def test_a_heading_inside_a_code_block_is_not_a_heading(tmp_path):
 
 
 def test_heading_text_must_match_exactly(tmp_path):
-    article = make_article(heading_overrides={"Teammates": "Teammates tagged"})
+    article = make_article(heading_overrides={TEAMMATES: "Teammates"})
     report = run(tmp_path, article)
     assert "headings" in rules(report)
-    assert "'Teammates'" in messages(report)
+    assert f"'{TEAMMATES}'" in messages(report)
 
 
 # --- 2. heading levels ---------------------------------------------------------------------------------------------------
 
 
 def test_a_skipped_heading_level_fails(tmp_path):
-    article = make_article(sections={"Experiments and what else was tried": PLAIN_EXPERIMENTS + "\n\n#### Too deep\n\nThis heading skips level three, which breaks the outline of the page.\n"})
+    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n#### Too deep\n\nThis heading skips level three, which breaks the outline of the page.\n"})
     report = run(tmp_path, article)
     assert "heading-levels" in rules(report)
     assert "Too deep" in messages(report)
@@ -299,7 +321,7 @@ def test_licence_spelling_may_differ_in_case_and_separators(tmp_path):
 
 
 def test_a_source_named_in_the_models_section_counts(tmp_path):
-    article = make_article(drop=("harm",)).replace("## Datasets and licenses", "## Datasets and licenses", 1)
+    article = make_article(drop=("harm",))
     article = article.replace(
         "Cohere Labs also applies", "fix/harm is also listed here under mit. Cohere Labs also applies"
     )
@@ -307,7 +329,7 @@ def test_a_source_named_in_the_models_section_counts(tmp_path):
 
 
 def test_a_source_named_only_in_another_section_does_not_count(tmp_path):
-    article = make_article(drop=("harm",)).replace("## Teammates\n\n", "## Teammates\n\nfix/harm mit is mentioned here only.\n\n")
+    article = make_article(drop=("harm",)).replace(f"## {TEAMMATES}\n\n", f"## {TEAMMATES}\n\nfix/harm mit is mentioned here only.\n\n")
     report = run(tmp_path, article)
     assert "source-licenses" in rules(report)
 
@@ -335,7 +357,7 @@ def test_disclosure_paragraph_present(tmp_path):
 
 
 def test_disclosure_must_say_it_is_an_ai_assistant(tmp_path):
-    article = make_article(sections={"Teammates": "None. The work was done with Claude Code and a lot of coffee, mostly at night."})
+    article = make_article(sections={TEAMMATES: "None. The work was done with Claude Code and a lot of coffee, mostly at night."})
     report = run(tmp_path, article)
     assert "disclosure" in rules(report)
 
@@ -377,7 +399,7 @@ def test_the_toolkits_are_named_in_the_repos_section(tmp_path, toolkit):
 
 def test_a_mention_in_the_wrong_section_does_not_count(tmp_path):
     # the Tiny Aya licence belongs with the models, not in the teammates section
-    article = make_article(drop=("tiny_licence",)).replace("## Teammates\n\n", "## Teammates\n\n" + PIECES["tiny_licence"] + "\n\n")
+    article = make_article(drop=("tiny_licence",)).replace(f"## {TEAMMATES}\n\n", f"## {TEAMMATES}\n\n" + PIECES["tiny_licence"] + "\n\n")
     report = run(tmp_path, article)
     assert "licenses-and-tools" in rules(report)
 
@@ -386,33 +408,33 @@ def test_a_mention_in_the_wrong_section_does_not_count(tmp_path):
 
 
 def test_a_section_of_only_links_fails(tmp_path):
-    article = make_article(sections={"Model collection": "https://huggingface.co/collections/example/models\n\n[the data](https://huggingface.co/collections/example/data)"})
+    article = make_article(sections={MODEL_ARTIFACTS: "https://huggingface.co/collections/example/models\n\n[the data](https://huggingface.co/collections/example/data)"})
     report = run(tmp_path, article)
     assert "empty-or-links-only" in rules(report)
-    assert "'Model collection'" in messages(report)
+    assert f"'{MODEL_ARTIFACTS}'" in messages(report)
     assert "links" in messages(report)
 
 
 def test_an_empty_section_fails(tmp_path):
-    report = run(tmp_path, make_article(sections={"Data collection": ""}))
+    report = run(tmp_path, make_article(sections={DATA_ARTIFACTS: ""}))
     assert "empty-or-links-only" in rules(report)
-    assert "'Data collection'" in messages(report)
+    assert f"'{DATA_ARTIFACTS}'" in messages(report)
 
 
 def test_a_figure_without_alt_text_fails(tmp_path):
-    article = make_article(sections={"Approach with before/after results": PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
+    article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
     report = run(tmp_path, article)
     assert "figures" in rules(report)
     assert "alt text" in messages(report)
 
 
 def test_a_figure_with_one_word_of_alt_text_fails(tmp_path):
-    article = make_article(sections={"Approach with before/after results": PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![heatmap]")})
+    article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![heatmap]")})
     assert "figures" in rules(run(tmp_path, article))
 
 
 def test_the_per_language_heatmap_must_be_referenced(tmp_path):
-    article = make_article(sections={"Approach with before/after results": PLAIN_APPROACH.split("\n\n")[0]})
+    article = make_article(sections={APPROACH: PLAIN_APPROACH.split("\n\n")[0]})
     report = run(tmp_path, article)
     assert "figures" in rules(report)
     assert "heatmap" in messages(report)
@@ -420,7 +442,7 @@ def test_the_per_language_heatmap_must_be_referenced(tmp_path):
 
 def test_the_heatmap_may_sit_in_a_subfolder_or_at_a_url(tmp_path):
     for path in ("figures/heatmap.png", "https://example.org/files/heatmap.png"):
-        article = make_article(sections={"Approach with before/after results": PLAIN_APPROACH.replace("(heatmap.png)", f"({path})")})
+        article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("(heatmap.png)", f"({path})")})
         folder = tmp_path / path.replace("/", "_").replace(":", "_")
         folder.mkdir()
         article_path, sources_path = write_case(folder, article)
@@ -443,7 +465,7 @@ FILL_IN_OK = "# Fill in\n\nheatmap.png is still to be added.\n"
 
 
 def draft_article(extra_sentence):
-    return make_article(sections={"Approach with before/after results": PLAIN_APPROACH + "\n\n" + extra_sentence})
+    return make_article(sections={APPROACH: PLAIN_APPROACH + "\n\n" + extra_sentence})
 
 
 def test_draft_mode_lists_placeholders_and_passes(tmp_path):
