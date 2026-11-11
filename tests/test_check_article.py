@@ -709,7 +709,8 @@ MARKED_UP_CLAIMS = {
     "link": "Fine-tuning made the [model](x.md) less safe in Swahili.",
     "link-text": "Fine-tuning [made the model less safe](https://example.org/a.b) in Swahili.",
     "blockquote": "> Fine-tuning made the model\n> less safe in Swahili.",
-    "nested-blockquote": "> > Fine-tuning made the model\n> > less safe in Swahili.",
+    "blockquote-wrapped-inside-the-phrase": "> Fine-tuning made the model less\n> safe in Swahili.",
+    "nested-blockquote": "> > Fine-tuning made the model less\n> > safe in Swahili.",
     "nbsp": "Fine-tuning made the model less safe in Swahili.",
     "narrow-nbsp": "Fine-tuning made the model less safe in Swahili.",
 }
