@@ -1198,3 +1198,55 @@ def test_the_real_article_names_the_exported_file_names_the_fill_in_relies_on():
     for name in ("tables.csv", "reliability.json", "heatmap.png", "alpha_curve.png", "MANIFEST.json"):
         assert name in fill_in, name
     assert textwrap.dedent(fill_in).strip()
+
+
+def real_text():
+    return " ".join(REAL_ARTICLE.read_text(encoding="utf-8").split())
+
+
+def test_the_real_article_asks_the_owner_about_the_gate_simulation_and_says_where_the_figures_come_from():
+    report = check_article.check(REAL_ARTICLE, REAL_SOURCES, draft=True)
+    names = [p.name for p in report.placeholders if p.kind == "OWNER"]
+    assert any("gate simulation was re-run" in n for n in names), names
+    text = real_text()
+    assert "As noted in the project log (not public)" in text
+    assert "comes from the project notes only" in text
+    for gone in ("As recorded", "never decides the outcome"):
+        assert gone not in text, gone
+
+
+def test_the_real_article_names_the_models_it_releases_only_through_the_upload_marker():
+    text = real_text()
+    assert "The released models" not in text
+    assert "Which arms those are: <<OWNER: which model arms were uploaded with weights>>" in text
+    assert "The repaired model (A2), only if a repair strength qualified" in text
+    assert "DARE" in text and "thinned" in text and "on by default" in text
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "A setting fails if any one of these is true:",
+        "always answering D would score 31%",
+        "always answering the most common letter would score 27 to 28%",
+        "The alpha choice compares models on the same questions, so the higher dev figure does not tilt it.",
+        "18 pairs of English prompts are in both dev and report.",
+        "shares at least 60% of its wording (4 pairs share at least 80%)",
+        "AlignTune can train in two ways, called backends: unsloth and TRL (Hugging Face's training library).",
+        "This is our reading, not legal advice.",
+        "a character-overlap score called chrF of at least 0.35",
+    ],
+)
+def test_the_real_article_uses_the_plain_wording_the_review_asked_for(phrase):
+    assert phrase in real_text()
+
+
+def test_the_real_article_lists_the_five_sanity_checks_as_bullets():
+    lines = REAL_ARTICLE.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if "A setting fails if any one of these is true:" in line)
+    bullets = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("  - "):
+            break
+        bullets.append(line.strip())
+    assert len(bullets) == 5, bullets

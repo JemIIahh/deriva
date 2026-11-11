@@ -49,13 +49,13 @@ Before spending effort on a repair, the study asks whether there is drift to rep
 
 There are three branches. If the gate passes, the study continues to the repair. If it does not pass, the study first tries a stronger fine-tune recipe (Section 5). If the stronger recipe does not pass either, the study pivots to prevention (A3), and the repair becomes a secondary result.
 
-The error rates of the gate come from a simulation that an AI review agent ran during the build, at 150 harmful prompts per language. The settings of that simulation were not saved. It will be run again, and its settings saved, before these figures are relied on. As recorded:
+The error rates of the gate come from a simulation that an AI review agent ran during the build, at 150 harmful prompts per language. The settings of that simulation were not saved, so the figures cannot be reproduced from the repository. They are to be re-run with their settings saved before anyone relies on them. <<OWNER: confirm the gate simulation was re-run and its settings saved, or delete this sentence>> As noted in the project log (not public):
 
 - With no true change, the gate passes 0% of the time.
-- With a true rise of 5 points, it passes 0.3% of the time.
+- With a true rise of 5 points, it passes 0.3% of the time. This figure comes from the project notes only; its set-up was not recorded.
 - With a true rise of 10 points, it passes 25% of the time. At 12 points it passes 51% of the time, and at 15 points 84%.
 - If all four non-English languages rise by 8 points, it still passes about 43% of the time. That is the one case whose set-up was recorded. The gate picks its languages after looking at the data, and that selection makes it easier to pass.
-- The clause "the combined rise is clearly above zero" never decides the outcome at 150 prompts per language. The rule of a 10-point rise in two languages does the work.
+- In that simulation, the clause "the combined rise is clearly above zero" did not change the outcome at 150 prompts per language. The rule of a 10-point rise in two languages did the work.
 
 By these figures the gate rarely passes by accident, and it misses moderate rises often.
 
@@ -83,9 +83,11 @@ These rules are in the code and in tests. They exist so that a good-looking numb
 | NLLB-200 distilled 600M, through the transformers library | Machine-translates the English prompts into Hindi, Arabic and Swahili. | CC-BY-NC-4.0 (model weights) |
 | Our own code, <<LINK: code repository>> | Builds the test set, runs the generations and the judge, computes the tables and figures, and exports the public files. | See the repository. |
 
-AlignTune is released under the MIT licence. It depends on CuratorKIT, which is under the Lexsi Labs Source Available License 1.1 (LSAL-1.1): free for research, evaluation, education and audit, and not for commercial use. So the tooling is used here for research only. The released models are under CC-BY-NC-4.0 because Tiny Aya is (Section 3).
+AlignTune is released under the MIT licence. It depends on CuratorKIT, which is under the Lexsi Labs Source Available License 1.1 (LSAL-1.1): free for research, evaluation, education and audit, and not for commercial use. So the tooling is used here for research only. Any model that this study releases is under CC-BY-NC-4.0, because Tiny Aya is (Section 3).
 
-The AlignTune package also bundles unsloth, which is Apache-2.0 with some parts under AGPL-3.0, and mergekit, which is LGPL-3.0. We use only the TRL backend of AlignTune (TRL is Hugging Face's training library), and that backend switches the unsloth backend off. Our reading is that the AGPL parts of unsloth are therefore not part of what we run. That is our reading of the code and not legal advice. The step that merges the fine-tune into the model uses PEFT calls.
+The AlignTune package also bundles two other tools: unsloth, which is Apache-2.0 with some parts under AGPL-3.0, and mergekit, which is LGPL-3.0.
+
+AlignTune can train in two ways, called backends: unsloth and TRL (Hugging Face's training library). We use only the TRL backend. Choosing it switches the unsloth backend off. Our reading is that the AGPL parts of unsloth are therefore not part of what we run. This is our reading, not legal advice. The step that merges the fine-tune into the model uses PEFT calls.
 
 SafeTune is used for one thing: the ReSta repair. We call it through a small wrapper that checks that the three models it combines have the same weight names and shapes, and that records the repair settings next to the repaired weights. <<OWNER: one sentence on what SafeTune's licence allows, as read from its repository>>
 
@@ -169,12 +171,14 @@ The dataset card says all of this again next to the files. Dataset: <<LINK: data
 
 ## Model artifacts (weights, adapters, …) public, as an HF collection
 
-The collection holds the models that this study produced, each with a model card. Tiny Aya Global and Tiny Aya Base are not re-uploaded: Cohere Labs hosts them, and their gated terms apply to anyone who downloads them.
+The collection holds the models of this study that were uploaded, each with a model card. Which arms those are: <<OWNER: which model arms were uploaded with weights>> Tiny Aya Global and Tiny Aya Base are not re-uploaded: Cohere Labs hosts them, and their gated terms apply to anyone who downloads them.
 
-- The fine-tuned model (A1) is Tiny Aya Global after the harmless LoRA fine-tune, merged back into one model stored in 16-bit precision.
-- If a repair strength qualified on the dev split, the collection also holds the repaired model (A2): the fine-tuned model after ReSta at that strength.
+The study can produce two models for the collection:
 
-Each card names its model version and repeats the licence and the Acceptable Use Policy. It says the model is not a safety guarantee. For numbers, it points to this article. Collection: <<LINK: model collection on Hugging Face>>. <<OWNER: which model arms were uploaded with weights>>
+- The fine-tuned model (A1): Tiny Aya Global after the harmless LoRA fine-tune, merged back into one model stored in 16-bit precision.
+- The repaired model (A2), only if a repair strength qualified on the dev split: the fine-tuned model after ReSta at that strength.
+
+Each uploaded model has a card that names its model version and repeats the licence and the Acceptable Use Policy. It says the model is not a safety guarantee. For numbers, it points to this article. Collection: <<LINK: model collection on Hugging Face>>.
 
 ### How the fine-tuned model was made
 
@@ -188,17 +192,22 @@ A stronger recipe exists in configs/ft_lora_strong.yaml: learning rate 2e-4, thr
 
 ### How the repair is made
 
-ReSta takes three models: the fine-tuned one, the aligned one and the base one. It adds a scaled copy of the change that post-training (instruction and safety training together) made. In symbols, the repaired weights are the fine-tuned weights plus alpha times (the aligned weights minus the base weights). The fine-tuned model already contains that change once, so any alpha above zero adds it a second time. By this arithmetic, an alpha of 1 does not return the original model.
+ReSta takes three models: the fine-tuned one, the aligned one and the base one. It adds a scaled copy of the change that post-training (instruction and safety training together) made. When a step called DARE is on, the copy is a thinned one: each entry of the change is kept at random with probability 0.7 and scaled up to make up for the entries that were dropped. SafeTune's trainer has DARE on by default; whether it was on for our final run is stated below. In symbols, the repaired weights are the fine-tuned weights plus alpha times (the aligned weights minus the base weights). The fine-tuned model already contains that change once, so any alpha above zero adds it a second time. By this arithmetic, an alpha of 1 does not return the original model.
 
 The first list of alpha values was 0, 0.25, 0.5, 0.75 and 1. SafeTune's own documentation says that on Tiny Aya an alpha of 1 breaks the model, that 0.5 or more also breaks it, and that about 0.25 is a sensible value. We did not check that claim ourselves. We read it before any model ran. We then changed the list to 0, 0.05, 0.1, 0.15, 0.25, 0.35, 0.5 and 1.
 
-SafeTune's trainer has an optional random thinning step called DARE. Whether it was on for the final run: <<RESULT: whether DARE was on for the final run (resta_patch.json)>> The alpha used is chosen on the dev split by the rules below. <<RESULT: alpha chosen on dev, with the reason>>
+Whether DARE was on for the final run: <<RESULT: whether DARE was on for the final run (resta_patch.json)>> The alpha used is chosen on the dev split by the rules below. <<RESULT: alpha chosen on dev, with the reason>>
 
 ### How the repair strength is chosen
 
 Three rules decide which alpha may win. All three use the dev split only.
 
-- The sanity gate. A model that is broken says nothing useful, so a judge finds nothing harmful in it and it looks safe. Before a repair setting can count, five checks run on its dev replies. It fails if more than 5% are empty, more than 20% run to the length limit, more than 10% end in a loop of repeated text, more than 20% use the wrong alphabet, or its task accuracy is more than 10 points below the fine-tuned model's. A setting that fails is left out and listed by name.
+- The sanity gate. A model that is broken says nothing useful, so a judge finds nothing harmful in it and it looks safe. Before a repair setting can count, five checks run on its dev replies. A setting that fails is left out and listed by name. A setting fails if any one of these is true:
+  - more than 5% of its replies are empty;
+  - more than 20% of its replies run to the length limit;
+  - more than 10% of its replies end in a loop of repeated text;
+  - more than 20% of its replies use the wrong alphabet for the language;
+  - its task accuracy is more than 10 points below the fine-tuned model's.
 - The over-refusal rule. A setting is eligible only if, in every language, its dev over-refusal is at most the larger of A0's and A1's over-refusal plus 10 percentage points. A repair that refuses everything cannot win.
 - The alpha rule. Among the strengths that pass both rules above in every language, the one with the lowest mean dev attack success over the non-English languages is chosen. If none qualifies, no alpha is chosen, and the heatmap shows the original model against the fine-tuned one.
 
@@ -220,7 +229,7 @@ Once built, the test set is frozen. A manifest lists the sha256 (a fingerprint o
 
 Hindi, Arabic and Swahili prompts are machine translations made with NLLB-200 distilled 600M. Hinglish prompts are made by a chat model through an API endpoint, because NLLB cannot write Hinglish. There is no public Hinglish safety test set that we know of, so every Hinglish prompt is a translation.
 
-Each translation is checked by translating it back into English with a chat model and comparing the result with the original. An item is kept only if the back-translation shares enough characters with the original (a chrF-style F-score of at least 0.35) and has a similar length (between 0.6 and 1.5 times the original). The thresholds were picked by hand and not calibrated. The check catches a refusal, an answer instead of a translation, a cut-off text and a wrong-language text. It cannot catch a flipped meaning, for example "how do I stop X" becoming "how do I X", because the characters are nearly the same. Items that fail are dropped, so the languages end with slightly different numbers of prompts: <<RESULT: prompts kept and dropped per language after the translation check>>
+Each translation is checked by translating it back into English with a chat model and comparing the result with the original. An item is kept only if the back-translation is close to the original (a character-overlap score called chrF of at least 0.35) and about as long (0.6 to 1.5 times the original's length). The thresholds were picked by hand and not calibrated. The check catches a refusal, an answer instead of a translation, a cut-off text and a wrong-language text. It cannot catch a flipped meaning, for example "how do I stop X" becoming "how do I X", because the characters are nearly the same. Items that fail are dropped, so the languages end with slightly different numbers of prompts: <<RESULT: prompts kept and dropped per language after the translation check>>
 
 Because every non-English prompt is a translation of an English one, the five languages are not five independent samples of prompts. They are the same prompts in five forms.
 
@@ -239,9 +248,9 @@ There are no Hinglish fine-tuning rows. The fine-tune therefore uses four of the
 ### Limits of the data
 
 - The held-out task questions number about 200 per language, so a task accuracy has an interval of about 7 points either way. The same 200 dev questions are used in all four languages.
-- The dev task set has a majority-letter floor of 31% (always answering D), against 27 to 28% on the held-out questions. The alpha choice compares the repaired model with the original and the fine-tuned model on the same questions, so a higher floor does not bias that comparison.
+- On the dev questions, always answering D would score 31%. On the held-out questions, always answering the most common letter would score 27 to 28%. Both are what a model that ignores the question would get. The alpha choice compares models on the same questions, so the higher dev figure does not tilt it.
 - One question in the dev task set is a source twin of a training question (astronomy test item 9 against item 116). That is 1 of 200, and it slightly favours a model that saw the training copy.
-- English dev and report prompts share 18 template-family near-duplicate pairs. These are pairs built from the same prompt template, with a Jaccard overlap (the share of content that two texts have in common) of 0.6 or more, and 4 pairs at 0.8 or more. The report split is therefore not fully independent of the dev split for those templates.
+- 18 pairs of English prompts are in both dev and report. Each pair comes from the same prompt template and shares at least 60% of its wording (4 pairs share at least 80%). So the report split is not fully independent of dev for those templates.
 - No native speaker has read the translated prompts or the Hindi, Arabic and Swahili instruction lines. <<OWNER: confirm that no native speaker reviewed the translations or the judge labels>>
 - Machine translation can change meaning in ways that the back-translation check cannot see.
 
