@@ -411,6 +411,31 @@ def _strip_markers(text: str) -> str:
     return _VALID_MARKER.sub(" ", text)
 
 
+_ODD_SPACES = re.compile("[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
+_QUOTE_MARK = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+_EMPHASIS = re.compile(r"[*`]+|(?<!\w)_+|_+(?!\w)")  # * and ` anywhere; _ only at the edge of a word (resta_patch.json keeps its _)
+
+
+def _alt_of(tag: str) -> str:
+    alt = re.search(r"""alt\s*=\s*(?:"([^"]*)"|'([^']*)')""", tag, re.I)
+    return ((alt.group(1) or alt.group(2)) if alt else "").strip()
+
+
+def _quote_free(line: str) -> str:
+    """One line without its leading block-quote marks ("> ", "> > ") and with odd spaces (no-break space) made plain."""
+    return _QUOTE_MARK.sub("", _ODD_SPACES.sub(" ", line))
+
+
+def _plain(text: str) -> str:
+    """The words a reader reads, for matching a claim or a figure: an image becomes its alt text, a link its text, the marks
+    * _ ` that make bold, italic and code disappear, and runs of white space become one space. Call it after the markers
+    are stripped."""
+    text = _IMAGE.sub(lambda m: " " + m.group(1) + " ", _ODD_SPACES.sub(" ", text))
+    text = _HTML_IMAGE.sub(lambda m: " " + _alt_of(m.group(0)) + " ", text)
+    text = _LINK.sub(r"\1", text)
+    return re.sub(r"\s+", " ", _EMPHASIS.sub("", text)).strip()
+
+
 def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
@@ -624,9 +649,10 @@ def check_hype(doc: Doc, report: Report) -> None:
 
 
 def check_claims(doc: Doc, report: Report) -> None:
-    units = [(b.line, b.text) for b in blocks(doc.text_lines())] + [(h.line, h.text) for h in doc.headings]
+    lines = [(number, _quote_free(text)) for number, text in doc.text_lines()]
+    units = [(b.line, b.text) for b in blocks(lines)] + [(h.line, h.text) for h in doc.headings]
     for line, raw in sorted(units):
-        text = _strip_markers(raw)
+        text = _plain(_strip_markers(raw))
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             sentence = sentence.strip()
             if not sentence or sentence.endswith("?"):
@@ -642,17 +668,19 @@ def check_claims(doc: Doc, report: Report) -> None:
                     )
                     break
     for title in FIGURE_SECTIONS:
-        for number, text in doc.section_lines(title):
-            visible = _URL.sub(" ", _IMAGE.sub(" ", _strip_markers(text)))
-            figure = _FIGURE.search(visible)
-            if figure:
-                report.add(
-                    "claims",
-                    f"The figure '{figure.group(0)}' stands outside a <<RESULT: ...>> placeholder in the section '{title}'. "
-                    "In a draft, every percentage and every number of points in that section must be a result inside a "
-                    "placeholder; put method settings (limits, thresholds, margins) in Sections 1 to 6.",
-                    number,
-                )
+        for first, last in doc.sections(title):
+            section = [(number, _quote_free(text)) for number, text in doc.text_lines(first, last)]
+            for block in blocks(section):
+                visible = _URL.sub(" ", _plain(_strip_markers(block.text)))
+                figure = _FIGURE.search(visible)
+                if figure:
+                    report.add(
+                        "claims",
+                        f"The figure '{figure.group(0)}' stands outside a <<RESULT: ...>> placeholder in the section '{title}'. "
+                        "In a draft, every percentage and every number of points in that section must be a result inside a "
+                        "placeholder; put method settings (limits, thresholds, margins) in Sections 1 to 6.",
+                        block.line,
+                    )
 
 
 def collect_markers(doc: Doc, report: Report) -> None:

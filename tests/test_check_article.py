@@ -675,6 +675,69 @@ def test_numbers_that_are_not_percentages_or_points_are_not_figures(tmp_path):
     assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
 
 
+# --- 8c. fix round 2: alt text and Markdown marks must not hide a result ------------------------------------------------------
+
+
+@pytest.mark.parametrize("section", ["EXPERIMENTS", "APPROACH"])
+def test_a_result_in_the_alt_text_of_a_figure_fails_in_draft_mode(tmp_path, section):
+    name = {"EXPERIMENTS": EXPERIMENTS, "APPROACH": APPROACH}[section]
+    base = {"EXPERIMENTS": PLAIN_EXPERIMENTS, "APPROACH": PLAIN_APPROACH}[section]
+    image = "![Heatmap: Swahili at 66% attack success after the repair, the highest of the five languages](heatmap.png)"
+    report = run(tmp_path, make_article(sections={name: base + "\n\n" + image}), draft=True, fill_in=FILL_IN_OK)
+    assert "claims" in rules(report), section
+    assert "66%" in messages(report)
+
+
+def test_alt_text_is_still_required_and_a_plain_description_still_passes(tmp_path):
+    article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
+    assert "figures" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
+    assert run(tmp_path, make_article(), draft=True, fill_in=FILL_IN_OK).ok
+
+
+def test_a_claim_in_the_alt_text_of_a_figure_is_a_claim_in_any_section(tmp_path):
+    image = "![Heatmap showing that fine-tuning made the model less safe in Swahili](heatmap.png)"
+    article = make_article(sections={PROBLEM: PIECES["question"] + "\n\n" + image})
+    assert "claims" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
+
+
+MARKED_UP_CLAIMS = {
+    "bold": "Fine-tuning made the model less **safe** in Swahili.",
+    "bold-both": "Fine-tuning **made the model less safe** in Swahili.",
+    "italic": "Fine-tuning made the model _less safe_ in Swahili.",
+    "star-italic": "Fine-tuning made the model *less safe* in Swahili.",
+    "code": "Fine-tuning made the model `less safe` in Swahili.",
+    "link": "Fine-tuning made the [model](x.md) less safe in Swahili.",
+    "link-text": "Fine-tuning [made the model less safe](https://example.org/a.b) in Swahili.",
+    "blockquote": "> Fine-tuning made the model\n> less safe in Swahili.",
+    "nested-blockquote": "> > Fine-tuning made the model\n> > less safe in Swahili.",
+    "nbsp": "Fine-tuning made the model less safe in Swahili.",
+    "narrow-nbsp": "Fine-tuning made the model less safe in Swahili.",
+}
+
+
+@pytest.mark.parametrize("sentence", list(MARKED_UP_CLAIMS.values()), ids=list(MARKED_UP_CLAIMS))
+def test_markdown_marks_and_odd_spaces_do_not_hide_a_claim(tmp_path, sentence):
+    for article in (in_problem_section(sentence), draft_article(sentence)):
+        report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
+        assert "claims" in rules(report), sentence
+
+
+def test_a_marked_up_claim_inside_a_result_placeholder_still_passes(tmp_path):
+    article = in_problem_section("<<RESULT: fine-tuning made the model _less **safe**_ in Swahili>>.")
+    assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK + "fine-tuning made the model _less **safe**_ in Swahili\n"))
+
+
+def test_plain_text_with_links_and_marks_is_still_not_a_claim(tmp_path):
+    safe = [
+        "The **repair** is a [ReSta](https://example.org/resta) step that needs no retraining.",
+        "> The report split is _frozen_ before any model runs on it.",
+        "The file `resta_patch.json` records the settings of the repair.",
+    ]
+    for sentence in safe:
+        report = run(tmp_path, in_problem_section(sentence), draft=True, fill_in=FILL_IN_OK)
+        assert "claims" not in rules(report), (sentence, messages(report))
+
+
 # --- 9. FILL_IN.md and the figure file -----------------------------------------------------------------------------------------------
 
 
