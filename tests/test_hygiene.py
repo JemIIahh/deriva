@@ -34,7 +34,7 @@ REPLACEMENT_PATTERN = re.compile(re.escape(REPLACEMENT_CHARACTER))
 # from pieces so this file does not match itself.
 HOME_PATH_PATTERN = re.compile(rb"(?<![\w.~-])/(?:" + b"Users" + rb"|" + b"home" + rb")/[A-Za-z0-9._-]+")
 
-HOME_DIRS = ("src", "scripts", "kaggle", "notebooks", "tests")  # the FFFD scan has no such list: it covers every file git knows
+HOME_DIRS = ("src", "scripts", "kaggle", "notebooks", "tests", "article")  # the FFFD scan has no such list: it covers every file git knows
 
 
 def scan(paths, pattern: re.Pattern[bytes], root: Path) -> list[str]:
