@@ -31,7 +31,8 @@ article, not here, so that a card and the article can never disagree.
 ## What it was fine-tuned on
 
 The fine-tuning task is harmless and closed-form: questions with a short answer that can be checked exactly, either a
-bare option letter for a multiple-choice question or a short extracted span for the rest, on harmless subjects. The
+bare option letter for a multiple-choice question or a short extracted span for the rest, on harmless subjects. In the
+data this study built, every training answer is a bare option letter (multiple-choice questions from Global-MMLU). The
 training data is validated to hold no refusal-style answer, no harmful content and nothing from the safety test set. The
 study asks whether ordinary, harmless fine-tuning moves safety behaviour; it does not assume that it does.
 
