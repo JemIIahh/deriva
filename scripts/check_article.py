@@ -241,7 +241,7 @@ _NOT_SUPERLATIVES = (
 )
 _COMPARISON = (
     r"(?:more|less|fewer|higher|lower|larger|smaller|bigger|wider|narrower|stronger|weaker|greater|worse|better|most|least|"
-    r"safer|permissive|affected|unaffected|stable|flat|unchanged|hardest|weakest|"
+    r"safer|permissive|affected|unaffected|stable|flat|unchanged|hardest|weakest|worst|"
     rf"(?!(?:{_NOT_SUPERLATIVES})\b)\w+est)"
 )
 _RESULT_VERB = (

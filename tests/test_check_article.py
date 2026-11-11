@@ -776,6 +776,7 @@ MORE_SCOPED_RESULTS = [
     "A2 looks better than A1 in Arabic.",
     "The naive blend is more permissive than the repair.",
     "Swahili is the weakest language.",
+    "Swahili came out worst.",
     "English is unchanged.",
     "Arabic is the hardest case.",
     "The original model is stable and Hindi is flat.",
