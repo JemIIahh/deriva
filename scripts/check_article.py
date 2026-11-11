@@ -10,6 +10,7 @@ article is good, and it does not read the results. The rules, in the order they 
   headings           exactly these nine level-2 headings, in this order, none missing, none twice, none extra
                      (use level 3 for subsections). Headings inside code blocks are ignored.
   heading-levels     no heading level is skipped (a level 4 under a level 2 is an error).
+  comments           every HTML comment that is opened is closed; one that is not hides the rest of the page.
   source-licenses    every entry of the source list that is not `excluded` is named, with its licence, on one line of
                      the "Models used and their licenses" or the "Datasets and benchmarks used and their licenses" section. An entry with
                      `redistribute: false` must also say "evaluation only" on that line. A row for an entry whose name
@@ -552,6 +553,19 @@ def check_headings(doc: Doc, report: Report) -> None:
         )
 
 
+def check_comments(text: str, report: Report) -> None:
+    """An HTML comment that is opened and never closed hides the rest of the page. Name where it opens."""
+    for m in _COMMENT.finditer(text):
+        if not m.group(0).endswith("-->"):
+            line = text.count("\n", 0, m.start()) + 1
+            report.add(
+                "comments",
+                f"The comment opened at line {line} is never closed, so everything after it is hidden from a reader and from "
+                "the rules about content. Close it with -->, or remove the <!--.",
+                line,
+            )
+
+
 def check_heading_levels(doc: Doc, report: Report) -> None:
     previous = 0
     for h in doc.headings:
@@ -894,6 +908,7 @@ def check(article_path: Path | str, sources_path: Path | str, *, draft: bool = F
     report = Report(draft=draft)
     check_headings(doc, report)
     check_heading_levels(doc, report)
+    check_comments(text, report)
     check_sources(doc, sources, report)
     check_mentions(doc, report)
     check_disclosure(doc, report)

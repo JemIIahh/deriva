@@ -1105,6 +1105,33 @@ def test_an_unterminated_comment_hides_the_rest_of_the_article(tmp_path):
     assert "headings" in rules(run(tmp_path, article))
 
 
+@pytest.mark.parametrize("draft", [False, True])
+def test_an_unterminated_comment_is_named_with_the_line_it_opens_on(tmp_path, draft):
+    article = make_article().replace(f"## {TEAMMATES}\n", f"<!-- never closed\n## {TEAMMATES}\n")
+    line = article.splitlines().index("<!-- never closed") + 1
+    report = run(tmp_path, article, draft=draft, fill_in=FILL_IN_OK)
+    assert f"comment opened at line {line} is never closed" in messages(report)
+    assert "headings" in rules(report)  # the hidden heading is still reported
+    result = cli(tmp_path, article, *(["--draft"] if draft else []), fill_in=FILL_IN_OK)
+    assert result.returncode == 1
+    assert f"comment opened at line {line} is never closed" in result.stdout
+
+
+def test_an_unterminated_comment_at_the_end_of_the_file_is_named(tmp_path):
+    article = make_article() + "\n<!-- a note that was never finished\n"
+    line = article.splitlines().index("<!-- a note that was never finished") + 1
+    report = run(tmp_path, article)
+    assert f"comment opened at line {line} is never closed" in messages(report)
+    assert not report.ok
+
+
+def test_closed_comments_are_not_reported(tmp_path):
+    article = make_article(extra="\n<!-- one -->\n\n<!--\ntwo\nlines\n-->\n")
+    report = run(tmp_path, article)
+    assert "never closed" not in messages(report)
+    assert report.ok, messages(report)
+
+
 def test_placeholders_and_unfinished_markers_in_a_comment_are_still_seen(tmp_path):
     article = make_article(extra="\n" + comment("<<RESULT: hidden result>> and TODO later") + "\n")
     draft = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
