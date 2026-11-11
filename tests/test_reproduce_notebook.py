@@ -16,6 +16,7 @@ Nothing here touches a model, a judge, a key or the network.
 import ast
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -100,7 +101,8 @@ def test_every_code_cell_has_a_text_cell_right_before_it():
             assert before["cell_type"] == "markdown", "two code cells in a row: say in words what the second one does"
 
 
-def test_the_first_code_cell_sets_export_dir_to_the_export_folder():
+def test_the_first_code_cell_sets_export_dir_to_the_export_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # an empty folder: the answer must not depend on where pytest was started
     first = code_cells()[0]
     namespace = {}
     exec(compile(first, "first cell", "exec"), namespace)
@@ -119,6 +121,23 @@ def test_the_text_says_what_is_recomputed_and_what_is_a_recorded_decision_and_wh
 def test_the_text_says_png_bytes_are_not_compared_and_what_is_instead():
     text = text_of_markdown().lower()
     assert "png" in text and "bytes" in text and "matplotlib" in text and "plotted numbers" in text
+
+
+def _markdown_starting(heading):
+    return next(source_of(c) for c in load()["cells"] if c["cell_type"] == "markdown" and source_of(c).startswith(heading))
+
+
+@pytest.mark.parametrize("heading", ["## 4. The heatmap", "## 5. The alpha curve"])
+def test_the_figure_sections_say_the_number_lines_repeat_the_hash_result_and_the_published_pngs_are_not_machine_checked(heading):
+    text = " ".join(_markdown_starting(heading).lower().split())
+    assert "repeat the result of step 3" in text  # once the hash matched, these lines add nothing independent
+    assert "not machine-checked" in text and "by eye" in text  # the published pictures are looked at, not tested
+    assert "never fails" in text  # the redrawn-bytes line is information
+
+
+def test_the_text_says_the_intervals_come_from_seeded_draws_so_the_numpy_version_can_change_them():
+    text = " ".join(text_of_markdown().lower().split())
+    assert "bootstrap" in text and "numpy version" in text and "compare n and rate first" in text
 
 
 def test_the_text_documents_how_to_install_from_a_checkout_and_from_a_downloaded_copy():
@@ -151,6 +170,14 @@ def test_the_gpu_section_is_behind_run_gpu_false_and_everything_in_it_is_guarded
     assert "subprocess" in src and "run_eval" in src  # the section does something when it is switched on
     # the whole notebook never switches it on by itself
     assert not any(re.search(r"^RUN_GPU\s*=\s*True", c, re.M) for c in code_cells())
+
+
+def test_the_gpu_section_warns_that_the_fresh_folder_holds_full_completions_that_must_not_be_shared_or_committed():
+    cells = load()["cells"]
+    index = next(i for i, c in enumerate(cells) if c["cell_type"] == "code" and "RUN_GPU" in source_of(c))
+    text = " ".join(source_of(cells[index - 1]).lower().split())
+    assert "reproduced/gpu/fresh" in text and "full completions" in text and "harmful" in text
+    assert "never" in text and "share" in text and "commit" in text
 
 
 def test_the_gpu_section_says_it_is_not_guaranteed_and_what_it_needs_and_holds_no_key():
@@ -186,6 +213,7 @@ def ipython_stub(monkeypatch):
     display.display = lambda *items: shown.extend(items)
     package = types.ModuleType("IPython")
     package.display = display
+    package.version_info = (9, 0, 0)  # matplotlib looks at it when IPython is importable
     monkeypatch.setitem(sys.modules, "IPython", package)
     monkeypatch.setitem(sys.modules, "IPython.display", display)
     return shown
@@ -256,6 +284,32 @@ def test_an_edited_tables_csv_with_a_fixed_manifest_still_fails_on_the_recomputa
         run_cells()
     out = capsys.readouterr().out
     assert "arm=A1" in out and "lang=hi" in out and "metric=asr" in out and "0.400000" in out  # which number, not a shrug
+    assert "numpy version" in out and "compare n and rate first" in out  # lo and hi come from seeded draws
+
+
+def test_an_edited_manifest_entry_alone_fails_with_the_changed_since_the_export_was_built_message(notebook_dir, no_subprocess_and_no_ipython, capsys):
+    """Only MANIFEST.json is touched: the files are as they were, but they no longer match what it records."""
+    manifest = notebook_dir / "export" / "MANIFEST.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["files"]["dataset/aggregates/tables.csv"]["sha256"] = "0" * 64
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(AssertionError, match="changed since the export was built"):
+        run_cells()
+    assert "dataset/aggregates/tables.csv" in capsys.readouterr().out
+
+
+def test_the_notebook_says_whether_the_redrawn_pngs_are_byte_identical_and_never_fails_on_it(notebook_dir, no_subprocess_and_no_ipython, capsys):
+    heatmap = notebook_dir / "export" / "dataset" / "aggregates" / "heatmap.png"
+    heatmap.write_bytes(heatmap.read_bytes() + b"\0")  # a different file, with the manifest kept in step: only the bytes differ
+    manifest = notebook_dir / "export" / "MANIFEST.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["files"]["dataset/aggregates/heatmap.png"]["sha256"] = hashlib.sha256(heatmap.read_bytes()).hexdigest()
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    run_cells()  # no exception: the PNG bytes are information only
+    out = capsys.readouterr().out
+    assert "heatmap.png: redrawn PNG bytes different from the published file" in out
+    assert re.search(r"alpha_curve\.png: redrawn PNG bytes (identical to|different from) the published file", out)
+    assert "MATCH" in out and "MISMATCH" not in out
 
 
 def test_an_edited_verdict_row_with_a_fixed_manifest_fails_because_the_numbers_are_recomputed(notebook_dir, no_subprocess_and_no_ipython, capsys):
@@ -288,6 +342,21 @@ def test_without_msd_installed_and_without_a_src_folder_the_import_cell_says_wha
     monkeypatch.setitem(sys.modules, "msd", None)  # `from msd import ...` now fails as if it were not installed
     with pytest.raises(AssertionError, match=r"msd is not installed.*install lines"):
         run_cells()
+
+
+def test_a_missing_dependency_of_msd_is_reported_as_that_dependency_not_as_msd_missing(tmp_path):
+    """numpy is not importable but msd is there: the import cell must not say "msd is not installed" (and send the reader
+    to the install lines for the wrong thing); the real error, naming numpy, comes through."""
+    runner = ("import json, sys\n"
+              "sys.modules['numpy'] = None  # an import of numpy raises ModuleNotFoundError\n"
+              "for number, src in enumerate(json.loads(sys.argv[1])):\n"
+              "    exec(compile(src, f'cell {number}', 'exec'))\n")
+    cells = code_cells()[:2]  # the settings cell and the import cell
+    done = subprocess.run([sys.executable, "-c", runner, json.dumps(cells)], capture_output=True, text=True,
+                          env={"PYTHONPATH": str(ROOT / "src"), "PATH": ""}, cwd=tmp_path)
+    assert done.returncode != 0
+    assert "ModuleNotFoundError" in done.stderr and "numpy" in done.stderr
+    assert "msd is not installed" not in done.stderr
 
 
 def test_a_missing_export_folder_fails_with_a_message_that_says_where_to_look(tmp_path, monkeypatch, no_subprocess_and_no_ipython):
@@ -341,7 +410,27 @@ def test_the_gpu_section_when_switched_on_builds_a_command_run_eval_accepts_and_
     assert (args.arm, args.split, list(args.langs), args.limit, args.model_path) == ("A1", "report", ["hi"], 20, "someone/published-A1")
     assert args.judge == "anthropic:claude-sonnet-5-5" and list(args.stages) == ["generate", "judge"]
     assert not (Path(args.ft_dir) / "heldout.jsonl").exists()  # no task items are generated for a 20-item check
-    assert "10 of 20 labels equal the published ones" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "10 of 20 labels equal the published ones" in out
+    assert "reproduced/gpu/fresh" in out and "full completions" in out and "never share or commit" in out
+
+
+def test_the_gpu_section_finds_the_keys_in_a_kaggle_secret_when_the_environment_has_none(notebook_dir, fake_gpu_run, monkeypatch, capsys):
+    """A Kaggle secret is not in os.environ: the section asks the secrets client, puts the value into the environment in
+    memory for the run_eval.py process, and never prints it."""
+    secrets = {"HF_TOKEN": "kaggle-secret-value-0001", "ANTHROPIC_API_KEY": "kaggle-secret-value-0002"}
+    module = types.ModuleType("kaggle_secrets")
+    module.UserSecretsClient = lambda: types.SimpleNamespace(get_secret=lambda name: secrets[name])
+    monkeypatch.setitem(sys.modules, "kaggle_secrets", module)
+    for name in secrets:
+        monkeypatch.setenv(name, "placeholder")  # so that the undo removes what the notebook sets
+        monkeypatch.delenv(name)
+    run_cells(replace=GPU_ON)
+    assert len(fake_gpu_run) == 1
+    assert {name: os.environ[name] for name in secrets} == secrets  # in memory, for the child process
+    out = capsys.readouterr().out
+    assert not any(value in out for value in secrets.values())
+    assert not any(value in cell for value in secrets.values() for cell in code_cells())
 
 
 @pytest.mark.parametrize("missing, message", [("HF_TOKEN", "HF_TOKEN is not set"), ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY is not set")])
@@ -375,26 +464,37 @@ def _runner():
     return nbformat, nbclient
 
 
-def _execute(workdir, monkeypatch):
+def _execute(workdir, monkeypatch, kernels):
+    """Run the notebook in a kernel that is THIS interpreter (the one that has numpy, matplotlib and msd): a kernel spec
+    written under `kernels`, found through JUPYTER_PATH, instead of whatever "python3" happens to resolve to."""
     nbformat, nbclient = _runner()
+    spec = kernels / "kernels" / "pinned"
+    spec.mkdir(parents=True)
+    (spec / "kernel.json").write_text(json.dumps({
+        "argv": [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+        "display_name": "the running interpreter", "language": "python",
+    }), encoding="utf-8")
+    monkeypatch.setenv("JUPYTER_PATH", str(kernels))
     monkeypatch.setenv("PYTHONPATH", str(ROOT / "src"))
     nb = nbformat.read(NOTEBOOK, as_version=4)
-    client = nbclient.NotebookClient(nb, timeout=180, kernel_name="python3", resources={"metadata": {"path": str(workdir)}})
+    client = nbclient.NotebookClient(nb, timeout=180, kernel_name="pinned", resources={"metadata": {"path": str(workdir)}})
     client.execute()
     return nb
 
 
-def test_the_notebook_executes_in_a_kernel_and_prints_a_match(notebook_dir, monkeypatch):
-    nb = _execute(notebook_dir, monkeypatch)
+def test_the_notebook_executes_in_a_kernel_and_prints_a_match(notebook_dir, monkeypatch, tmp_path_factory):
+    nb = _execute(notebook_dir, monkeypatch, tmp_path_factory.mktemp("jupyter-data"))
     printed = "".join(o.get("text", "") for cell in nb.cells if cell.cell_type == "code" for o in cell.outputs)
     assert "MATCH" in printed and "MISMATCH" not in printed
 
 
-def test_the_notebook_fails_in_a_kernel_when_tables_csv_was_edited(notebook_dir, monkeypatch):
+def test_the_notebook_fails_in_a_kernel_when_tables_csv_was_edited(notebook_dir, monkeypatch, tmp_path_factory):
     _runner()
     from nbclient.exceptions import CellExecutionError
 
     tables = notebook_dir / "export" / "dataset" / "aggregates" / "tables.csv"
     tables.write_bytes(tables.read_bytes().replace(b"A1,,hi,asr,0.500000", b"A1,,hi,asr,0.400000", 1))
-    with pytest.raises(CellExecutionError):
-        _execute(notebook_dir, monkeypatch)
+    with pytest.raises(CellExecutionError) as caught:
+        _execute(notebook_dir, monkeypatch, tmp_path_factory.mktemp("jupyter-data"))
+    assert caught.value.ename == "AssertionError"  # the notebook's own stop, not a kernel that failed to start
+    assert "changed" in str(caught.value) or "MISMATCH" in str(caught.value)
