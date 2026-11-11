@@ -468,6 +468,11 @@ def draft_article(extra_sentence):
     return make_article(sections={APPROACH: PLAIN_APPROACH + "\n\n" + extra_sentence})
 
 
+def in_problem_section(sentence):
+    # section 1 has no figure rule, so only the claims patterns can catch the sentence here
+    return make_article(sections={PROBLEM: PIECES["question"] + "\n\n" + sentence})
+
+
 def test_draft_mode_lists_placeholders_and_passes(tmp_path):
     article = draft_article(
         "Result: <<RESULT: pooled attack success per language>>. Models: <<LINK: model collection url>>. "
@@ -561,7 +566,7 @@ def test_questions_and_plain_method_text_are_not_claims(tmp_path):
         "The sanity gate fails a cell whose task accuracy falls more than ten points below the fine-tuned model.",
     ]
     for sentence in safe:
-        report = run(tmp_path, draft_article(sentence), draft=True, fill_in=FILL_IN_OK)
+        report = run(tmp_path, in_problem_section(sentence), draft=True, fill_in=FILL_IN_OK)
         assert "claims" not in rules(report), (sentence, messages(report))
 
 
@@ -603,11 +608,6 @@ REPHRASED_CLAIMS = [
     "The repaired model is safer than the drifted one in every language.",
     "The gate passed, so the study continued to the repair.",
 ]
-
-
-def in_problem_section(sentence):
-    # section 1 has no figure rule, so only the claims patterns can catch the sentence here
-    return make_article(sections={PROBLEM: PIECES["question"] + "\n\n" + sentence})
 
 
 @pytest.mark.parametrize("sentence", REPHRASED_CLAIMS)
@@ -736,6 +736,130 @@ def test_plain_text_with_links_and_marks_is_still_not_a_claim(tmp_path):
     for sentence in safe:
         report = run(tmp_path, in_problem_section(sentence), draft=True, fill_in=FILL_IN_OK)
         assert "claims" not in rules(report), (sentence, messages(report))
+
+
+# --- 8d. fix round 2: Sections 7 and 8 and the front matter may not say how a language or a model did ---------------------------
+
+
+def in_experiments(sentence):
+    return make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + sentence})
+
+
+def in_front_matter(sentence):
+    """The lines under the title, before the first level-2 heading."""
+    return make_article().replace("# A test article\n", "# A test article\n\n" + sentence + "\n", 1)
+
+
+def in_data_limits(sentence):
+    """Section 6 holds method text, where a language name next to a comparison is allowed."""
+    return make_article(sections={DATA_ARTIFACTS: PLAIN_DATA + "\n\n" + sentence})
+
+
+SCOPED = {"front matter": in_front_matter, "section 7": in_experiments, "section 8": draft_article}
+
+REVIEW_SENTENCES = [
+    "Swahili is the most affected language.",
+    "Hindi was hit hardest.",
+    "The repair improved Hindi and Arabic.",
+    "ReSta beats the naive blend.",
+    "Refusal rates dropped sharply after training.",
+    "Safety degraded in Swahili.",
+    "Attack success was higher after fine-tuning.",
+]
+
+MORE_SCOPED_RESULTS = [
+    # a language or a model next to a comparison
+    "The drifted model is worse than the original.",
+    "Hindi is the safest language of the five.",
+    "Hinglish has fewer refusals than English.",
+    "A2 looks better than A1 in Arabic.",
+    "The naive blend is more permissive than the repair.",
+    "Swahili is the weakest language.",
+    "English is unchanged.",
+    "Arabic is the hardest case.",
+    "The original model is stable and Hindi is flat.",
+    # a language or a model next to a verb that says what happened
+    "English stayed flat.",
+    "Arabic held up.",
+    "A1 lost refusals in Hinglish.",
+    "The naive blend failed.",
+    "A2 passed every check.",
+    "Hindi gained from the repair.",
+    "Swahili showed the biggest change.",
+    "The repaired model became safe.",
+    "BASE remained stable.",
+    "Hinglish crossed the line.",
+    "The repair works.",
+    "A2n helped in Arabic.",
+    "A1 hurt Hindi.",
+    "The repair moved Arabic.",
+    "English fell.",
+    # a measure (usually without a model name) next to a verb or a comparison
+    "Scores fell in every language.",
+    "Caution rose after the repair.",
+    "The refusal rate was lower after the repair.",
+    "Task accuracy stayed the same.",
+    "Attack success improved.",
+    "Over-refusal held steady.",
+    "Safety was worse.",
+]
+
+
+@pytest.mark.parametrize("where", list(SCOPED))
+@pytest.mark.parametrize("sentence", REVIEW_SENTENCES + MORE_SCOPED_RESULTS)
+def test_a_result_about_a_language_or_a_model_fails_in_sections_7_and_8_and_the_front_matter(tmp_path, where, sentence):
+    report = run(tmp_path, SCOPED[where](sentence), draft=True, fill_in=FILL_IN_OK)
+    assert "claims" in rules(report), (where, sentence)
+    assert "has not been measured" in messages(report)
+
+
+@pytest.mark.parametrize("where", list(SCOPED))
+@pytest.mark.parametrize("sentence", REVIEW_SENTENCES)
+def test_the_same_result_inside_a_placeholder_passes_there(tmp_path, where, sentence):
+    name = sentence.rstrip(".")
+    report = run(tmp_path, SCOPED[where](f"<<RESULT: {name}>>."), draft=True, fill_in=FILL_IN_OK + name + "\n")
+    assert "claims" not in rules(report), (where, messages(report))
+
+
+def test_the_new_patterns_are_scoped_to_the_results_sections_and_the_front_matter(tmp_path):
+    # method text in Section 6 may put a language next to a comparison
+    for sentence in ("Hindi has more fine-tuning rows than Swahili does.", "Hinglish has no fine-tuning rows and Arabic has the fewest checks."):
+        report = run(tmp_path, in_data_limits(sentence), draft=True, fill_in=FILL_IN_OK)
+        assert "claims" not in rules(report), (sentence, messages(report))
+
+
+PLAIN_SCOPED_TEXT = [
+    "Every model version is run on the prompts of the report split in each language.",
+    "Each row is one language, and each column is one model version.",
+    "The repaired model is compared with the original model on the same prompts.",
+    "The first column is the fine-tuned model and the second is the repaired model at the chosen alpha.",
+    "Hindi and Arabic are read from the same table as English.",
+    "Does the repair work in Swahili?",
+    "A hatched row means that the change between the two columns is inside the noise.",
+    "The held-out questions are kept apart from the training rows.",
+    "Where the repaired model and the naive blend differ, that difference is what ReSta adds beyond plain averaging.",
+    "The test set holds requests in every language and the judges read each reply.",
+]
+
+
+@pytest.mark.parametrize("where", list(SCOPED))
+@pytest.mark.parametrize("sentence", PLAIN_SCOPED_TEXT)
+def test_plain_text_that_names_a_language_or_a_model_is_not_a_claim(tmp_path, where, sentence):
+    report = run(tmp_path, SCOPED[where](sentence), draft=True, fill_in=FILL_IN_OK)
+    assert "claims" not in rules(report), (where, sentence, messages(report))
+
+
+def test_a_scoped_result_stays_a_claim_through_markdown_marks(tmp_path):
+    for sentence in ("Swahili is the **most** affected language.", "The repair _improved_ [Hindi](h.md) and Arabic.", "> Safety\n> degraded in Swahili."):
+        assert "claims" in rules(run(tmp_path, in_experiments(sentence), draft=True, fill_in=FILL_IN_OK)), sentence
+
+
+
+def test_the_script_says_plainly_that_the_claims_guard_is_a_backstop_and_cannot_be_complete():
+    doc = " ".join(check_article.__doc__.split())
+    assert "text-level backstop" in doc
+    assert "cannot be complete" in doc
+    assert "A person must read the draft" in doc
 
 
 # --- 9. FILL_IN.md and the figure file -----------------------------------------------------------------------------------------------

@@ -25,13 +25,21 @@ article is good, and it does not read the results. The rules, in the order they 
   hype               a short list of hype words is not used.
   claims             DRAFT MODE ONLY. No sentence or heading states the study's result as fact outside a
                      <<RESULT: ...>> placeholder, because nothing has been measured yet (the final article may state
-                     results). In the experiments and the results sections no percentage and no number of points may
-                     stand outside a placeholder either; method settings belong in Sections 1 to 6. This is a text net
-                     with known holes, not a proof: a person reads the draft too.
+                     results). Everywhere: sentences of the shapes in CLAIM_PATTERNS. In the front matter and in the
+                     experiments and results sections, also any sentence that puts a language or a model version next to
+                     a word of comparison or a verb of result (SCOPED_CLAIM_PATTERNS), any percentage, number of points,
+                     decimal or number word with a unit, and any cell of a results table that is not a placeholder or
+                     "Not applicable"; method settings belong in Sections 1 to 6. Alt text, link text and the words
+                     inside bold, italic, code and block quotes are read as plain text.
   placeholders       <<RESULT: name>>, <<LINK: name>> and <<OWNER: name>> are the only markers. With --draft they pass
                      and are listed; without it each one fails. A malformed marker always fails.
   unfinished-markers TODO, TBD, XXX and {{...}} fail in both modes.
   fill-in            DRAFT MODE ONLY. FILL_IN.md beside the article (or --fill-in) has a line for every placeholder.
+
+The claims rule is a text-level backstop. It protects the draft before any result exists, by catching the sentences that
+most often state one, and it cannot be complete: a result can always be worded in a way no pattern knows, and the script
+does not read meaning. It has no list of approved sentences and does not try to cover every idiom. A person must read the
+draft before it is submitted.
 
 HTML comments (<!-- ... -->) do not render, so the rules about content do not read them: a section, a licence sentence or
 the disclosure inside a comment does not count. Placeholders and TODO-style markers are still found inside a comment.
@@ -215,6 +223,46 @@ CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"\b(?:found|finds?)\s+that\b",
             re.I,
         ),
+    ),
+)
+
+# In the front matter (under the title, before the first section) and in the two sections that hold results, a sentence
+# that names a language or a model version has no business using a word of comparison or a verb of result: those places
+# hold questions, pointers and placeholders, and the method is in Sections 1 to 6. The patterns below are stricter than
+# CLAIM_PATTERNS for that reason, and they run only there. They still cannot know every way to say a result.
+_NAME = (
+    r"(?:english|hindi|hinglish|arabic|swahili|original|drifted|repaired|naive blend|resta|the repair"
+    r"|(?-i:BASE|A0|A1|A2n|A2|A3))"
+)
+_NOT_SUPERLATIVES = (
+    "test|request|suggest|interest|rest|west|invest|protest|contest|digest|arrest|attest|manifest|harvest|honest|modest|"
+    "quest|guest|chest|nest|pest|vest|forest|crest"
+)
+_COMPARISON = (
+    r"(?:more|less|fewer|higher|lower|larger|smaller|bigger|wider|narrower|stronger|weaker|greater|worse|better|most|least|"
+    r"safer|permissive|affected|unaffected|stable|flat|unchanged|hardest|weakest|"
+    rf"(?!(?:{_NOT_SUPERLATIVES})\b)\w+est)"
+)
+_RESULT_VERB = (
+    r"(?:dropped|drops|rose|rises|fell|falls|moved|held(?!-out)|stayed|remained|lost|gained|improved|improves|helped|helps|"
+    r"hurt|hurts|beats|works|failed|fails|passed|cleared|crossed|stands? out|saw|showed|became|degraded|degrades)"
+)
+_MEASURE = (
+    r"(?:attack success(?: rates?)?|asr|refusal rates?|refusals?|over-?refusal(?: rates?)?|caution|scores?|safety|"
+    r"task accuracy|accuracy|compliance|alignment|guardrails?|drift|the gap|rates?)"
+)
+SCOPED_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "it puts a language or a model next to a comparison",
+        re.compile(rf"^(?=.*?\b{_NAME}\b)(?=.*?\b{_COMPARISON}\b)", re.I | re.S),
+    ),
+    (
+        "it says what a language or a model did",
+        re.compile(rf"\b{_NAME}\b[^.?!]{{0,80}}?\b{_RESULT_VERB}\b", re.I),
+    ),
+    (
+        "it says what happened to a measure",
+        re.compile(rf"\b{_MEASURE}\b[^.?!]{{0,60}}?\b(?:{_RESULT_VERB}|{_COMPARISON})\b", re.I),
     ),
 )
 
@@ -648,16 +696,27 @@ def check_hype(doc: Doc, report: Report) -> None:
             report.add("hype", f"The word '{m.group(0)}' reads as hype. State what was measured, in plain words.", number)
 
 
+def _strict_spans(doc: Doc) -> list[tuple[int, int]]:
+    """Line ranges where SCOPED_CLAIM_PATTERNS also run: the front matter and the two sections that hold results."""
+    first_section = next((h.line for h in doc.headings if h.level == 2), len(doc.lines) + 1)
+    spans = [(1, first_section - 1)]
+    for title in FIGURE_SECTIONS:
+        spans.extend(doc.sections(title))
+    return spans
+
+
 def check_claims(doc: Doc, report: Report) -> None:
     lines = [(number, _quote_free(text)) for number, text in doc.text_lines()]
     units = [(b.line, b.text) for b in blocks(lines)] + [(h.line, h.text) for h in doc.headings]
+    strict = _strict_spans(doc)
     for line, raw in sorted(units):
         text = _plain(_strip_markers(raw))
+        patterns = CLAIM_PATTERNS + (SCOPED_CLAIM_PATTERNS if any(a <= line <= b for a, b in strict) else ())
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             sentence = sentence.strip()
             if not sentence or sentence.endswith("?"):
                 continue
-            for why, pattern in CLAIM_PATTERNS:
+            for why, pattern in patterns:
                 if pattern.search(sentence):
                     shown = sentence if len(sentence) <= 90 else sentence[:87] + "..."
                     report.add(

@@ -54,7 +54,7 @@ The error rates of the gate come from a simulation that an AI review agent ran d
 - With no true change, the gate passes 0% of the time.
 - With a true rise of 5 points, it passes 0.3% of the time.
 - With a true rise of 10 points, it passes 25% of the time. At 12 points it passes 51% of the time, and at 15 points 84%.
-- If all four non-English languages rise by 8 points, it still passes about 43% of the time. That is the one case whose set-up was recorded. The gate picks the languages that rose most, and that selection makes it easier to pass.
+- If all four non-English languages rise by 8 points, it still passes about 43% of the time. That is the one case whose set-up was recorded. The gate picks its languages after looking at the data, and that selection makes it easier to pass.
 - The clause "the combined rise is clearly above zero" never decides the outcome at 150 prompts per language. The rule of a 10-point rise in two languages does the work.
 
 By these figures the gate rarely passes by accident, and it misses moderate rises often.
@@ -260,7 +260,7 @@ The rule of the gate, its error rates and its three branches are in Section 1. I
 
 A judge model is itself a model, and it can be wrong. To measure that, a second judge, from another model family, labels 60 replies per language. We report how often the two judges agree as Cohen's kappa: 1 means full agreement, 0 means no better than chance. Each kappa comes with an interval. A language is marked low-confidence when the lower end of its interval is below 0.6, when fewer than 30 pairs could be compared, or when no second judge was run. Low-confidence languages are named in the tables and the figures and are never hidden.
 
-No judge candidate's model card names Hinglish, and the Qwen3 language list names Swahili only under "Other", so we expect the weakest judging in those two languages. The measured agreement tells how much that matters. Inter-judge agreement: <<RESULT: inter-judge agreement per language, with intervals>>. Low-confidence languages: <<RESULT: low-confidence languages>>.
+No judge candidate's model card names Hinglish, and the Qwen3 language list names Swahili only under "Other", so judging in those two languages may be unreliable. The measured agreement tells how much that matters. Inter-judge agreement: <<RESULT: inter-judge agreement per language, with intervals>>. Low-confidence languages: <<RESULT: low-confidence languages>>.
 
 ### What else was tried, and what changed
 
