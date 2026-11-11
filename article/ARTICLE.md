@@ -167,6 +167,10 @@ There are 6,000 training rows (1,500 per language), 800 held-out rows (200 per l
 
 There are no Hinglish fine-tuning rows. The fine-tune therefore uses four of the five test languages. It never sees a Hinglish row, so Hinglish is measured as a language that the fine-tune did not train on.
 
+### The public data artifacts
+
+The data this study produced is published as one Hugging Face dataset: <<LINK: dataset on Hugging Face>>. It holds the prompts, one label per judged reply with a short excerpt, one correct or incorrect mark per task question, and the tables and figures. Its card lists every file and the licence of every source. Section 4 says what is released and what is withheld.
+
 ## Experiments and what else was tried
 
 ### What was run
