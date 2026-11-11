@@ -75,6 +75,7 @@ class CellSpec:
     stale_tasks_file: bool = False  # a tasks file beside an eval.json that says "no tasks"
     stale_verdicts_file: bool = False
     gens: bool = True
+    ids: dict[str, list[str]] | None = None  # kind -> prompt ids to use instead of `<lang>-h000` (the export tests need real ones)
 
 
 def _order(lang: str, kind: str, n: int) -> list[int]:
@@ -112,6 +113,9 @@ def write_cell(root, spec: CellSpec) -> dict[str, Any]:
     ids = {kind: [f"{spec.lang}-{tag}{i:03d}" for i in range(n)]
            for kind, tag, n in (("harmful", "h", spec.n_harmful), ("benign_edgy", "b", spec.n_benign),
                                 ("task", "t", spec.n_task))}
+    for kind, given in (spec.ids or {}).items():
+        assert len(given) == n_by_kind[kind], f"{len(given)} ids given for {n_by_kind[kind]} {kind} items"
+        ids[kind] = list(given)
 
     gens, verdicts = [], []
     complied = set(_order(spec.lang, "harmful", spec.n_harmful)[: round(spec.asr * spec.n_harmful)])
@@ -189,9 +193,10 @@ def default_spec(split: str, arm: str, alpha: float | None, lang: str) -> CellSp
 
 
 def build_tree(root, *, langs=config.LANGS, alphas=ALPHAS, overrides=None, report_arms=("A0", "A1", "A2"),
-               dev_arms=("A0", "A1", "A2")) -> Path:
+               dev_arms=("A0", "A1", "A2"), ids=None) -> Path:
     """Dev: A0, A1 and A2 at each alpha (A0 and A1 are the over-refusal references of the alpha choice). Report: A0, A1 and A2 at each alpha. `overrides` maps
-    (split, arm, alpha, lang) to CellSpec keyword changes; `...` in a key matches anything."""
+    (split, arm, alpha, lang) to CellSpec keyword changes; `...` in a key matches anything. `ids(split, lang, kind)`
+    gives the prompt ids of the harmful and benign_edgy items (a test set's own), and so their number."""
     root = Path(root)
     overrides = overrides or {}
     for split, arms in (("dev", dev_arms), ("report", report_arms)):
@@ -199,6 +204,9 @@ def build_tree(root, *, langs=config.LANGS, alphas=ALPHAS, overrides=None, repor
             for alpha in ((None,) if arm in ("A0", "A1", "BASE", "A3") else alphas):
                 for lang in langs:
                     spec = default_spec(split, arm, alpha, lang)
+                    if ids is not None:
+                        spec.ids = {kind: list(ids(split, lang, kind)) for kind in ("harmful", "benign_edgy")}
+                        spec.n_harmful, spec.n_benign = len(spec.ids["harmful"]), len(spec.ids["benign_edgy"])
                     for key, changes in overrides.items():
                         if all(k is ... or k == v for k, v in zip(key, (split, arm, alpha, lang))):
                             for name, value in changes.items():

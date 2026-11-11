@@ -254,3 +254,23 @@ def fake_hf_stack():
         return torch, transformers, log
 
     return build
+
+
+# --- a synthetic PUBLIC export, built once per scenario (Task 20) ------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def public_exports(tmp_path_factory):
+    """`public_exports(scenario)` -> `export_tree.PublicExport`: a frozen fixture test set, a results tree with its
+    report outputs, and the export `scripts/export_public.py` writes from them. Built the first time a scenario is
+    asked for, shared after that: it is READ-ONLY, copy a folder before changing it."""
+    import export_tree
+
+    built = {}
+
+    def get(scenario="default"):
+        if scenario not in built:
+            built[scenario] = export_tree.build_public_export(tmp_path_factory.mktemp(f"public-{scenario}"), scenario)
+        return built[scenario]
+
+    return get
