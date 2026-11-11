@@ -268,8 +268,35 @@ SCOPED_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 # A percentage or a number of points in the experiments and the results sections has to be a result, and a result may
 # only stand inside a placeholder. Method settings (limits, thresholds, margins) belong in the earlier sections.
-_FIGURE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*%|\s+percent\b|[\s-]*(?:percentage[\s-]*)?points?\b|\s*pp\b)", re.I)
+_FIGURE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*%|\s+percent\b|[\s-]*(?:percentage[\s-]*)?(?:points?|pts?|pct)\b|\s*pp\b)", re.I)
+_NUMBER_WORD = (
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
+)
+_FIGURE_SHAPES: tuple[re.Pattern[str], ...] = (
+    _FIGURE,
+    # a decimal ("0.25", ".5"); not a version inside a name ("Qwen3.5") and not a licence version ("CC-BY-4.0")
+    re.compile(r"(?<![\w.])(?<![A-Za-z]-)\d*\.\d+\b"),
+    # a number in words followed by a unit ("twelve points", "twenty-five percent", "ten per cent", "fifteen pct")
+    re.compile(
+        rf"\b{_NUMBER_WORD}(?:[\s-]+{_NUMBER_WORD})*[\s-]*(?:percentage[\s-]*)?(?:points?|percent|per[\s-]*cent|pct|pts?|pp|x)\b",
+        re.I,
+    ),
+    # "a quarter", "half", "3x", "1 in 4", "one in four"
+    re.compile(r"\b(?:quarters?|half|halves)\b", re.I),
+    re.compile(r"\b\d+(?:[.,]\d+)?\s*[x\u00d7](?![\w])", re.I),
+    re.compile(rf"\b(?:\d+|{_NUMBER_WORD})\s+in\s+(?:\d+|{_NUMBER_WORD})\b", re.I),
+)
 FIGURE_SECTIONS: tuple[str, ...] = (REQUIRED_HEADINGS[6], REQUIRED_HEADINGS[7])
+RESULT_TABLES = REQUIRED_HEADINGS[7]  # every data cell of a table here is a placeholder or "Not applicable"
+
+
+def _first_figure(text: str) -> str | None:
+    for shape in _FIGURE_SHAPES:
+        found = shape.search(text)
+        if found:
+            return found.group(0).strip()
+    return None
 
 
 # --- licences and tools the article must write out ---------------------------------------------------------------
@@ -729,17 +756,51 @@ def check_claims(doc: Doc, report: Report) -> None:
     for title in FIGURE_SECTIONS:
         for first, last in doc.sections(title):
             section = [(number, _quote_free(text)) for number, text in doc.text_lines(first, last)]
-            for block in blocks(section):
-                visible = _URL.sub(" ", _plain(_strip_markers(block.text)))
-                figure = _FIGURE.search(visible)
+            found = [(block.line, _URL.sub(" ", _plain(_strip_markers(block.text)))) for block in blocks(section)]
+            # code blocks are not prose, but a result can sit in one as well
+            found += [(number, _strip_markers(doc.lines[number - 1])) for number in range(first, last + 1) if doc.in_code[number - 1]]
+            for number, visible in sorted(found):
+                figure = _first_figure(visible)
                 if figure:
                     report.add(
                         "claims",
-                        f"The figure '{figure.group(0)}' stands outside a <<RESULT: ...>> placeholder in the section '{title}'. "
-                        "In a draft, every percentage and every number of points in that section must be a result inside a "
-                        "placeholder; put method settings (limits, thresholds, margins) in Sections 1 to 6.",
-                        block.line,
+                        f"The figure '{figure}' stands outside a <<RESULT: ...>> placeholder in the section '{title}'. "
+                        "In a draft, every percentage, every number of points and every decimal in that section must be a "
+                        "result inside a placeholder; put method settings (limits, thresholds, margins) in Sections 1 to 6.",
+                        number,
                     )
+    check_result_tables(doc, report)
+
+
+_SEPARATOR_ROW = re.compile(r"^\|?[\s:|-]*-[\s:|-]*\|?$")
+
+
+def check_result_tables(doc: Doc, report: Report) -> None:
+    """In the before and after section every data cell of a table (not its header, not its row label) is a placeholder
+    or 'Not applicable', so that no number or word that reads as a result stands in the table by hand."""
+    for first, last in doc.sections(RESULT_TABLES):
+        rows: list[tuple[int, str]] = []
+        for number, text in doc.text_lines(first, last) + [(last + 2, "")]:  # the sentinel closes the last table
+            stripped = _quote_free(text).strip()
+            if stripped.startswith("|") and (not rows or number == rows[-1][0] + 1):
+                rows.append((number, stripped))
+                continue
+            data = rows[2:] if len(rows) > 1 and _SEPARATOR_ROW.match(rows[1][1]) else rows[1:]
+            for row_number, row in data:
+                cells = [c.strip() for c in _VALID_MARKER.sub("\x00", row).strip("|").split("|")][1:]
+                for cell in cells:
+                    if re.fullmatch(r"[\x00\s,;/()\-]*", cell) and "\x00" in cell:
+                        continue
+                    if re.match(r"not applicable\b", cell, re.I):
+                        continue
+                    shown = _plain(cell) or "(empty)"
+                    report.add(
+                        "claims",
+                        f"The table cell '{shown}' is not a placeholder. In a draft, every data cell of a results table in the "
+                        f"section '{RESULT_TABLES}' must be a <<RESULT: ...>> placeholder or 'Not applicable'.",
+                        row_number,
+                    )
+            rows = [(number, stripped)] if stripped.startswith("|") else []
 
 
 def collect_markers(doc: Doc, report: Report) -> None:

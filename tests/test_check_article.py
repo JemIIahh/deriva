@@ -670,7 +670,7 @@ def test_method_figures_are_fine_in_the_earlier_sections_and_in_final_mode(tmp_p
 
 
 def test_numbers_that_are_not_percentages_or_points_are_not_figures(tmp_path):
-    text = "A second judge labels 60 replies per language, and at least 30 pairs must be comparable at a kappa of 0.6."
+    text = "A second judge labels 60 replies per language, and at least 30 pairs must be comparable."
     article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + text})
     assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
 
@@ -860,6 +860,118 @@ def test_the_script_says_plainly_that_the_claims_guard_is_a_backstop_and_cannot_
     assert "text-level backstop" in doc
     assert "cannot be complete" in doc
     assert "A person must read the draft" in doc
+
+
+# --- 8e. fix round 2: decimals, number words, table cells and code in Sections 7 and 8 -------------------------------------------
+
+
+def in_approach(text):
+    return make_article(sections={APPROACH: PLAIN_APPROACH + "\n\n" + text})
+
+
+FIGURE_SHAPES = [
+    "The weight is 0.25 for the second setting.",
+    "A cut-off of .5 applies here.",
+    "The change was twelve points.",
+    "The change was twenty-five percent.",
+    "The change was ten per cent.",
+    "The change was 12 pts.",
+    "The change was fifteen pct.",
+    "The change was two percentage points.",
+    "The change was a quarter.",
+    "Only a quarter of the replies changed.",
+    "The change was half.",
+    "The change was 1 in 4.",
+    "The change was one in four.",
+    "The change was 3x.",
+    "The change was 3 x.",
+    "The change was 2.5 times.",
+]
+
+
+@pytest.mark.parametrize("sentence", FIGURE_SHAPES)
+@pytest.mark.parametrize("where", ["section 7", "section 8"])
+def test_a_decimal_or_a_number_word_with_a_unit_fails_in_sections_7_and_8(tmp_path, where, sentence):
+    article = {"section 7": in_experiments, "section 8": in_approach}[where](sentence)
+    report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
+    assert "claims" in rules(report), (where, sentence)
+    assert "placeholder" in messages(report)
+
+
+@pytest.mark.parametrize("sentence", FIGURE_SHAPES)
+def test_the_same_figure_shapes_pass_in_the_method_sections_and_inside_a_placeholder(tmp_path, sentence):
+    assert "claims" not in rules(run(tmp_path, in_problem_section(sentence), draft=True, fill_in=FILL_IN_OK)), sentence
+    name = sentence.rstrip(".")
+    article = in_approach(f"<<RESULT: {name}>>.")
+    assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK + name + "\n")), sentence
+
+
+def test_plain_numbers_and_names_with_digits_are_not_figures(tmp_path):
+    safe = [
+        "One judge reads each reply, and five languages are compared.",
+        "A second judge labels 60 replies per language, and at least 30 pairs must be comparable.",
+        "The study has 150 harmful prompts per language, in two splits.",
+        "The judge is Qwen3-4B and the licence is CC-BY-NC-4.0.",
+        "The files are tables.csv, reliability.json and alpha_curve.png.",
+        "Cohen's kappa runs from minus one to one.",
+    ]
+    for sentence in safe:
+        for article in (in_experiments(sentence), in_approach(sentence)):
+            assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), sentence
+
+
+RESULT_TABLE_HEAD = "| Language | Original | Drifted |\n|---|---|---|\n"
+
+
+def with_table(rows):
+    return in_approach(RESULT_TABLE_HEAD + rows)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "| English | yes | no |",
+        "| English | <<RESULT: rate>> | high |",
+        "| English | n/a | <<RESULT: rate>> |",
+        "| English | <<RESULT: rate>> | <<RESULT: rate>> and more text |",
+        "| English | <<RESULT: rate>> | |",
+        "| English | see the figure | <<RESULT: rate>> |",
+    ],
+)
+def test_a_data_cell_in_a_section_8_table_must_be_a_placeholder_or_not_applicable(tmp_path, row):
+    report = run(tmp_path, with_table(row), draft=True, fill_in=FILL_IN_OK + "rate\n")
+    assert "claims" in rules(report), row
+    assert "not a placeholder" in messages(report)
+
+
+def test_placeholders_and_not_applicable_cells_pass_and_headers_and_labels_are_not_data(tmp_path):
+    rows = (
+        "| English | <<RESULT: rate>> | <<RESULT: rate>> |\n"
+        "| Hinglish | <<RESULT: rate>> | Not applicable: no closed-form Hinglish data exists. |\n"
+        "| Swahili | <<RESULT: rate>> / <<RESULT: interval>> | not applicable |"
+    )
+    report = run(tmp_path, with_table(rows), draft=True, fill_in=FILL_IN_OK + "rate\ninterval\n")
+    assert "claims" not in rules(report), messages(report)
+
+
+def test_the_table_cell_rule_covers_every_table_in_section_8_and_only_there(tmp_path):
+    two_tables = RESULT_TABLE_HEAD + "| English | <<RESULT: rate>> | <<RESULT: rate>> |\n\nThe second table follows.\n\n" + RESULT_TABLE_HEAD + "| Hindi | yes | <<RESULT: rate>> |"
+    assert "claims" in rules(run(tmp_path, in_approach(two_tables), draft=True, fill_in=FILL_IN_OK + "rate\n"))
+    in_section_7 = in_experiments(RESULT_TABLE_HEAD + "| English | yes | no |")
+    assert "claims" not in rules(run(tmp_path, in_section_7, draft=True, fill_in=FILL_IN_OK))
+    in_section_6 = in_data_limits(RESULT_TABLE_HEAD + "| English | yes | no |")
+    assert "claims" not in rules(run(tmp_path, in_section_6, draft=True, fill_in=FILL_IN_OK))
+
+
+@pytest.mark.parametrize("code", ["Swahili: 66%", "alpha = 0.5", "drift = twelve points"])
+@pytest.mark.parametrize("where", ["section 7", "section 8"])
+def test_a_figure_inside_a_code_block_in_sections_7_and_8_fails_too(tmp_path, where, code):
+    article = {"section 7": in_experiments, "section 8": in_approach}[where](f"```\n{code}\n```")
+    assert "claims" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), (where, code)
+
+
+def test_a_code_block_in_the_method_sections_may_hold_settings(tmp_path):
+    assert "claims" not in rules(run(tmp_path, in_problem_section("```\nalpha = 0.5\nlearning_rate = 1e-4\n```"), draft=True, fill_in=FILL_IN_OK))
 
 
 # --- 9. FILL_IN.md and the figure file -----------------------------------------------------------------------------------------------
