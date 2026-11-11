@@ -319,8 +319,9 @@ class PublicTable:
             heat_excluded=self.heat_excluded, chosen_alpha=self.chosen_alpha, curve_excluded=self.curve_excluded,
             not_chosen=self.not_chosen, task_not_applicable=self.task_not_applicable,
         )
-        if problem is not None:
-            self.notes.append(f"alpha_curve.png was not drawn: {problem}")
+        note = f"alpha_curve.png was not drawn: {problem}"
+        if problem is not None and note not in self.notes:  # drawing twice must not say it twice
+            self.notes.append(note)
         return written
 
 
@@ -351,7 +352,7 @@ def table_from_public(export_dir: str | Path) -> PublicTable:
     left_out = {(e.arm, e.alpha, e.lang) for e in recorded.exclusions if e.split == REPORT}
     entering = [v for v in verdicts if (v.arm, v.alpha, v.lang) not in left_out]  # the cells the report left out
     try:
-        rows = reportrun._with_status(aggregate.build_table(entering, scores))
+        rows = reportrun.with_status(aggregate.build_table(entering, scores))
     except ValueError as exc:
         raise ReproduceError(f"the public rows cannot be tabulated: {exc}") from None
     for row in rows:
@@ -369,7 +370,7 @@ def table_from_public(export_dir: str | Path) -> PublicTable:
                     f"reliability.json says the heatmap compares {arm}" + (f" at alpha {alpha:g}" if alpha is not None else "")
                     + ", but the public rows have no attack-success rate for it"
                 )
-        deltas, notes = reportrun._paired_deltas(entering, compared[0], compared[1], rows)
+        deltas, notes = reportrun.paired_deltas(entering, compared[0], compared[1], rows)
     heat_excluded, curve_excluded = reportrun.figure_exclusions(recorded.exclusions, compared)
     return PublicTable(
         rows=rows, deltas=deltas, heat=recorded.heat, chosen_alpha=recorded.chosen_alpha,

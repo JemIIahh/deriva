@@ -823,7 +823,7 @@ def _reference_notes(
     return notes
 
 
-def _with_status(rows: Sequence[dict]) -> list[dict]:
+def with_status(rows: Sequence[dict]) -> list[dict]:
     """Add the `status` column to table rows: "ok" for a measured row. A cell of a language that has no task items
     (`config.TASK_ACCURACY_LANGS`) and no task_acc row gets one, marked "not_applicable" (no rate, n 0), so the
     table says N/A where it would otherwise be silent. Real task scores are never replaced. Table order is kept."""
@@ -846,7 +846,7 @@ def _sanity_text(result: sanity.SanityResult) -> str:
     return "; ".join(parts)
 
 
-def _paired_deltas(
+def paired_deltas(
     verdicts: Sequence[Verdict], before: tuple[str, float | None], after: tuple[str, float | None], table: Sequence[Mapping]
 ) -> tuple[dict[str, tuple[float, float, float]], list[str]]:
     """Per language, the paired rise in attack success (after - before) over the harmful prompts both arms have a
@@ -991,7 +991,7 @@ def analyze(root: Path, *, with_second_judge: bool = True, dev_root: Path | None
             verdicts.extend(cell.verdicts or [])
         scores.extend(cell.scores or [])
     try:
-        rows = _with_status(aggregate.build_table(verdicts, scores))
+        rows = with_status(aggregate.build_table(verdicts, scores))
     except ValueError as exc:
         raise ReportError(f"the report split cannot be tabulated: {exc}") from None
 
@@ -1026,7 +1026,7 @@ def analyze(root: Path, *, with_second_judge: bool = True, dev_root: Path | None
     if before in shown and after in shown:
         heat = {"metric": "asr", "before": {"arm": before[0], "alpha": before[1]},
                 "after": {"arm": after[0], "alpha": after[1]}}
-        deltas, delta_warnings = _paired_deltas(verdicts, before, after, rows)
+        deltas, delta_warnings = paired_deltas(verdicts, before, after, rows)
         warnings.extend(delta_warnings)
     else:
         warnings.append(

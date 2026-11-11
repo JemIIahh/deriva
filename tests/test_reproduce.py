@@ -318,11 +318,35 @@ def test_explain_difference_stops_after_a_few_lines_and_says_how_many_more(publi
     assert len(lines) == 6 and "more" in lines[-1]
 
 
+# --- the helpers of reportrun that this module uses are public ---------------------------------------------------------
+
+
+def test_the_report_helpers_reproduce_uses_are_public_names_not_private_ones():
+    assert callable(reportrun.with_status) and callable(reportrun.paired_deltas)
+    assert not hasattr(reportrun, "_with_status") and not hasattr(reportrun, "_paired_deltas")
+    assert "reportrun._" not in Path(reproduce.__file__).read_text(encoding="utf-8")
+
+
+def test_writing_the_figures_twice_notes_an_undrawable_alpha_curve_once(public_exports, tmp_path, monkeypatch):
+    public = reproduce.table_from_public(public_exports().export)
+    monkeypatch.setattr(reportrun, "write_figures", lambda *args, **kwargs: ([], "no point has both numbers"))
+    before = list(public.notes)
+    public.write_figures(tmp_path / "first")
+    public.write_figures(tmp_path / "second")
+    assert [note for note in public.notes if note not in before] == ["alpha_curve.png was not drawn: no point has both numbers"]
+    assert public.notes[: len(before)] == before  # what the table already noted is kept, in order
+
+
 # --- the figures: what is plotted --------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS)
 def test_the_plotted_numbers_of_both_figures_match_the_exported_table(scenario, public_exports, tmp_path):
+    """What this shows, and what it does not. The numbers each figure draws, read from the recomputed table and from the
+    exported one, are the same. Once the two tables are byte for byte equal (the hash check) that follows by itself, so
+    this is a check of `figure_numbers`, not a second, independent piece of evidence. It says nothing about the
+    PUBLISHED heatmap.png and alpha_curve.png: nothing here or in the notebook compares those with the data, a
+    reader looks at them by eye (the notebook says so)."""
     built = public_exports(scenario)
     public = reproduce.table_from_public(built.export)
     recomputed = reproduce.read_table_csv(public.write_tables(tmp_path / "tables.csv"))
