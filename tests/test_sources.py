@@ -358,3 +358,13 @@ def test_load_sources_rejects_a_non_list_document(tmp_path):
     bad.write_text("name: X\n", encoding="utf-8")
     with pytest.raises(ValueError):
         load_sources(bad)
+
+
+@pytest.mark.parametrize("raw", ["- name: [unclosed\n  license: mit\n", "- name: X\n\turl: https://example.com\n"], ids=["unclosed-bracket", "tab-indent"])
+def test_load_sources_turns_invalid_yaml_into_a_value_error_that_names_the_file(tmp_path, raw):
+    # callers catch ValueError for a malformed manifest; a raw yaml.YAMLError would escape as a traceback
+    bad = tmp_path / "sources.yaml"
+    bad.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError, match="sources.yaml") as excinfo:
+        load_sources(bad)
+    assert "YAML" in str(excinfo.value)

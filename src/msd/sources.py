@@ -178,7 +178,11 @@ def validate_sources(entries: Sequence[Any]) -> list[str]:
 def load_sources(path: str | Path) -> list[dict[str, Any]]:
     """Read and validate the manifest; raise ValueError listing every problem if it is malformed."""
     with Path(path).open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+        try:
+            data = yaml.safe_load(fh)
+        except yaml.YAMLError as exc:
+            # callers catch ValueError for a malformed manifest; a raw YAMLError would reach the user as a traceback
+            raise ValueError(f"{path} is not valid YAML: {' '.join(str(exc).split())}") from None
     if not isinstance(data, list):
         raise ValueError(f"{path}: expected a YAML list of entries, got {type(data).__name__}")
     problems = validate_sources(data)
