@@ -7,7 +7,7 @@
    nothing), so this test replaces it.
 2. An absolute path into someone's home folder (the macOS users folder or the Linux home folder, then a user
    name) in code or tests: it works on one laptop and nowhere else, and it leaks the user name. This scan stays
-   in src, scripts, kaggle and tests: notes such as HANDOFF.md at the repo root may name where a thing lives.
+   in src, scripts, kaggle, notebooks and tests: notes such as HANDOFF.md at the repo root may name where a thing lives.
 
 Both scans read bytes, skip files that contain a NUL byte (binary), and run over the files git knows about:
 tracked files plus new files that are not ignored (so a file is checked before its first commit, and the
@@ -34,7 +34,7 @@ REPLACEMENT_PATTERN = re.compile(re.escape(REPLACEMENT_CHARACTER))
 # from pieces so this file does not match itself.
 HOME_PATH_PATTERN = re.compile(rb"(?<![\w.~-])/(?:" + b"Users" + rb"|" + b"home" + rb")/[A-Za-z0-9._-]+")
 
-HOME_DIRS = ("src", "scripts", "kaggle", "tests")  # the FFFD scan has no such list: it covers every file git knows
+HOME_DIRS = ("src", "scripts", "kaggle", "notebooks", "tests")  # the FFFD scan has no such list: it covers every file git knows
 
 
 def scan(paths, pattern: re.Pattern[bytes], root: Path) -> list[str]:
