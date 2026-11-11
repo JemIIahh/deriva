@@ -586,6 +586,95 @@ def test_the_claims_guard_does_not_run_on_the_final_article(tmp_path):
     assert run(tmp_path, draft_article("Fine-tuning made the model less safe in Swahili."), draft=False).ok
 
 
+# --- 8b. fix round 1: the guard must also catch plain rephrasings ------------------------------------------------------------
+
+
+REPHRASED_CLAIMS = [
+    "After fine-tuning, the model complied with more harmful Swahili requests.",
+    "Safety in Hindi was eroded by the fine-tune.",
+    "The drifted model is less safe than the original in Arabic.",
+    "ReSta brought refusals back in every language.",
+    "Hinglish showed the largest drift of the five languages.",
+    "The repair cut attack success by half in Swahili.",
+    "Attack success in Arabic went from 12% to 31%.",
+    "Fine-tuning weakened the model's refusals in Hindi.",
+    "Our measurements show that drift is uneven across languages.",
+    "Drift was found in all four non-English languages.",
+    "The repaired model is safer than the drifted one in every language.",
+    "The gate passed, so the study continued to the repair.",
+]
+
+
+def in_problem_section(sentence):
+    # section 1 has no figure rule, so only the claims patterns can catch the sentence here
+    return make_article(sections={PROBLEM: PIECES["question"] + "\n\n" + sentence})
+
+
+@pytest.mark.parametrize("sentence", REPHRASED_CLAIMS)
+def test_a_rephrased_result_sentence_fails_in_draft_mode(tmp_path, sentence):
+    report = run(tmp_path, in_problem_section(sentence), draft=True, fill_in=FILL_IN_OK)
+    assert "claims" in rules(report), sentence
+    assert "has not been measured" in messages(report)
+
+
+@pytest.mark.parametrize("sentence", REPHRASED_CLAIMS)
+def test_a_rephrased_result_inside_a_result_placeholder_passes(tmp_path, sentence):
+    article = in_problem_section(f"<<RESULT: {sentence.rstrip('.')}>>.")
+    report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK + sentence.rstrip(".") + "\n")
+    assert "claims" not in rules(report), messages(report)
+
+
+@pytest.mark.parametrize("sentence", REPHRASED_CLAIMS)
+def test_a_rephrased_result_sentence_is_also_caught_in_the_experiments_section(tmp_path, sentence):
+    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + sentence})
+    assert "claims" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), sentence
+
+
+def test_a_heading_that_states_a_result_fails(tmp_path):
+    heading = "### Fine-tuning made the model less safe in Swahili"
+    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + heading + "\n\nThe text under the heading is plain and says nothing about a result."})
+    report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
+    assert "claims" in rules(report)
+    assert "Fine-tuning made the model less safe in Swahili" in messages(report)
+
+
+def test_a_heading_that_is_a_question_or_plain_method_is_fine(tmp_path):
+    article = make_article(
+        sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n### Does fine-tuning make the model less safe?\n\nWe ask it of five languages in turn, with the same prompts.\n\n### The safeguards\n\nThey are listed here in plain words."}
+    )
+    assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
+
+
+@pytest.mark.parametrize("text", ["The rate is 31% in Arabic.", "It is 12 points higher in Hindi.", "The gap is 5 percentage points.", "A 10-point rule applies here.", "It is 3 percent."])
+@pytest.mark.parametrize("section", ["EXPERIMENTS", "APPROACH"])
+def test_a_figure_outside_a_placeholder_in_sections_7_and_8_fails_in_draft_mode(tmp_path, text, section):
+    name = {"EXPERIMENTS": EXPERIMENTS, "APPROACH": APPROACH}[section]
+    base = {"EXPERIMENTS": PLAIN_EXPERIMENTS, "APPROACH": PLAIN_APPROACH}[section]
+    report = run(tmp_path, make_article(sections={name: base + "\n\n" + text}), draft=True, fill_in=FILL_IN_OK)
+    assert "claims" in rules(report), text
+    assert "placeholder" in messages(report)
+    assert name in messages(report)
+
+
+def test_a_figure_inside_a_placeholder_in_those_sections_passes(tmp_path):
+    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\nThe rate is <<RESULT: rate in Arabic, 31%>> in Arabic."})
+    assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK + "rate in Arabic, 31%\n"))
+
+
+def test_method_figures_are_fine_in_the_earlier_sections_and_in_final_mode(tmp_path):
+    text = "The sanity gate allows at most 20% empty replies and a fall of at most 10 points in task accuracy."
+    early = make_article(sections={MODELS: PIECES["tiny_licence"] + "\n\n" + PIECES["gated"] + "\n\n" + PIECES["aup"] + "\n\n" + PIECES["nllb"] + "\n\n" + text})
+    assert "claims" not in rules(run(tmp_path, early, draft=True, fill_in=FILL_IN_OK))
+    late = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + text})
+    assert run(tmp_path, late, draft=False).ok  # the final article may state figures
+
+
+def test_numbers_that_are_not_percentages_or_points_are_not_figures(tmp_path):
+    text = "A second judge labels 60 replies per language, and at least 30 pairs must be comparable at a kappa of 0.6."
+    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + text})
+    assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
+
+
 # --- 9. FILL_IN.md and the figure file -----------------------------------------------------------------------------------------------
 
 
@@ -663,6 +752,92 @@ def test_the_article_must_be_utf8(tmp_path):
     article_path.write_bytes(b"# Bad\n\xff\xfe\n")
     result = subprocess.run([sys.executable, str(SCRIPT), str(article_path), str(sources_path)], capture_output=True, text=True)
     assert result.returncode == 2
+
+
+# --- 10b. fix round 1: a broken source list, comments that do not render, names that start alike ----------------------------
+
+
+@pytest.mark.parametrize("raw", ["- name: [unclosed\n  license: mit\n", "- name: fix/harm\n\turl: https://example.org\n"], ids=["unclosed-bracket", "tab-indent"])
+def test_a_source_list_that_is_not_valid_yaml_is_a_usage_error_not_a_traceback(tmp_path, raw):
+    article_path, sources_path = write_case(tmp_path, make_article())
+    sources_path.write_text(raw, encoding="utf-8")
+    with pytest.raises(check_article.UsageError) as excinfo:
+        check_article.check(article_path, sources_path)
+    assert "source list" in str(excinfo.value)
+    result = subprocess.run([sys.executable, str(SCRIPT), str(article_path), str(sources_path)], capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr + result.stdout
+    assert "source list" in result.stderr
+
+
+def comment(text):
+    return "<!-- " + text + " -->"
+
+
+def test_a_whole_section_hidden_in_a_comment_is_missing(tmp_path):
+    article = make_article().replace(f"## {TEAMMATES}\n", f"<!--\n## {TEAMMATES}\n") + "\n-->\n"
+    report = run(tmp_path, article)
+    assert "headings" in rules(report)
+    assert f"'{TEAMMATES}'" in messages(report)
+
+
+def test_a_disclosure_that_sits_in_a_comment_does_not_count(tmp_path):
+    article = make_article(sections={TEAMMATES: "None. " + comment(PIECES["disclosure"])})
+    assert "disclosure" in rules(run(tmp_path, article))
+
+
+def test_a_licence_sentence_that_sits_in_a_comment_does_not_count(tmp_path):
+    models = "\n\n".join([comment(PIECES["tiny_licence"]), PIECES["gated"], PIECES["aup"], PIECES["nllb"]])
+    report = run(tmp_path, make_article(sections={MODELS: models}))
+    assert "licenses-and-tools" in rules(report)
+    assert "licence (CC-BY-NC-4.0)" in messages(report)
+
+
+def test_a_source_row_that_sits_in_a_comment_does_not_count(tmp_path):
+    rows = "| fix/benign | cc-by-4.0 | harmless but edgy prompts |\n| fix/eval | cc-by-sa-4.0 | evaluation only: scores are published |"
+    datasets = "The public sources are listed here with the licence of each one.\n\n" + rows + "\n\n" + comment("| fix/harm | mit | harmful prompts |") + "\n\n" + PIECES["multijail"]
+    report = run(tmp_path, make_article(drop=("harm",), sections={DATASETS: datasets}))
+    assert "source-licenses" in rules(report)
+    assert "fix/harm" in messages(report)
+
+
+def test_an_unterminated_comment_hides_the_rest_of_the_article(tmp_path):
+    article = make_article().replace(f"## {TEAMMATES}\n", f"<!-- never closed\n## {TEAMMATES}\n")
+    assert "headings" in rules(run(tmp_path, article))
+
+
+def test_placeholders_and_unfinished_markers_in_a_comment_are_still_seen(tmp_path):
+    article = make_article(extra="\n" + comment("<<RESULT: hidden result>> and TODO later") + "\n")
+    draft = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
+    assert [p.name for p in draft.placeholders] == ["hidden result"]
+    assert "fill-in" in rules(draft)  # FILL_IN_OK does not list it
+    assert "unfinished-markers" in rules(draft)
+    final = run(tmp_path, article)
+    assert "placeholders" in rules(final)
+
+
+def test_line_numbers_stay_right_after_a_multi_line_comment(tmp_path):
+    article = make_article(extra="\n<!--\none\ntwo\n-->\n## An extra section\n\nWords that make the section long enough to pass the prose rule easily.\n")
+    report = run(tmp_path, article)
+    line = article.splitlines().index("## An extra section") + 1
+    assert any(f.rule == "headings" and f.line == line for f in report.findings), messages(report)
+
+
+def test_a_source_name_that_starts_another_entrys_name_needs_its_own_row(tmp_path):
+    sources = [
+        source_entry("fix/mmlu", "apache-2.0", "task_cross_check"),
+        source_entry("fix/mmlu (fine-tune subset)", "apache-2.0", "fine_tune_data"),
+    ]
+    both = "| fix/mmlu | apache-2.0 | task questions |\n| fix/mmlu (fine-tune subset) | apache-2.0 | training questions |"
+    only_subset = "| fix/mmlu (fine-tune subset) | apache-2.0 | training questions |"
+
+    def article(rows):
+        return make_article(drop=("harm", "benign", "eval"), sections={DATASETS: "The public sources are listed with the licence of each one.\n\n" + rows + "\n\n" + PIECES["multijail"]})
+
+    assert "source-licenses" not in rules(run(tmp_path, article(both), sources=sources))
+    report = run(tmp_path, article(only_subset), sources=sources)
+    assert "source-licenses" in rules(report)
+    assert "'fix/mmlu' " in messages(report) or "'fix/mmlu'" in messages(report)
 
 
 # --- 11. the real article ------------------------------------------------------------------------------------------------------------------------

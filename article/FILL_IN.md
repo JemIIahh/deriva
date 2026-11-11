@@ -5,7 +5,7 @@ The draft in article/ARTICLE.md has no measured result in it. Every place that n
 Steps after the GPU runs:
 
 1. Run the study and the export: `envs/core/bin/python scripts/make_report.py ...` then `envs/core/bin/python scripts/export_public.py --out export/`.
-2. Copy `export/dataset/aggregates/heatmap.png` and `export/dataset/aggregates/alpha_curve.png` next to the article (into article/), see the figures list below.
+2. Copy `export/dataset/aggregates/heatmap.png` and `export/dataset/aggregates/alpha_curve.png` next to the article (into article/), see the figures list below. The checker needs the files to exist next to the article. When the article is published on the Hub, upload both pictures to the Hub first and use their URLs in the two image lines instead of the file names (the checker accepts URLs).
 3. Replace each marker, using the lines below. Delete the marker brackets as well as the name. Write the value in plain words, with its interval.
 4. Run `envs/core/bin/python scripts/check_article.py article/ARTICLE.md data/sources.yaml` with no flag. It must exit 0. That is the state to submit.
 
@@ -21,11 +21,13 @@ Value paths below are relative to the repository, after the report and the expor
 - `<<RESULT: whether arm A3 was built>>`: say yes or no. Source: `results/gate.json` key `branch` (A3 is built only when it is `pivot_prevention`) and whether `export/MANIFEST.json` lists `models/A3/README.md`.
 - `<<LINK: CuratorKIT repository>>`: the URL of the CuratorKIT repository or package page, read from the package that was installed (the version used is in `docs/toolkit-notes.md`).
 - `<<OWNER: SafeTune licence as read from its repository>>`: the owner or a reader opens the LICENSE file in https://github.com/Lexsi-Labs/SafeTune and names the licence in the Section 2 table cell. The study never re-read it. If its terms limit use, add a sentence to the Section 2 licence paragraphs.
+- `<<OWNER: one sentence on what SafeTune's licence allows, as read from its repository>>`: the same reading of the SafeTune LICENSE file, written as one sentence for the SafeTune paragraph of Section 2 (the table cell above names the licence, this sentence says what it allows). If SafeTune's terms limit use, say so here and in the Section 3 licence paragraph.
 - `<<RESULT: judge model ids for dev and report>>`: `reliability.json` key `judge_ids` (`dev` and `report`), and `second_judge_id` for the second judge.
 - `<<OWNER: whether a paid judge was used for the report split, and which one>>`: the owner. Must agree with `reliability.json` key `judge_ids.report`; a stand-in judge and a paid judge are never mixed inside one set of numbers.
 - `<<OWNER: name of the model behind that endpoint and the terms it was used under>>`: the owner. The translator names per language are recorded in `data/testset_build_summary.json` (key `languages`, translator names) and in the dataset card's translators table.
 - `<<OWNER: which model arms were uploaded with weights>>`: the owner. Compare with the model cards listed in `export/MANIFEST.json` under `models/` (the export writes cards and never weights).
 - `<<RESULT: fine-tune training summary, from finetune_summary.json>>`: `results/finetune/<config stem>/finetune_summary.json`, keys `mean_train_loss`, `last_logged_loss`, `rows_seen`, `merged`, `label_check`. One or two plain sentences.
+- `<<RESULT: whether DARE was on for the final run (resta_patch.json)>>`: `results/<split>/A2/<alpha>/resta_patch.json`, the DARE settings it records (on or off, drop rate, seed). Say plainly which it was; if the final runs differ between alphas, say so.
 - `<<RESULT: alpha chosen on dev, with the reason>>`: `reliability.json` key `alpha_choice`: `chosen`, and for the other candidates `candidates[].reasons`, plus `rule` and `over_refusal_margin`. If `chosen` is null, say that no strength qualified and give the reasons.
 - `<<RESULT: freeze hash of the test set>>`: sha256 of `data/testset/MANIFEST.json`, the hash appended to `docs/FREEZE_LOG.md` at the real freeze.
 - `<<RESULT: freeze date>>`: the date on the same line of `docs/FREEZE_LOG.md`.
@@ -37,6 +39,7 @@ Value paths below are relative to the repository, after the report and the expor
 - `<<RESULT: low-confidence languages>>`: `reliability.json` key `low_confidence` (with the reasons), and the `low_confidence` column of `tables.csv`. Say "none" if the key is empty.
 - `<<RESULT: partial or null results in plain words>>`: write from `gate.json` (a gate that did not pass), from `tables.csv` rows whose interval (`lo` to `hi`) leaves the question open, and from `reliability.json` keys `excluded_cells` and `warnings`. If nothing qualifies, write that plainly.
 - `<<OWNER: confirm that no native speaker reviewed the translations or the judge labels>>`: the owner. If someone did, say who by role and for which languages, and remove the matching limit.
+- `<<OWNER: confirm no HF credits (the $20 coupon) were used>>`: the owner. HANDOFF.md says it is unknown whether the coupon was redeemed. If any credits were used, rewrite the sentence in the "With more credits" section and the GPU marker together.
 - `<<RESULT: answer to question 1, drift>>`: `tables.csv` rows `metric=asr`, `arm=A0` against `arm=A1`, per language (`rate`, `lo`, `hi`, `n`), and `gate.json` `passed`. One or two sentences.
 - `<<RESULT: answer to question 2, unequal across languages>>`: the same rows, compared across languages; say which languages differ and whether the intervals overlap.
 - `<<RESULT: answer to question 3, repair>>`: `tables.csv` rows `arm=A1` against `arm=A2` (alpha = `alpha_choice.chosen`) for `asr`, `over_refusal` and `task_acc`, and against the `A2n` rows.
@@ -55,6 +58,7 @@ Value paths below are relative to the repository, after the report and the expor
 - `<<RESULT: cells left out by the sanity gate or the judge-error limit>>`: `reliability.json` key `excluded_cells` (arm, alpha, lang, reason, `failed_checks`) and `sanity_gate`. Say "none" if empty.
 - `<<LINK: reproduction notebook>>`: the URL of notebooks/reproduce.ipynb as published in the code repository (or its Kaggle or Colab copy).
 - `<<RESULT: reproduction check outcome>>`: the notebook's own pass or fail line: the sha256 of the rebuilt `tables.csv` against the `export/MANIFEST.json` entry. Write it as the notebook prints it.
+- `<<OWNER: confirm how much of the code and text Claude Code wrote and reviewed>>`: the owner, in plain words (for example "most of the code and the first draft of the text; reviewed by the author"). Do not write more than the owner confirms.
 - `<<OWNER: confirm what you personally checked, for example the sources, the design decisions and the results>>`: the owner, in one plain sentence about what they checked. Do not claim more than they did.
 - `<<OWNER: decision to keep this disclosure paragraph>>`: the owner decides whether to keep the Claude Code disclosure paragraph in the last section (Teammates tagged). The checker requires a paragraph that names Claude Code, so keep it unless the check rules change.
 
@@ -75,7 +79,11 @@ These statements in the draft were written from the repository as it stood when 
 - 25 sources checked and left out: count the `excluded` entries of `data/sources.yaml` again if it changes.
 - AuditKIT is not used. If the owner adds it, change the last Section 2 paragraph.
 - SafeTune and its licence: see the SafeTune marker above. The DARE default (rate 0.3, seed 0) and the alpha grid are from `src/msd/config.py` and `docs/toolkit-notes.md`; recheck them if the code changes.
-- The gate's pass rates (0%, 0.3%, 25%, 51%, 84%, about 43%) are a reviewer's simulation at 150 harmful prompts per language, copied as the review recorded them. The simulation settings are not saved in the repository.
+- The gate's pass rates (0%, 0.3%, 25%, 51%, 84%, about 43%) are quoted as the review recorded them, with no scenario: they come from a simulation that an AI review agent ran during the build at 150 harmful prompts per language, and its settings were not saved. Only the 43% case (all four languages at 8 points) has a recorded set-up (ledger, Task 3). The article says the simulation will be run again with its settings saved before the figures are relied on. Do that, then replace the figures or soften that paragraph.
 - Limits that come from the working log: held-out interval about 7 points, dev floor 31% against 27 to 28%, 18 near-duplicate template pairs (4 at 0.8 or more), one source twin (astronomy test items 9 and 116). Recompute them if the data is rebuilt.
 - The nine level-2 headings are the organizers' checklist titles, word for word (slide 29 of `reference/kickoff-slides-text.txt`; a test compares them). If the organizers change a title, change `REQUIRED_HEADINGS` in `scripts/check_article.py` and the article's headings together.
 - The sentence under the "With more credits" heading says that no extra credits were used, only free Colab or Kaggle compute. If the final run used anything else, change that sentence and the GPU marker together.
+- Sentences that depend on what the runs produce. Each is written so that it stays true, but read it again after the fill: the Prevention row of the model table in Section 1 (A3 exists only if the gate pivots), the Section 5 bullet "If a repair strength qualified ..." (A2 is in the collection only if an alpha qualified), the heatmap paragraph in Section 8 (it already says what the figure shows when no strength qualified), and "They ran only if the branch reported above says so" in Section 7.
+- The SafeTune markers (table cell and paragraph, Section 2) disappear when filled. If SafeTune's licence turns out to restrict something the article states elsewhere, change that statement too.
+- AuditKIT: the article says the design planned it for measuring and that it is not used. The design document records only the plan, so the article gives no reason; do not add one unless the owner can say why.
+- Figures that are not placeholders (settings, counts, limits) sit in Sections 1 to 6, and the checker lets them stand there. In Sections 7 and 8 the draft checker requires every percentage and every number of points to be a placeholder. After the final fill it no longer minds, so results may be written there as numbers.

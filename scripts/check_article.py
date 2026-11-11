@@ -12,7 +12,8 @@ article is good, and it does not read the results. The rules, in the order they 
   heading-levels     no heading level is skipped (a level 4 under a level 2 is an error).
   source-licenses    every entry of the source list that is not `excluded` is named, with its licence, on one line of
                      the "Models used and their licenses" or the "Datasets and benchmarks used and their licenses" section. An entry with
-                     `redistribute: false` must also say "evaluation only" on that line.
+                     `redistribute: false` must also say "evaluation only" on that line. A row for an entry whose name
+                     starts with another entry's name ("X (fine-tune subset)" and "X") counts only for the longer one.
   licenses-and-tools the licences and tools the study depends on are written out (Tiny Aya's licence, gated access
                      and use policy; AlignTune MIT with its CuratorKIT dependency under LSAL-1.1; unsloth AGPL and
                      mergekit LGPL; the TRL backend only; NLLB CC-BY-NC; the MultiJail ethics statement; the
@@ -22,15 +23,21 @@ article is good, and it does not read the results. The rules, in the order they 
   figures            every image has alt text (at least three words); the per-language heatmap is shown; a local
                      image file exists (in --draft mode it may be missing if FILL_IN.md lists it as still to be added).
   hype               a short list of hype words is not used.
-  claims             DRAFT MODE ONLY. No sentence states the study's result as fact outside a <<RESULT: ...>>
-                     placeholder, because nothing has been measured yet (the final article may state results).
+  claims             DRAFT MODE ONLY. No sentence or heading states the study's result as fact outside a
+                     <<RESULT: ...>> placeholder, because nothing has been measured yet (the final article may state
+                     results). In the experiments and the results sections no percentage and no number of points may
+                     stand outside a placeholder either; method settings belong in Sections 1 to 6. This is a text net
+                     with known holes, not a proof: a person reads the draft too.
   placeholders       <<RESULT: name>>, <<LINK: name>> and <<OWNER: name>> are the only markers. With --draft they pass
                      and are listed; without it each one fails. A malformed marker always fails.
   unfinished-markers TODO, TBD, XXX and {{...}} fail in both modes.
   fill-in            DRAFT MODE ONLY. FILL_IN.md beside the article (or --fill-in) has a line for every placeholder.
 
+HTML comments (<!-- ... -->) do not render, so the rules about content do not read them: a section, a licence sentence or
+the disclosure inside a comment does not count. Placeholders and TODO-style markers are still found inside a comment.
+
 Exit codes: 0 every rule passed; 1 at least one rule failed (each is printed as "FAIL [rule] line N: what is wrong");
-2 a usage problem (a file cannot be read, the source list is malformed).
+2 a usage problem (a file cannot be read, the source list is malformed or not valid YAML).
 
 The headings are the nine sections of the organizers' submission checklist, word for word as slide 29 of
 reference/kickoff-slides-text.txt gives them (a test compares them with that file). If the organizers change a title,
@@ -48,6 +55,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import yaml  # noqa: E402
 from msd.sources import load_sources  # noqa: E402
 
 # The nine section titles of the organizers' submission checklist (reference/kickoff-slides-text.txt, slide 29), word for word.
@@ -96,13 +104,35 @@ HYPE = re.compile(
 # --- the claims guard ----------------------------------------------------------------------------------------------
 # Draft mode only. Each pattern is the shape of a sentence that reports what the study found. The study has not been
 # run yet, so such a sentence may only exist inside a <<RESULT: ...>> placeholder. Present tense ("falls", "adds") and
-# questions are how the draft describes the method and the question, so they pass.
+# questions are how the draft describes the method and the question, so they pass. Headings are checked too. This is a
+# text-level net, not a proof: a result can always be worded in a way no pattern knows, so the figures rule below is a
+# second net, and a human reads the draft before it is submitted.
 
 _GAP = r"[^.?!]{0,50}?"
+_TARGET = (
+    r"(?:safety|refusals?|refusal rate|over[- ]refusal|attack success|asr|compliance|alignment|guardrails|"
+    r"task accuracy|accuracy)"
+)
+_CHANGE_PAST = (
+    r"eroded|weakened|degraded|undermined|damaged|compromised|lowered|reduced|cut|raised|boosted|increased|"
+    r"decreased|worsened|improved"
+)
+_CHANGE_PRESENT = r"erodes|weakens|degrades|undermines|damages|compromises"
+_DRIFT_WORDS = r"(?:drift|gap|rise|erosion|increase|decrease|decline|change|differences?)"
+_SUPERLATIVES = r"(?:largest|biggest|greatest|strongest|widest|weakest|worst|highest|lowest|smallest)"
 CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "it says fine-tuning made the model less safe",
         re.compile(rf"\b(?:made|makes|left|leaves)\b{_GAP}\b(?:less safe|unsafe|more harmful|more vulnerable|less aligned)\b", re.I),
+    ),
+    (
+        "it says a model is less safe, or safer",
+        re.compile(
+            r"\b(?:is|are|was|were|became|become|becomes|remains|remained|stayed|stays)\b[^.?!]{0,40}?\b(?:less safe|safer|more harmful|"
+            r"more vulnerable|less aligned|more unsafe|less robust|more compliant|less compliant|more likely to (?:comply|refuse)|"
+            r"less likely to (?:comply|refuse))\b",
+            re.I,
+        ),
     ),
     (
         "it says safety was restored or repaired",
@@ -115,6 +145,10 @@ CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        "it says something was brought back",
+        re.compile(r"\b(?:brought|put|got)\b[^.?!]{0,40}?\bback\b", re.I),
+    ),
+    (
         "it says the repair worked or failed",
         re.compile(
             r"\b(?:repair|repairs|patch|resta|blend)\b[^.?!]{0,40}?\b(?:worked|succeeded|failed|helped|recovered|"
@@ -125,11 +159,26 @@ CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "it says a rate went up or down",
         re.compile(
-            r"\b(?:attack success|over[- ]refusal|refusal rate|unsafe rate|asr|task accuracy|accuracy|safety)\b[^.?!]{0,40}?"
-            r"\b(?:rose|fell|increased|decreased|dropped|went up|went down|grew|shrank|doubled|halved|climbed|improved|"
+            rf"\b(?:attack success|over[- ]refusal|refusal rate|unsafe rate|asr|task accuracy|accuracy|safety)\b[^.?!]{{0,40}}?"
+            r"\b(?:rose|fell|increased|decreased|dropped|went up|went down|went from|grew|shrank|doubled|halved|climbed|improved|"
             r"declined|worsened)\b",
             re.I,
         ),
+    ),
+    (
+        "it says something was weakened, cut or raised",
+        re.compile(rf"\b(?:{_CHANGE_PAST}|{_CHANGE_PRESENT})\b{_GAP}\b{_TARGET}\b", re.I),
+    ),
+    (
+        "it says something was weakened, cut or raised",
+        re.compile(
+            rf"\b{_TARGET}\b[^.?!]{{0,40}}?\b(?:was|were|is|are|got|gets|has been|have been)\s+(?:\w+ly\s+)?(?:{_CHANGE_PAST})\b",
+            re.I,
+        ),
+    ),
+    (
+        "it says a number went from one value to another",
+        re.compile(r"\b(?:went|goes|moved|climbed|jumped)\s+(?:from|up|down|to)\b", re.I),
     ),
     (
         "it says how large the drift or gap was",
@@ -140,14 +189,39 @@ CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        "it names the largest or smallest drift, gap or rise",
+        re.compile(rf"^(?=.*?\b{_DRIFT_WORDS}\b)(?=.*?\b{_SUPERLATIVES}\b)", re.I | re.S),
+    ),
+    (
+        "it says what the model complied with or refused",
+        re.compile(r"\b(?:complied|refused)\b[^.?!]{0,25}?\b(?:more|fewer|less|most|many|all|almost|nearly|half)\b", re.I),
+    ),
+    (
+        "it says the gate passed or failed",
+        re.compile(
+            r"\bgate\b[^.?!]{0,30}?\b(?:passed|failed|fired|triggered|did not pass)\b|"
+            r"\bthe study (?:continued|pivoted|moved on|went on|switched|carried on)\b",
+            re.I,
+        ),
+    ),
+    (
         "it reports a finding",
         re.compile(
             r"\b(?:we found that|we observed|we observe that|our results show|the results show|results show that|"
-            r"this shows that|this confirms|we confirm|we measured that|turned out)\b",
+            r"this shows that|this confirms|we confirm|we measured that|turned out)\b|"
+            r"\bwe\s+(?:also\s+)?(?:found|saw|observed|measured|detected|noticed)\b|"
+            r"\b(?:shows?|showed|reveals?|revealed|demonstrates?|demonstrated|confirms?|confirmed|indicates?|indicated|suggests?|suggested)\s+that\b|"
+            r"\b(?:was|were|has been|have been)\s+(?:also\s+)?(?:found|observed|seen|detected)\b|"
+            r"\b(?:found|finds?)\s+that\b",
             re.I,
         ),
     ),
 )
+
+# A percentage or a number of points in the experiments and the results sections has to be a result, and a result may
+# only stand inside a placeholder. Method settings (limits, thresholds, margins) belong in the earlier sections.
+_FIGURE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*%|\s+percent\b|[\s-]*(?:percentage[\s-]*)?points?\b|\s*pp\b)", re.I)
+FIGURE_SECTIONS: tuple[str, ...] = (REQUIRED_HEADINGS[6], REQUIRED_HEADINGS[7])
 
 
 # --- licences and tools the article must write out ---------------------------------------------------------------
@@ -324,6 +398,15 @@ def blocks(lines: list[tuple[int, str]]) -> list[Block]:
     return out
 
 
+_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+
+
+def strip_comments(text: str) -> str:
+    """The article as a reader sees it: HTML comments (which do not render) become blanks, line breaks kept so that line
+    numbers stay right. An unterminated comment hides the rest of the page, as it does in a browser."""
+    return _COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
 def _strip_markers(text: str) -> str:
     return _VALID_MARKER.sub(" ", text)
 
@@ -387,13 +470,23 @@ def check_heading_levels(doc: Doc, report: Report) -> None:
 def check_sources(doc: Doc, sources: list[dict], report: Report) -> None:
     lines = doc.section_lines(DATASETS) + doc.section_lines(MODELS)
     where = f"'{DATASETS}' or '{MODELS}'"
+    all_names = [e["name"] for e in sources]
     for entry in sources:
         if entry["used_for"] == "excluded":
             continue
         name, licence = entry["name"], entry["license"]
         name_re = re.compile(r"(?<![A-Za-z0-9_/])" + re.escape(name) + r"(?![A-Za-z0-9_])", re.I)
         licence_re = re.compile(_lic(licence), re.I)
-        named = [(n, t) for n, t in lines if name_re.search(t)]
+        # another entry's longer name may start with this name ("X" and "X (fine-tune subset)"); a row for the longer
+        # one must not count as a row for this one
+        longer = [re.compile(re.escape(n), re.I) for n in all_names if len(n) > len(name) and n.lower().startswith(name.lower())]
+
+        def without_longer(text: str) -> str:
+            for pattern in longer:
+                text = pattern.sub(lambda m: " " * len(m.group(0)), text)
+            return text
+
+        named = [(n, t) for n, t in lines if name_re.search(without_longer(t))]
         if not named:
             report.add("source-licenses", f"The source '{name}' (licence {licence}) is not named in {where}.")
             continue
@@ -531,8 +624,9 @@ def check_hype(doc: Doc, report: Report) -> None:
 
 
 def check_claims(doc: Doc, report: Report) -> None:
-    for block in blocks(doc.text_lines()):
-        text = _strip_markers(block.text)
+    units = [(b.line, b.text) for b in blocks(doc.text_lines())] + [(h.line, h.text) for h in doc.headings]
+    for line, raw in sorted(units):
+        text = _strip_markers(raw)
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             sentence = sentence.strip()
             if not sentence or sentence.endswith("?"):
@@ -544,9 +638,21 @@ def check_claims(doc: Doc, report: Report) -> None:
                         "claims",
                         f"This sentence states a result as fact ({why}), but the result has not been measured yet: "
                         f'"{shown}" Put the result inside a <<RESULT: ...>> placeholder and write the question here.',
-                        block.line,
+                        line,
                     )
                     break
+    for title in FIGURE_SECTIONS:
+        for number, text in doc.section_lines(title):
+            visible = _URL.sub(" ", _IMAGE.sub(" ", _strip_markers(text)))
+            figure = _FIGURE.search(visible)
+            if figure:
+                report.add(
+                    "claims",
+                    f"The figure '{figure.group(0)}' stands outside a <<RESULT: ...>> placeholder in the section '{title}'. "
+                    "In a draft, every percentage and every number of points in that section must be a result inside a "
+                    "placeholder; put method settings (limits, thresholds, margins) in Sections 1 to 6.",
+                    number,
+                )
 
 
 def collect_markers(doc: Doc, report: Report) -> None:
@@ -630,12 +736,13 @@ def check(article_path: Path | str, sources_path: Path | str, *, draft: bool = F
     text = _read(article_path, "the article")
     try:
         sources = load_sources(sources_path)
-    except (OSError, ValueError) as exc:
-        raise UsageError(f"cannot use the source list {sources_path}: {exc}") from None
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise UsageError(f"cannot use the source list {sources_path}: {' '.join(str(exc).split())}") from None
     fill_in_path = Path(fill_in_path) if fill_in_path else article_path.parent / FILL_IN_NAME
     fill_in = _read(fill_in_path, "the fill-in list") if draft and fill_in_path.is_file() else None
 
-    doc = Doc(text)
+    doc = Doc(strip_comments(text))  # what a reader sees: the rules about content read this
+    raw = Doc(text)  # what is in the file: markers and unfinished text are found even inside a comment
     report = Report(draft=draft)
     check_headings(doc, report)
     check_heading_levels(doc, report)
@@ -647,10 +754,10 @@ def check(article_path: Path | str, sources_path: Path | str, *, draft: bool = F
     check_hype(doc, report)
     if draft:
         check_claims(doc, report)
-    collect_markers(doc, report)
+    collect_markers(raw, report)
     if not draft:
         check_placeholders_final(report)
-    check_unfinished(doc, report)
+    check_unfinished(raw, report)
     if draft:
         check_fill_in(report, fill_in, fill_in_path)
     return report
