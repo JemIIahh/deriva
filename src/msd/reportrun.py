@@ -65,6 +65,9 @@ Files written
                       the alpha choice (every candidate with its reasons), what the heatmap compares, warnings. Counts and numbers only: no prompt,
                       completion or excerpt text. Sorted keys, NaN as null, no timestamps.
 
+`write_tables_csv` and `write_figures` write the first three; `msd.reproduce` calls the same two to rebuild tables.csv and
+both figures from the public export, so the report and its reproduction share one writer.
+
 Previous outputs are deleted before anything is read, and again if writing fails half way (a figure error), so a
 failed run leaves no tables that look current and no partial set: either all four files are new or none exists.
 
@@ -880,6 +883,34 @@ def _paired_deltas(
     return deltas, warnings
 
 
+def figure_exclusions(
+    exclusions: Sequence[Exclusion], compared: tuple[tuple[str, float | None], tuple[str, float | None]] | None
+) -> tuple[dict[tuple[str, str], str], dict[str, list[float | str]]]:
+    """What the two figures must say they left out, from the excluded cells (`compared`: the two (arm, alpha) the
+    heatmap shows, or None when there is no heatmap).
+
+    The heatmap's: (language, arm) -> "judge errors" / "sanity check", for an excluded report cell of a compared arm.
+    The alpha curve's: per language the A2 alphas (numbers) and single-model markers (arm names A0, A1) that were
+    left out of the table, so a gap in a line or a missing marker does not go unexplained."""
+    heat_excluded = {
+        (e.lang, e.arm): "judge errors" if e.reason == "judge_error" else "sanity check"
+        for e in exclusions
+        if e.split == REPORT and compared is not None and (e.arm, e.alpha) in compared
+    }
+    left_alphas: dict[str, set[float]] = defaultdict(set)
+    left_arms: dict[str, set[str]] = defaultdict(set)
+    for e in exclusions:
+        if e.split != REPORT:
+            continue
+        if e.arm == CHOICE_ARM and e.alpha is not None:
+            left_alphas[e.lang].add(e.alpha)
+        elif e.arm in REFERENCE_ARMS:
+            left_arms[e.lang].add(e.arm)
+    curve_excluded = {lang: [*sorted(left_arms[lang]), *sorted(left_alphas[lang])]
+                      for lang in sorted(set(left_alphas) | set(left_arms))}
+    return heat_excluded, curve_excluded
+
+
 def analyze(root: Path, *, with_second_judge: bool = True, dev_root: Path | None = None) -> Analysis:
     """Read the results folder and decide everything; writes nothing. Raises ReportError, JudgeError, NoDataError.
 
@@ -1001,23 +1032,7 @@ def analyze(root: Path, *, with_second_judge: bool = True, dev_root: Path | None
         warnings.append(
             f"heatmap.png was not written: there are no attack-success rows for both {before[0]} and {after[0]}"
         )
-    heat_excluded = {
-        (e.lang, e.arm): "judge errors" if e.reason == "judge_error" else "sanity check"
-        for e in exclusions
-        if e.split == REPORT and heat is not None and (e.arm, e.alpha) in (before, after)
-    }
-    # what the alpha curve cannot draw: A2 points and the single-model markers (A0, A1) that were left out
-    left_alphas: dict[str, set[float]] = defaultdict(set)
-    left_arms: dict[str, set[str]] = defaultdict(set)
-    for e in exclusions:
-        if e.split != REPORT:
-            continue
-        if e.arm == CHOICE_ARM and e.alpha is not None:
-            left_alphas[e.lang].add(e.alpha)
-        elif e.arm in REFERENCE_ARMS:
-            left_arms[e.lang].add(e.arm)
-    curve_excluded = {lang: [*sorted(left_arms[lang]), *sorted(left_alphas[lang])]
-                      for lang in sorted(set(left_alphas) | set(left_arms))}
+    heat_excluded, curve_excluded = figure_exclusions(exclusions, (before, after) if heat is not None else None)
     not_chosen = {c.alpha: list(c.over_refusal_failures) for c in choice.candidates if c.over_refusal_failures}
 
     task_na = lang_order({r["lang"] for r in rows if r["status"] == "not_applicable"})
@@ -1104,34 +1119,66 @@ def discard_outputs(out_dir: Path) -> None:
             pass
 
 
-def write_outputs(a: Analysis, out_dir: Path) -> list[Path]:
-    """Write the four files (each through a temp file and a rename); figures that have nothing to draw are skipped."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written = []
-
-    path = out_dir / "tables.csv"
+def write_tables_csv(rows: Sequence[Mapping], path: Path) -> Path:
+    """tables.csv from table rows (`TABLE_COLUMNS`, `FLOAT_DIGITS` decimals), through a temp file and a rename. The one
+    writer of that file: the report and `msd.reproduce` (which rebuilds it from the public rows) both use it, so the
+    same rows are always the same bytes."""
     evalrun.atomic_replace(path, lambda tmp: aggregate.write_table_csv(
-        a.table, tmp, columns=TABLE_COLUMNS, float_digits=FLOAT_DIGITS))
-    written.append(path)
+        rows, tmp, columns=TABLE_COLUMNS, float_digits=FLOAT_DIGITS))
+    return path
 
-    langs = lang_order({r["lang"] for r in a.table})
-    if a.heat is not None:
+
+def write_figures(
+    out_dir: Path,
+    rows: Sequence[Mapping],
+    *,
+    heat: Mapping[str, Any] | None,
+    deltas: Mapping[str, tuple[float, float, float]],
+    low_confidence: set[str],
+    heat_excluded: Mapping[tuple[str, str], str],
+    chosen_alpha: float | None,
+    curve_excluded: Mapping[str, Sequence[float | str]],
+    not_chosen: Mapping[float, Sequence[str]],
+    task_not_applicable: Sequence[str],
+) -> tuple[list[Path], str | None]:
+    """heatmap.png (when `heat` says what it compares) and alpha_curve.png into `out_dir`, each through a temp file and
+    a rename. Returns the files written and, when the alpha curve had nothing to draw, why (it is then not written)."""
+    written = []
+    langs = lang_order({r["lang"] for r in rows})
+    if heat is not None:
         path = out_dir / "heatmap.png"
-        compared = {(a.heat[side]["arm"], a.heat[side]["alpha"]) for side in ("before", "after")}
-        shown_rows = [r for r in a.table if (r["arm"], r["alpha"]) in compared]  # one alpha per arm
+        compared = {(heat[side]["arm"], heat[side]["alpha"]) for side in ("before", "after")}
+        shown_rows = [r for r in rows if (r["arm"], r["alpha"]) in compared]  # one alpha per arm
         evalrun.atomic_replace(path, lambda tmp: report.heatmap(
-            shown_rows, metric="asr", arm_before=a.heat["before"]["arm"], arm_after=a.heat["after"]["arm"],
-            low_conf=set(a.low_confidence), out_path=tmp, deltas=a.deltas, excluded=a.heat_excluded,
+            shown_rows, metric="asr", arm_before=heat["before"]["arm"], arm_after=heat["after"]["arm"],
+            low_conf=set(low_confidence), out_path=tmp, deltas=dict(deltas), excluded=dict(heat_excluded),
         ))
         written.append(path)
+    problem = None
     try:
         path = out_dir / "alpha_curve.png"
         evalrun.atomic_replace(path, lambda tmp: report.alpha_curve(
-            a.table, langs=langs, out_path=tmp, chosen_alpha=a.choice.chosen, excluded=a.curve_excluded,
-            not_chosen=a.not_chosen, not_applicable=a.task_not_applicable))
+            rows, langs=langs, out_path=tmp, chosen_alpha=chosen_alpha, excluded=dict(curve_excluded),
+            not_chosen=dict(not_chosen), not_applicable=list(task_not_applicable)))
         written.append(path)
     except ValueError as exc:
-        a.warnings.append(f"alpha_curve.png was not written: {exc}")
+        problem = str(exc)
+    return written, problem
+
+
+def write_outputs(a: Analysis, out_dir: Path) -> list[Path]:
+    """Write the four files (each through a temp file and a rename); figures that have nothing to draw are skipped."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = [write_tables_csv(a.table, out_dir / "tables.csv")]
+
+    figures, problem = write_figures(
+        out_dir, a.table, heat=a.heat, deltas=a.deltas, low_confidence=set(a.low_confidence),
+        heat_excluded=a.heat_excluded, chosen_alpha=a.choice.chosen, curve_excluded=a.curve_excluded,
+        not_chosen=a.not_chosen, task_not_applicable=a.task_not_applicable,
+    )
+    written.extend(figures)
+    if problem is not None:
+        a.warnings.append(f"alpha_curve.png was not written: {problem}")
 
     path = out_dir / "reliability.json"
     text = json.dumps(reliability_json(a), ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n"
