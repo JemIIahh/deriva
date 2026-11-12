@@ -42,7 +42,7 @@ from typing import Any, Mapping, Sequence
 
 from msd import aggregate, gen, redact, reportrun
 from msd.config import ARMS, LANGS
-from msd.reportrun import REPORT, TABLE_COLUMNS, Exclusion
+from msd.reportrun import DEV, REPORT, TABLE_COLUMNS, Exclusion
 from msd.schema import Prompt, TaskScore, Verdict, write_jsonl
 
 # Where the exporter (msd.export) puts things; tests/test_reproduce.py pins these against it.
@@ -472,10 +472,18 @@ def figure_numbers(rows: Sequence[Mapping], heat: Mapping[str, Any] | None, chos
 # --- the optional GPU section: a small fresh run, compared with the published labels ---------------------------------
 
 
-def rebuild_testset(export_dir: str | Path, out_dir: str | Path, *, lang: str, split: str = REPORT, limit: int | None = None) -> Path:
+def rebuild_testset(export_dir: str | Path, out_dir: str | Path, *, lang: str, split: str = REPORT, limit: int | None = None,
+                    as_split: str | None = None) -> Path:
     """The exported prompts of one language and split, written in the layout the study's scripts read
     (`<out_dir>/<lang>/<split>.jsonl`, one `Prompt` per line), the first `limit` of them; returns `out_dir`, which is what
-    `--testset-dir` takes. A translated prompt keeps its source's licence, as in the test set it was exported from."""
+    `--testset-dir` takes. A translated prompt keeps its source's licence, as in the test set it was exported from.
+
+    `as_split` writes the same prompts under another split label (`<out_dir>/<lang>/<as_split>.jsonl`, each row's split
+    set to it). The GPU spot check uses `as_split="dev"`: run_eval generates the report split only from the frozen test
+    set (a MANIFEST.json that verifies, `msd.genrun`), which a copy rebuilt from the export is not, and the comparison
+    with the published labels goes by prompt id, so the label of the scratch run does not change what is compared."""
+    if as_split is not None and as_split not in (DEV, REPORT):
+        raise ValueError(f"as_split must be {DEV!r} or {REPORT!r}, got {as_split!r}")
     root = Path(export_dir)
     found = []
     for rel in PROMPT_FILES:
@@ -483,12 +491,14 @@ def rebuild_testset(export_dir: str | Path, out_dir: str | Path, *, lang: str, s
             found += [row for _n, row in _jsonl(root / rel, rel) if isinstance(row, dict) and row.get("lang") == lang and row.get("split") == split]
     if not found:
         raise ReproduceError(f"the export has no {split} prompts for language {lang!r} (look at {PROMPT_FILES[0]} and {PROMPT_FILES[1]})")
+    label = split if as_split is None else as_split
     try:
-        prompts = [Prompt(r["id"], r["lang"], r["kind"], r["text"], r["split"], r["source"], r.get("source_license", r["license"]))
+        prompts = [Prompt(r["id"], r["lang"], r["kind"], r["text"], label if as_split else r["split"], r["source"],
+                          r.get("source_license", r["license"]))
                    for r in found[:limit]]
     except (KeyError, TypeError, ValueError) as exc:
         raise ReproduceError(f"a prompt row of {lang}/{split} is not a prompt ({type(exc).__name__})") from None
-    write_jsonl(Path(out_dir) / lang / f"{split}.jsonl", prompts)
+    write_jsonl(Path(out_dir) / lang / f"{label}.jsonl", prompts)
     return Path(out_dir)
 
 

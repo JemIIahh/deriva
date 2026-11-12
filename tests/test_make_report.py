@@ -801,6 +801,9 @@ def test_make_report_reads_what_run_eval_writes(tmp_path, monkeypatch, run):
             write_jsonl(repo / "data" / "testset" / lang / f"{split}.jsonl", [
                 _prompt(f"{lang}-{split}-{i}", lang, "harmful" if i % 2 == 0 else "benign_edgy", split)
                 for i in range(24)])
+    from frozen_testset import freeze_fixture
+
+    freeze_fixture(repo / "data" / "testset")  # only a frozen test set may make the report split (final review I5)
     ft = repo / "data" / "ft"
     ft.mkdir(parents=True)
     for name in ("heldout.jsonl", "taskdev.jsonl"):

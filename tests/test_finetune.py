@@ -1616,6 +1616,19 @@ def test_an_upload_failure_keeps_the_local_result_and_scrubs_the_token(world, to
     assert (world.out / "merged" / "config.json").is_file() and (world.out / "finetune_summary.json").is_file()
 
 
+def test_an_upload_failure_message_is_redacted_like_every_other_secret_not_only_hf_tokens(world, token, monkeypatch,
+                                                                                           capsys):
+    """final review minor 12: the upload error is passed through msd.gen's redaction, which also covers the value of
+    any secret-looking environment variable (a judge key, a translation key), not only the shape of a HF token."""
+    other = "SENTINEL-plain-secret-value-42"
+    monkeypatch.setenv("MSD_TRANSLATE_API_KEY", other)
+    api = FakeApi(upload_error=RuntimeError(f"proxy said: bad credentials {other}"))
+    assert world.run("--push-to", "my-org/a1", api_factory=ApiFactory(api)) == 1
+    out = capsys.readouterr()
+    assert other not in out.out + out.err and TOKEN not in out.out + out.err
+    assert "upload" in out.err and "proxy said" in out.err and "kept" in out.err
+
+
 def test_push_to_without_hf_token_is_a_usage_error(world, capsys):
     assert world.run("--push-to", "my-org/a1", api_factory=forbidden) == 2
     assert "HF_TOKEN" in capsys.readouterr().err

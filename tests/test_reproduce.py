@@ -413,6 +413,44 @@ def test_the_published_prompts_of_one_language_are_rebuilt_in_the_layout_the_scr
     assert len(read_jsonl(whole / "en" / "report.jsonl", Prompt)) == 52
 
 
+def test_the_rebuilt_prompts_can_be_labelled_as_a_dev_scratch_run(public_exports, tmp_path):
+    """The GPU spot check generates from a copy rebuilt from the export. run_eval generates the report split only from
+    the frozen test set, so the copy is written as a dev-labelled scratch set: same ids, same texts, split "dev"."""
+    from msd.schema import Prompt, read_jsonl
+
+    export = public_exports().export
+    as_report = read_jsonl(reproduce.rebuild_testset(export, tmp_path / "a", lang="hi", limit=20) / "hi" / "report.jsonl", Prompt)
+    folder = reproduce.rebuild_testset(export, tmp_path / "b", lang="hi", limit=20, as_split="dev")
+    assert sorted(p.name for p in (folder / "hi").iterdir()) == ["dev.jsonl"]
+    as_dev = read_jsonl(folder / "hi" / "dev.jsonl", Prompt)
+    assert [(p.id, p.text, p.kind, p.source, p.license) for p in as_dev] == [
+        (p.id, p.text, p.kind, p.source, p.license) for p in as_report]
+    assert {p.split for p in as_dev} == {"dev"}
+    with pytest.raises(ValueError, match="as_split"):
+        reproduce.rebuild_testset(export, tmp_path / "c", lang="hi", as_split="test")
+
+
+def test_run_eval_generates_from_the_dev_labelled_copy_and_refuses_the_report_labelled_one(public_exports, tmp_path, capsys):
+    """What the GPU section relies on, run for real with the fake backend and the fake judge in a scratch folder: the
+    freeze gate refuses a report-split generation from a copy that has no MANIFEST.json, and lets the dev-labelled
+    copy through; the fresh labels are then read by prompt id against the published report labels."""
+    from msd import evalrun
+
+    export = public_exports().export
+    common = ["--arm", "A1", "--backend", "fake", "--judge", "fake", "--langs", "hi", "--limit", "5",
+              "--stages", "generate,judge", "--ft-dir", str(tmp_path / "no-task-items")]
+    report_copy = reproduce.rebuild_testset(export, tmp_path / "as-report", lang="hi", limit=5)
+    assert evalrun.main([*common, "--split", "report", "--testset-dir", str(report_copy), "--out", str(tmp_path / "r")],
+                        root=tmp_path) == 1
+    assert "frozen test set" in capsys.readouterr().err and not (tmp_path / "r" / "report" / "A1").exists()
+    dev_copy = reproduce.rebuild_testset(export, tmp_path / "as-dev", lang="hi", limit=5, as_split="dev")
+    assert evalrun.main([*common, "--split", "dev", "--testset-dir", str(dev_copy), "--out", str(tmp_path / "d")],
+                        root=tmp_path) == 0
+    fresh = tmp_path / "d" / "dev" / "A1" / "none" / "hi.verdicts.jsonl"
+    counted = reproduce.compare_with_published(export, fresh, arm="A1", alpha=None, lang="hi")
+    assert counted["compared"] == 5 and counted["only_fresh"] == 0
+
+
 def test_rebuilding_for_a_language_the_export_has_no_prompts_for_is_refused(public_exports, tmp_path):
     with pytest.raises(reproduce.ReproduceError, match="no report prompts for language 'xx'"):
         reproduce.rebuild_testset(public_exports().export, tmp_path / "t", lang="xx")

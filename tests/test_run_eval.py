@@ -20,6 +20,7 @@ from msd.aggregate import build_table
 from msd.evalrun import JudgeMixError
 from msd.gen import GenOut
 from msd.schema import Generation, Prompt, TaskScore, Verdict, read_jsonl, write_jsonl
+from frozen_testset import freeze_fixture
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "run_eval.py"
 MARK = "SENTINEL-PROMPT-TEXT"  # stands in for safety prompt text; it must never be printed or stored in eval.json
@@ -240,8 +241,9 @@ def test_writes_one_file_set_per_arm_alpha_lang(repo, scratch, model, judge, cap
     langs = ("en", "hi")
     build_testset(repo, langs, split="report", n=6)
     build_tasks(repo, "heldout.jsonl", langs, n=4)
-    assert run_cli(repo, *args_for(scratch, arm="A1", split="report")) == 0
-    assert run_cli(repo, *args_for(scratch, "--alpha", "0.25", arm="A2", split="report")) == 0
+    freeze_fixture(repo / "data" / "testset")  # only a frozen test set may make the report split
+    assert run_cli(repo, *args_for(scratch, "--langs", "en,hi", arm="A1", split="report")) == 0
+    assert run_cli(repo, *args_for(scratch, "--langs", "en,hi", "--alpha", "0.25", arm="A2", split="report")) == 0
     for arm, alpha, alpha_dir in (("A1", None, "none"), ("A2", 0.25, "0.25")):
         for lang in langs:
             folder = scratch / "report" / arm / alpha_dir
@@ -390,8 +392,9 @@ def test_report_split_uses_heldout_and_dev_split_uses_taskdev(repo, scratch, mod
     build_testset(repo, split="report", n=2)
     build_tasks(repo, "taskdev.jsonl", n=3)
     heldout = build_tasks(repo, "heldout.jsonl", n=5)
-    assert run_cli(repo, *args_for(scratch, split="dev")) == 0
-    assert run_cli(repo, *args_for(scratch, split="report")) == 0
+    freeze_fixture(repo / "data" / "testset")
+    assert run_cli(repo, *args_for(scratch, "--langs", "en", split="dev")) == 0
+    assert run_cli(repo, *args_for(scratch, "--langs", "en", split="report")) == 0
     assert len(read_jsonl(evalrun.tasks_path(scratch, "dev", "A1", None, "en"), TaskScore)) == 3
     assert len(read_jsonl(evalrun.tasks_path(scratch, "report", "A1", None, "en"), TaskScore)) == 5
     assert heldout.name == "heldout.jsonl"
@@ -999,6 +1002,7 @@ def test_eval_json_has_no_text_and_no_secrets(repo, scratch, model, judge, monke
         "arm", "alpha", "lang", "split", "model_path", "backend", "judge_id", "judge", "n_generations", "n_by_kind",
         "finish_reasons", "truncation", "truncation_safety", "empty_outputs", "empty_or_error", "verdicts",
         "judge_error", "tasks", "task_skipped", "warnings",  # "judge" is the one key added with the judge configuration
+        "testset_manifest_sha256",  # added by the report-split freeze gate (final review I5); None on the dev split
     }
     assert "timestamp" not in text  # no clock: a rerun must be byte-identical
 
@@ -1308,10 +1312,11 @@ def test_output_files_feed_the_aggregation(repo, scratch, model, judge):
     langs = ("en", "hi")
     build_testset(repo, langs, split="report", n=8)
     build_tasks(repo, "heldout.jsonl", langs, n=4)
+    freeze_fixture(repo / "data" / "testset")
     cells = [("A0", None), ("A1", None), ("A2", 0.5)]
     for arm, alpha in cells:
         extra = ["--alpha", str(alpha)] if alpha is not None else []
-        assert run_cli(repo, *args_for(scratch, *extra, arm=arm, split="report")) == 0
+        assert run_cli(repo, *args_for(scratch, "--langs", "en,hi", *extra, arm=arm, split="report")) == 0
     verdicts, scores = [], []
     for arm, alpha in cells:
         for lang in langs:
@@ -1743,7 +1748,7 @@ def test_eval_json_records_the_judge_configuration_next_to_the_id(repo, scratch,
     assert report["judge"] == {"type": "stub", "model": "m", "max_tokens": 512, "sampling": "default",
                                "template_fingerprint": template_fingerprint(), "retries": 2,
                                "max_consecutive_failures": MAX_CONSECUTIVE_FAILURES}
-    assert set(report) == PRE_EXISTING_KEYS | {"judge"}  # additive: nothing else changed
+    assert set(report) == PRE_EXISTING_KEYS | {"judge", "testset_manifest_sha256"}  # additive: nothing else changed
 
 
 def test_a_judge_without_config_still_records_the_runner_settings(repo, scratch, model, judge):
@@ -1806,3 +1811,38 @@ def test_usage_is_optional_and_only_whole_numbers_are_printed(repo, scratch, tmp
     assert run_cli(repo, *args_for(tmp_path / "other_out", judge_name="c2")) == 0
     err = capsys.readouterr().err
     assert "judge usage: calls 2, input_tokens 10" in err and SECRET_IN_MESSAGE not in err and "1.5" not in err
+
+
+# --- final review I5: the report split is generated only from the frozen test set ------------------------------------
+
+
+def test_run_eval_refuses_to_generate_the_report_split_from_a_test_set_that_is_not_frozen(repo, scratch, model, judge,
+                                                                                          capsys):
+    build_testset(repo, split="report", n=4)
+    build_tasks(repo, "heldout.jsonl", n=2)
+    assert run_cli(repo, *args_for(scratch, "--langs", "en", split="report")) == 1
+    err = capsys.readouterr().err
+    assert "MANIFEST.json missing" in err and "build_testset.py --langs all --freeze" in err and "verify_freeze.py" in err
+    assert len([line for line in err.splitlines() if line.startswith("error: ")]) == 1 and "Traceback" not in err
+    assert model.built == 0 and judge.calls == [] and not scratch.exists()
+
+
+def test_eval_json_records_the_manifest_sha256_of_the_frozen_set_the_report_split_came_from(repo, scratch, model, judge):
+    build_testset(repo, split="report", n=4)
+    build_tasks(repo, "heldout.jsonl", n=2)
+    sha = freeze_fixture(repo / "data" / "testset")
+    assert run_cli(repo, *args_for(scratch, "--langs", "en", split="report", model_args=True)) == 0
+    report = json.loads(evalrun.eval_path(scratch, "report", "A1", None, "en").read_text(encoding="utf-8"))
+    assert report["testset_manifest_sha256"] == sha
+    # a later judge-only run (no model, for example on the Mac) keeps it: it comes from the gens meta
+    assert run_cli(repo, *args_for(scratch, "--langs", "en", "--stages", "judge,task", split="report",
+                                   model_args=False)) == 0
+    report = json.loads(evalrun.eval_path(scratch, "report", "A1", None, "en").read_text(encoding="utf-8"))
+    assert report["testset_manifest_sha256"] == sha
+
+
+def test_the_dev_split_needs_no_freeze_and_its_eval_json_says_none(repo, scratch, model, judge):
+    build_testset(repo, n=4)
+    assert run_cli(repo, *args_for(scratch, "--langs", "en")) == 0
+    report = json.loads(evalrun.eval_path(scratch, "dev", "A1", None, "en").read_text(encoding="utf-8"))
+    assert report["testset_manifest_sha256"] is None

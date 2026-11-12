@@ -89,7 +89,7 @@ from typing import Any, NamedTuple
 
 import yaml
 
-from msd import ftdata
+from msd import ftdata, gen
 from msd.atomicdir import atomic_output_dir, check_out_dir, note_stale_partials
 from msd.config import LANGS
 from msd.restarun import scrub
@@ -1673,9 +1673,10 @@ def execute(args: argparse.Namespace, root: Path, hooks: Hooks) -> int:
                 folder_path=str(out / cfg.output.merged_dir), repo_id=args.push_to, repo_type="model",
                 commit_message=f"A1 fine-tune ({stem}); training data sha256 {check.sha256}",
             )
-        except Exception as exc:
+        except Exception as exc:  # the message of a Hub error can quote a header or a key: redacted like every other
             raise FinetuneError(
-                f"the upload to {args.push_to} failed ({type(exc).__name__}: {exc}); the training result is kept in {shown(out, root)}"
+                f"the upload to {args.push_to} failed ({type(exc).__name__}: {gen._redact(scrub(str(exc)))}); the training "
+                f"result is kept in {shown(out, root)}"
             ) from None
         print(f"uploaded {shown(out / cfg.output.merged_dir, root)} to the private repo {args.push_to}")
     return EXIT_OK

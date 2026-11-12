@@ -15,6 +15,7 @@ import pytest
 from msd import gen, genrun
 from msd.gen import GenOut
 from msd.schema import Generation, Prompt, read_jsonl, write_jsonl
+from frozen_testset import freeze_fixture
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "generate.py"
 MARK = "SENTINEL-PROMPT-TEXT"  # stands in for prompt text; it must never be printed
@@ -306,7 +307,8 @@ def test_the_argument_helpers_and_error_tuple_are_public_and_leave_no_private_al
 
 def test_report_split_reads_report_files(repo, scratch):
     build_testset(repo, n=3, split="report")
-    assert run_cli(repo, *fake_args(scratch, split="report")) == 0
+    freeze_fixture(repo / "data" / "testset")  # only a frozen test set may make the report split
+    assert run_cli(repo, *fake_args(scratch, "--langs", "en", split="report")) == 0
     assert (scratch / "report" / "A0" / "none" / "en.gens.jsonl").is_file()
 
 
@@ -775,3 +777,57 @@ def test_script_exit_code_is_nonzero_when_nothing_could_be_generated(tmp_path):
     done = run_script("--arm", "A0", "--split", "dev", "--backend", "fake", "--langs", "sw",
                       "--testset-dir", str(tmp_path / "empty"), "--out-root", str(tmp_path / "out"))
     assert done.returncode not in (0, 2)
+
+
+# --- final review I5: the report split is generated only from the frozen test set ------------------------------------
+
+
+def test_the_report_split_is_refused_without_a_frozen_test_set_and_nothing_is_generated(repo, scratch, hf, capsys):
+    build_testset(repo, n=3, split="report")
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en", split="report")) == 1
+    err = capsys.readouterr().err
+    assert "MANIFEST.json missing" in err and "report split" in err
+    assert "build_testset.py --langs all --freeze" in err and "verify_freeze.py" in err  # says what to run
+    assert "Traceback" not in err and MARK not in err
+    assert hf.built == [] and not scratch.exists()
+
+
+def test_a_test_set_changed_after_its_freeze_is_refused_for_the_report_split(repo, scratch, hf, capsys):
+    build_testset(repo, n=3, split="report")
+    freeze_fixture(repo / "data" / "testset")
+    path = repo / "data" / "testset" / "en" / "report.jsonl"
+    rows = read_jsonl(path, Prompt)
+    write_jsonl(path, rows + [Prompt("en-added", "en", "harmful", f"{MARK} added", "report", "fixture", "fixture")])
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en", split="report")) == 1
+    err = capsys.readouterr().err
+    assert "en/report.jsonl" in err and "sha256 changed" in err and "verify_freeze.py" in err
+    assert hf.built == [] and not scratch.exists()
+
+
+def test_the_report_split_of_a_frozen_set_runs_and_its_meta_records_the_manifest_sha256(repo, scratch, hf):
+    build_testset(repo, n=3, split="report")
+    sha = freeze_fixture(repo / "data" / "testset")
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en", split="report")) == 0
+    meta = json.loads(gen.meta_path(gen.gens_path(scratch, "report", "A0", None, "en")).read_text(encoding="utf-8"))
+    assert meta["testset_manifest_sha256"] == sha and len(sha) == 64
+
+
+def test_the_dev_split_is_not_gated_on_the_freeze_and_records_no_manifest(repo, scratch, hf):
+    build_testset(repo, n=3)  # dev only, no MANIFEST.json
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en")) == 0
+    meta = json.loads(gen.meta_path(gen.gens_path(scratch, "dev", "A0", None, "en")).read_text(encoding="utf-8"))
+    assert "testset_manifest_sha256" not in meta
+
+
+def test_report_rows_made_under_one_freeze_are_not_continued_under_another(repo, scratch, hf, capsys):
+    build_testset(repo, n=4, split="report")
+    base = repo / "data" / "testset"
+    first = freeze_fixture(base)
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en", "--limit", "2", split="report")) == 0
+    write_jsonl(base / "hi" / "dev.jsonl", [Prompt("hi-dev-other", "hi", "harmful", "other", "dev", "fixture", "fixture")])
+    (base / "MANIFEST.json").unlink()
+    second = freeze_fixture(base)  # a refreeze: the en report rows are the same, the set is not
+    assert second != first
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en", split="report")) == 1
+    assert "testset_manifest_sha256" in capsys.readouterr().err  # two test sets must not share one gens file
+    assert run_cli(repo, *hf_args(scratch, "--langs", "en", "--force-new-meta", split="report")) == 0

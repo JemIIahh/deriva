@@ -45,6 +45,11 @@ so arms can be rejudged one at a time (their files are not touched). The verdict
 cache and replaced atomically (temp file, fsync, rename) at the end of each language, rows in gens order; a
 killed run loses at most the judge calls since the last cached label.
 
+The report split is generated only from the frozen test set (`msd.genrun`): `<testset-dir>/MANIFEST.json` must exist
+and verify, or the generate stage refuses with the commands to run (`scripts/build_testset.py --langs all --freeze`,
+then `scripts/verify_freeze.py`). eval.json records that manifest's sha256 (`testset_manifest_sha256`, taken from the
+gens meta; null for the dev split, which is not gated).
+
 Refusals (all before the first judge call): a gens file whose meta says backend "fake", or whose text carries
 the fake marker, on the real results root; a gens file with rows but no meta; ids that are not in the current
 prompt list of this split (a stale file from another test-set build); a torn or incomplete gens file. Row
@@ -829,6 +834,8 @@ def _eval_report(
         "split": args.split,
         "model_path": meta.get("model_path"),
         "backend": meta.get("backend"),
+        # the frozen test set the report split was generated from (msd.genrun gates it); None for the dev split
+        "testset_manifest_sha256": meta.get("testset_manifest_sha256"),
         "judge_id": gen._redact(judge_id) if judge_id else None,
         "judge": judge_section,
         "n_generations": n_total,

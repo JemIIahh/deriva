@@ -368,7 +368,8 @@ def test_a_missing_export_folder_fails_with_a_message_that_says_where_to_look(tm
 # --- the optional GPU section: never run by default, but its commands are checked --------------------------------------
 
 
-GPU_ON = (("RUN_GPU = False", "RUN_GPU = True"), ('"YOUR-HF-USERNAME/published-A1-model"', '"someone/published-A1"'))
+GPU_ON = (("RUN_GPU = False", "RUN_GPU = True"), ('"YOUR-HF-USERNAME/published-A1-model"', '"someone/published-A1"'),
+          ('JUDGE = "EDIT-ME', 'JUDGE = "anthropic:claude-test-judge"  # "EDIT-ME'))
 
 
 @pytest.fixture
@@ -386,7 +387,8 @@ def fake_gpu_run(monkeypatch, ipython_stub):
         assert check is True and Path(argv[1]).name == "run_eval.py" and argv[1].endswith("scripts/run_eval.py")
         args = evalrun.parse_args(argv[2:], root=ROOT)
         calls.append(args)
-        prompts = read_jsonl(Path(args.testset_dir) / args.langs[0] / "report.jsonl", Prompt)[: args.limit]
+        prompts = read_jsonl(Path(args.testset_dir) / args.langs[0] / f"{args.split}.jsonl", Prompt)[: args.limit]
+        assert {p.split for p in prompts} == {args.split}  # run_eval checks that every row belongs to the split
         published = {}
         for line in (Path("export") / "dataset/results_public/report/A1/none/hi.verdicts.jsonl").read_text("utf-8").split("\n"):
             if line:
@@ -407,8 +409,10 @@ def test_the_gpu_section_when_switched_on_builds_a_command_run_eval_accepts_and_
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-value-for-test")
     run_cells(replace=GPU_ON)
     (args,) = fake_gpu_run
-    assert (args.arm, args.split, list(args.langs), args.limit, args.model_path) == ("A1", "report", ["hi"], 20, "someone/published-A1")
-    assert args.judge == "anthropic:claude-sonnet-5-5" and list(args.stages) == ["generate", "judge"]
+    # the spot check runs as a dev-labelled scratch run: run_eval generates the report split only from the frozen
+    # test set (a MANIFEST.json that verifies), and a copy rebuilt from the export is not that (final review I5)
+    assert (args.arm, args.split, list(args.langs), args.limit, args.model_path) == ("A1", "dev", ["hi"], 20, "someone/published-A1")
+    assert args.judge == "anthropic:claude-test-judge" and list(args.stages) == ["generate", "judge"]
     assert not (Path(args.ft_dir) / "heldout.jsonl").exists()  # no task items are generated for a 20-item check
     out = capsys.readouterr().out
     assert "10 of 20 labels equal the published ones" in out
@@ -447,8 +451,19 @@ def test_the_gpu_section_refuses_the_placeholder_model_id(notebook_dir, fake_gpu
     monkeypatch.setenv("HF_TOKEN", "dummy-value-for-test")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-value-for-test")
     with pytest.raises(AssertionError, match="edit MODEL"):
-        run_cells(replace=GPU_ON[:1])
+        run_cells(replace=GPU_ON[:1] + GPU_ON[2:])
     assert fake_gpu_run == []
+
+
+def test_the_gpu_section_refuses_the_placeholder_judge_and_points_at_reliability_json(notebook_dir, fake_gpu_run, monkeypatch):
+    """final review minor 16: no real-looking judge id is hard-coded; the reader must copy the one reliability.json names."""
+    monkeypatch.setenv("HF_TOKEN", "dummy-value-for-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-value-for-test")
+    with pytest.raises(AssertionError, match=r"edit JUDGE.*reliability\.json"):
+        run_cells(replace=GPU_ON[:2])
+    assert fake_gpu_run == []
+    src = next(c for c in code_cells() if re.search(r"^RUN_GPU\s*=", c, re.M))
+    assert "claude-sonnet" not in src and "reliability.json" in src
 
 
 # --- the cells run, in a real notebook kernel (only when a runner is installed) ---------------------------------------

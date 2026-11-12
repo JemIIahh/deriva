@@ -32,9 +32,16 @@ language: duplicate prompt ids, a corrupt or foreign existing gens file, a meta 
 Resuming after a crash is therefore: run the same command again (same settings).
 There is one writer per output file; do not start two runs on the same --out-root at once.
 
+The report split is generated only from the frozen test set: `<testset-dir>/MANIFEST.json` must exist
+and pass `msd.testset.verify_freeze` (the check `scripts/verify_freeze.py` makes), else nothing is
+generated and the message says what to run. The sha256 of that MANIFEST.json goes into the meta as
+`testset_manifest_sha256` and is part of the setup, so rows made under two freezes never share a file.
+The dev split is not gated (it records no manifest).
+
 Exit codes: 0 done; 2 usage error (bad arguments, fake backend aimed at results/); 3 none of the
-requested languages has a test-set file; 1 any other failure (a refused or corrupt file, a backend
-or model error). Never 0 on an error. Prompt texts and completions are never printed.
+requested languages has a test-set file; 1 any other failure (a refused or corrupt file, a test set
+that is not frozen for the report split, a backend or model error). Never 0 on an error. Prompt texts
+and completions are never printed.
 """
 
 from __future__ import annotations
@@ -49,7 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from msd import gen
+from msd import gen, testset
 from msd.config import ARMS, LANGS
 from msd.schema import SPLITS, Prompt, read_jsonl
 
@@ -57,13 +64,36 @@ EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_NO_DATA = 0, 1, 2, 3
 
 # The setup fields: a gens file must be made with one value of each (commit, version and time may change).
 SETUP_KEYS: tuple[str, ...] = (
-    "model_path", "arm", "alpha", "batch_size", "max_new_tokens", "dtype", "backend",
+    "model_path", "arm", "alpha", "batch_size", "max_new_tokens", "dtype", "backend", "testset_manifest_sha256",
 )
 DTYPES: tuple[str, ...] = ("float16", "bfloat16", "float32")
 
 
 class MetaMismatchError(RuntimeError):
     """An existing meta file records a different setup (or cannot be read)."""
+
+
+class FreezeGateError(RuntimeError):
+    """The report split was asked for, but the test set is not frozen: no MANIFEST.json, or one that does not verify."""
+
+
+def report_freeze_sha256(testset_dir: str | Path) -> str:
+    """The sha256 of `<testset_dir>/MANIFEST.json` once `msd.testset.verify_freeze` found nothing wrong with the set.
+
+    Only the frozen test set may make report-split generations (design: "Freeze order"): the study's numbers come
+    from the report split, and they must come from the set whose hash is in docs/FREEZE_LOG.md. Raises
+    FreezeGateError, naming the first problems and the commands that fix them, before anything is generated.
+    """
+    problems = testset.verify_freeze(testset_dir)
+    if problems:
+        shown = "; ".join(problems[:3]) + (f"; and {len(problems) - 3} more" if len(problems) > 3 else "")
+        raise FreezeGateError(
+            f"the report split is generated only from the frozen test set, and {testset_dir} is not frozen or does "
+            f"not match its freeze ({shown}). Build and freeze all five languages first: python "
+            "scripts/build_testset.py --langs all --freeze (or --freeze-only when every language is already built), "
+            "then check it: python scripts/verify_freeze.py. Nothing was generated"
+        )
+    return testset.file_sha256(Path(testset_dir) / testset.MANIFEST_NAME)
 
 
 # --- arguments --------------------------------------------------------------------------------------------
@@ -289,12 +319,16 @@ def _make_backend(args: argparse.Namespace) -> gen.Backend:
     return gen.hf_backend(args.model_path, max_new_tokens=args.max_new_tokens, dtype=args.dtype)
 
 
-def _meta_for(args: argparse.Namespace, lang: str, n_rows: int, root: Path, unrecorded: int = 0) -> dict[str, Any]:
+def _meta_for(
+    args: argparse.Namespace, lang: str, n_rows: int, root: Path, unrecorded: int = 0, manifest_sha256: str | None = None
+) -> dict[str, Any]:
     meta = gen.run_meta(
         model_path=args.model_path, arm=args.arm, alpha=args.alpha, split=args.split, lang=lang,
         batch_size=args.batch_size, max_new_tokens=args.max_new_tokens, dtype=args.dtype, backend=args.backend,
         n_rows=n_rows, repo_root=root,
     )
+    if manifest_sha256 is not None:
+        meta["testset_manifest_sha256"] = manifest_sha256  # the frozen test set the report split was made from
     if unrecorded:
         meta["unrecorded_rows"] = unrecorded  # rows that were already in the file with no record of their setup
     return meta
@@ -326,8 +360,9 @@ def run(
     one meta and one resume rule per arm / alpha / language / split).
     """
     # Everything that can be refused is refused here, for every language, before the first generation
-    # and before any model load: duplicate prompt ids, a corrupt or foreign gens file (a dry scan with
-    # the code `generate` uses), a missing or conflicting meta.
+    # and before any model load: a report split whose test set is not frozen, duplicate prompt ids, a corrupt
+    # or foreign gens file (a dry scan with the code `generate` uses), a missing or conflicting meta.
+    manifest_sha = report_freeze_sha256(args.testset_dir) if args.split == "report" else None
     plans: list[_Plan] = []
     for lang, path in available:
         prompts = load_prompts(path, lang, args.split, args.limit) + list((extra_prompts or {}).get(lang, ()))
@@ -335,7 +370,8 @@ def run(
         meta_file = gen.meta_path(gens_file)
         n_done = len(gen.scan_existing(prompts, gens_file, arm=args.arm, alpha=args.alpha).done)
         previous, record_first, unrecorded = check_meta(
-            meta_file, gens_file, _meta_for(args, lang, n_done, root), n_rows=n_done, force=args.force_new_meta
+            meta_file, gens_file, _meta_for(args, lang, n_done, root, manifest_sha256=manifest_sha), n_rows=n_done,
+            force=args.force_new_meta,
         )
         plans.append(_Plan(lang, prompts, gens_file, meta_file, previous, record_first, unrecorded, n_done))
 
@@ -343,7 +379,8 @@ def run(
     total_new = 0
     for plan in plans:
         if plan.record_first:  # so that even a hard kill leaves the setup on record next to its rows
-            write_meta(plan.meta_file, _meta_for(args, plan.lang, plan.n_done, root, plan.unrecorded), plan.previous)
+            write_meta(plan.meta_file, _meta_for(args, plan.lang, plan.n_done, root, plan.unrecorded, manifest_sha),
+                       plan.previous)
 
         def progress(done: int, total: int, lang: str = plan.lang) -> None:
             print(f"  {lang}: {done}/{total}", file=sys.stderr, flush=True)
@@ -356,10 +393,12 @@ def run(
         except BaseException:
             rows = count_rows(plan.gens_file)
             if rows > plan.n_done:  # a crash after some batches: record how many rows exist now
-                write_meta(plan.meta_file, _meta_for(args, plan.lang, rows, root, plan.unrecorded), plan.previous)
+                write_meta(plan.meta_file, _meta_for(args, plan.lang, rows, root, plan.unrecorded, manifest_sha),
+                           plan.previous)
             raise
         if new:
-            write_meta(plan.meta_file, _meta_for(args, plan.lang, count_rows(plan.gens_file), root, plan.unrecorded),
+            write_meta(plan.meta_file,
+                       _meta_for(args, plan.lang, count_rows(plan.gens_file), root, plan.unrecorded, manifest_sha),
                        plan.previous)
         total_new += new
         print(f"{plan.lang}: {len(plan.prompts)} prompts, {new} new, {len(plan.prompts) - new} already done "
@@ -368,7 +407,7 @@ def run(
     return EXIT_OK
 
 
-PLAIN_ERRORS = (gen.ResumeError, gen.BackendError, MetaMismatchError, ValueError, ImportError, OSError)
+PLAIN_ERRORS = (gen.ResumeError, gen.BackendError, MetaMismatchError, FreezeGateError, ValueError, ImportError, OSError)
 
 
 def main(argv: Sequence[str] | None = None, *, root: Path | None = None) -> int:
