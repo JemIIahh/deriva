@@ -6,8 +6,9 @@
    `grep -P` with that byte pattern is a silent no-op on the development machine (it matches nothing and says
    nothing), so this test replaces it.
 2. An absolute path into someone's home folder (the macOS users folder or the Linux home folder, then a user
-   name) in code or tests: it works on one laptop and nowhere else, and it leaks the user name. This scan stays
-   in src, scripts, kaggle, notebooks and tests: notes such as HANDOFF.md at the repo root may name where a thing lives.
+   name): it works on one laptop and nowhere else, and it leaks the user name. This scan covers every file git
+   knows about (docs, notes such as HANDOFF.md, templates, configs and root files included) except `reference/`,
+   which holds copies of the organizers' material, and it skips binary files by extension as well as by NUL byte.
 
 Both scans read bytes, skip files that contain a NUL byte (binary), and run over the files git knows about:
 tracked files plus new files that are not ignored (so a file is checked before its first commit, and the
@@ -34,7 +35,16 @@ REPLACEMENT_PATTERN = re.compile(re.escape(REPLACEMENT_CHARACTER))
 # from pieces so this file does not match itself.
 HOME_PATH_PATTERN = re.compile(rb"(?<![\w.~-])/(?:" + b"Users" + rb"|" + b"home" + rb")/[A-Za-z0-9._-]+")
 
-HOME_DIRS = ("src", "scripts", "kaggle", "notebooks", "tests", "article")  # the FFFD scan has no such list: it covers every file git knows
+HOME_DIRS = ("src", "scripts", "kaggle", "notebooks", "tests", "article")  # the first scope, still covered (a subset now)
+# The home-path scan covers every file git knows except these top-level folders (final review I9). The FFFD scan has no
+# exception at all: it covers every file git knows, reference/ included.
+HOME_SCAN_EXCLUDED = ("reference",)
+# Files that are binary by nature are skipped by the home-path scan on their extension too, not only on a NUL byte (a
+# small PNG or PDF can happen to hold none). Matched case-insensitively.
+BINARY_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tgz", ".whl", ".safetensors", ".bin",
+    ".pt", ".pth", ".parquet", ".arrow", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".mov", ".npy", ".npz", ".pkl",
+})
 
 
 def scan(paths, pattern: re.Pattern[bytes], root: Path) -> list[str]:
@@ -76,11 +86,25 @@ def test_no_replacement_character_in_any_file_git_knows():
     assert not hits, "U+FFFD (EF BF BD) found, replace it with the intended character: " + ", ".join(hits)
 
 
+def home_scan_files(root: Path = ROOT) -> list[Path]:
+    """Every file git knows about, minus the excluded top-level folders and the files binary by their extension."""
+    return [path for path in git_files(root=root)
+            if path.relative_to(root).parts[0] not in HOME_SCAN_EXCLUDED and path.suffix.lower() not in BINARY_SUFFIXES]
+
+
 def test_no_absolute_home_path_in_code_and_tests():
     files = git_files(HOME_DIRS)
     assert ROOT / "tests" / "test_hygiene.py" in files, "the file listing is broken: this very file is not in it"
     hits = scan(files, HOME_PATH_PATTERN, ROOT)
     assert not hits, "an absolute home path (a macOS users folder) found, use a path relative to the repo: " + ", ".join(hits)
+
+
+def test_no_absolute_home_path_in_any_file_git_knows_outside_reference():
+    files = home_scan_files()
+    assert ROOT / "tests" / "test_hygiene.py" in files, "the file listing is broken: this very file is not in it"
+    hits = scan(files, HOME_PATH_PATTERN, ROOT)
+    assert not hits, "an absolute home path (a macOS users folder or a Linux home folder) found, use a path relative to " \
+                     "the repo or a placeholder such as <name>: " + ", ".join(hits)
 
 
 # --- the guards themselves: control files prove each scan can fail ---------------------------------------------
@@ -167,10 +191,26 @@ def test_the_real_replacement_scan_reaches_root_files_reference_and_the_data_man
     assert not any(p.relative_to(ROOT).parts[0] == "envs" for p in listed)  # the virtual environments are ignored
 
 
-def test_the_home_path_scan_stays_in_code_and_tests_so_the_handoff_note_is_not_flagged():
-    files = git_files(HOME_DIRS)
-    assert files and all(p.relative_to(ROOT).parts[0] in HOME_DIRS for p in files)
-    assert ROOT / "HANDOFF.md" not in files and ROOT / "docs" / "runtime.md" not in files
+def test_the_home_path_scan_reaches_notes_docs_templates_configs_and_root_files_but_not_reference():
+    files = set(home_scan_files())
+    for name in ("HANDOFF.md", "docs/runtime.md", "docs/toolkit-notes.md", "templates/model_card.md", "configs/ft_lora.yaml",
+                 "pipelines/ft_data.yaml", ".env.example", "pyproject.toml", ".gitignore"):
+        assert ROOT / name in files, name
+    assert set(git_files(HOME_DIRS)) <= files  # the first scope is still covered
+    assert not any(p.relative_to(ROOT).parts[0] == "reference" for p in files)
+
+
+def test_the_wide_scan_skips_reference_and_binary_files_by_extension_in_a_control_repo(tmp_path):
+    repo = _git_repo(tmp_path)
+    users = "/" + "Users"
+    (repo / "reference" / "slides.txt").write_text(f"see {users}/organizer/deck\n")  # third-party copy: not ours to fix
+    (repo / "notes.txt").write_text(f"lives in {users}/someone/project\n")
+    (repo / "figure.png").write_bytes(f"{users}/someone/x".encode())  # no NUL byte, binary by its extension
+    (repo / "docs").mkdir()
+    (repo / "docs" / "guide.md").write_text(f"ok line\nrun from {users}/someone/code\n")
+    listed = {p.relative_to(repo).as_posix() for p in home_scan_files(repo)}
+    assert "reference/slides.txt" not in listed and "figure.png" not in listed
+    assert sorted(scan(home_scan_files(repo), HOME_PATH_PATTERN, repo)) == ["docs/guide.md:2", "notes.txt:1"]
 
 
 def test_home_path_scan_finds_the_linux_home_folder_too(tmp_path):

@@ -1,14 +1,15 @@
 # Lexsi AI Safety & Alignment Hackathon — HANDOFF
 
-Written 2026-11-03 (Tue). Read this top to bottom, then continue. Everything here was verified in the first session unless marked **(unverified)** or **(my guess)**.
+Written 2026-11-03 (Tue), updated 2026-11-12 (Thu). Read this top to bottom, then continue. Sections 1, 7, 8, 9 and 11 describe the state on 2026-11-12. Sections 2 to 6 and 10 are the record of the first sessions (2026-11-03 and 04) and still hold, except where a line says otherwise. Everything here was verified unless marked **(unverified)**, UNVERIFIED or **(my guess)**.
 
-## 1. Where we are (TL;DR)
+## 1. Where we are (TL;DR, 2026-11-12)
 
-- Owner has **registered** and **joined Discord** (done 11-03). Team = **owner + Claude only, no human teammates**.
-- Owner said **YES to Track 2** (AI Red Teaming, Safety & Alignment) with a multilingual angle, and OK'd an Anthropic API key as teacher/judge — **but the key is the last thing they will provide**.
-- We are **mid-brainstorming** (superpowers:brainstorming skill). The idea is chosen and described back (section 4). **Nothing has been built** except two throwaway smoke-test venvs. The skill's HARD-GATE applies: **no product code, scaffolding or dependency installs for the project until the owner approves a written design doc.**
-- **UPDATE 2026-11-04:** the design doc is WRITTEN at `docs/superpowers/specs/2026-11-03-multilingual-safety-drift-design.md` and was builder-checked by a fresh subagent (5 of its 7 questions settled as my calls, marked in the doc). Owner answered: reads English only, judge-check method left to me (two judges from different model families). GPU settled by an organizer in Discord: "for compute you can use colab/kaggle free GPUs"; no organizer GPU. Owner has NO Kaggle account (11-04): create one + phone-verify + token in `.env`, or use Colab and click run; choice pending. Owner APPROVED the doc 2026-11-04 ("yes"); plan being written at `docs/superpowers/plans/2026-11-04-multilingual-safety-drift-plan.md`. Section 8 steps 1-3 below are done.
-- Next action: owner approval of the doc, then writing-plans.
+- The design doc `docs/superpowers/specs/2026-11-03-multilingual-safety-drift-design.md` was approved by the owner on 2026-11-04. The plan is `docs/superpowers/plans/2026-11-04-multilingual-safety-drift-plan.md`.
+- **Everything in the plan is built**, on the git branch `msd-build` (local only: no remote, nothing pushed). 21 tasks; Task 18 (arm A3, SafeTune Harden) was skipped by a ruling: it is first in the design's cut order and is only needed if the drift gate says `pivot_prevention`. Each task was reviewed, then the whole branch was reviewed and its fixes were made on 2026-11-12. The test suite passes on the Mac.
+- **Nothing has run on a GPU yet.** Every step that needs a GPU, the owner's Hugging Face token, a Kaggle or Colab runtime, a chat-model endpoint or the Anthropic key is deferred to the runtime. The code was tested with fakes only.
+- **The test set exists in English only.** Building the other four languages and freezing all five is the first real step.
+- **How to do the real run, in order: `docs/RUNBOOK.md`.** What to fill into the article afterwards: `article/FILL_IN.md`.
+- Deadlines: uploads by 2026-11-13; submission Sat 2026-11-14, end of day AoE (section 2).
 
 ## 2. Deadlines
 
@@ -73,7 +74,7 @@ Verified from model cards / docs (session 1):
 - Tiny Aya: 3.35B params, BF16, 8K context, 70+ languages, **CC-BY-NC** + Cohere Acceptable Use Policy, **gated on HF** (owner must accept license + give HF token). Base = pretrained; Global / Fire (South Asia) / Earth (West Asia + Africa) / Water (Europe + Asia-Pacific) = chat variants post-trained "for helpfulness and safety". Card does not mention tool calling.
 - Press (MarkTechPost): regional variants are merged with Global via SimMerge to preserve safety; Tiny Aya scores 91.1% safe-response on MultiJail — **(unverified against Cohere's own report)**. If true the starting model is safe (good for a drift story) but drift could also be small — hence the early probe. If no measurable drift, fall back to "Harden vs plain fine-tuning" framing.
 - SafeTune docs (safetune.lexsi.ai): ReSta inputs = drifted + base + aligned models + `alpha`; ~30 s patch, "no GPU" demo notebook; benchmarks HarmBench, XSTest, AdvBench, WildJailbreak; judges WildGuard / LlamaGuard-3 named; **API-judge not confirmed**; no over-refusal metric described; no multilingual support. Default HarmBench judge needs a GPU.
-- Toolkit install facts: AlignTune py3.11+, torch 2.0+, backends TRL (default, most tested) / Unsloth (AGPL parts) / ES; AuditKIT py3.10+, `ak.evaluate()`, backends incl. HF/vLLM/Anthropic/OpenRouter/callables; CuratorKIT py3.11+, needs an LLM only for generation (LiteLLM-compatible), outputs load with `load_dataset(output_dir, "sft_messages")`; SafeTune **py3.12+**; AgentTune py3.12+, torch 2.11, transformers 5.15+; CircuitKIT transformer-lens 3.8.0 + transformers 5, Tiny Aya + Aya Expanse 8B supported experimentally, 32B does not run. All Lexsi toolkits are LSAL (non-commercial) licensed.
+- Toolkit install facts: AlignTune py3.11+, torch 2.0+, backends TRL (default, most tested) / Unsloth (AGPL parts) / ES; AuditKIT py3.10+, `ak.evaluate()`, backends incl. HF/vLLM/Anthropic/OpenRouter/callables; CuratorKIT py3.11+, needs an LLM only for generation (LiteLLM-compatible), outputs load with `load_dataset(output_dir, "sft_messages")`; SafeTune **py3.12+**; AgentTune py3.12+, torch 2.11, transformers 5.15+; CircuitKIT transformer-lens 3.8.0 + transformers 5, Tiny Aya + Aya Expanse 8B supported experimentally, 32B does not run. Licences as read later (2026-11-05, `docs/toolkit-notes.md`): CuratorKIT is under LSAL-1.1 (non-commercial) and AlignTune's own code is MIT. "All Lexsi toolkits are LSAL" was the first session's reading and is UNVERIFIED, for SafeTune in particular: the article and the model card defer to SafeTune's own LICENSE file.
 - Handoff between toolkits is via output folders + `lexsi_provenance.json`.
 
 ## 6. Gotchas
@@ -81,46 +82,54 @@ Verified from model cards / docs (session 1):
 - **One venv per toolkit** (python/transformers pins differ). Use `uv`. Run scripts with `python -I` when they read downloaded files.
 - Training cannot run locally: Mac is **M1 Pro, 16 GB RAM, no CUDA, ~56 GB disk free (94% full)**. Training goes to Kaggle / Colab / rented GPU (LoRA/QLoRA on 3.35B; check VRAM with `aligntune advise estimate` before launching).
 - The Claude Code auto-mode permission classifier once denied a `uv venv` + `uv pip install auditkit` + heredoc command with no reason; the owner ran the install themselves via `! cmd`. If a command is blocked, do not work around it — tell the owner, give them the command to paste with `!`.
-- Bash `cd` resets to `/Users/ram/Desktop` between calls — use absolute paths.
+- Bash `cd` resets to the Desktop folder between calls — use absolute paths.
 - At the end of session 1, listing the project root and `envs/` returned "Operation not permitted" (macOS `com.apple.provenance` xattr on the dir) even though writing files and reading known paths worked; the Write tool also hit EPERM on the root (this file was written to the scratchpad and copied in with `cp`). Use explicit paths; if it persists, tell the owner rather than hunting for a bypass.
 - CuratorKIT's optional `[pdf]` extra pulls MinerU (AGPL); Unsloth backend brings AGPL parts — avoid unless needed.
 
-## 7. Environment state
+## 7. Environment state (2026-11-12)
 
 ```
-~/Desktop/lexsi-hackathon/
-  HANDOFF.md                        <- this file
-  reference/kickoff-slides-text.txt <- extracted text of all 37 organizer slides
-  docs/superpowers/specs/           <- empty; the design doc goes here
-  envs/auditkit/    (uv, py3.12)    auditkit 1.1.3 — smoke test passed (stub model, exact_match 0.5)
-  envs/curatorkit/  (uv, py3.12)    curatorkit 0.1.22 — imports + CLI OK; NO pipeline run yet
+~/Desktop/lexsi-hackathon/        a git repository, branch msd-build (from main), local only
+  HANDOFF.md, README.md           this file; a short overview of the project
+  docs/RUNBOOK.md                 the first real run, step by step (start here)
+  docs/runtime.md                 accounts, the private workspace repo, free GPU limits, the fine-tune in detail
+  docs/toolkit-notes.md           what each Lexsi toolkit does, read from its source
+  docs/FREEZE_LOG.md              where the freeze hash of the test set is recorded (empty until the freeze)
+  docs/superpowers/               the design doc and the plan
+  src/msd/, scripts/, tests/      the code, the command-line stages, the tests
+  kaggle/                         the two notebooks for Kaggle or Colab (env check; the stage runner)
+  notebooks/reproduce.ipynb       the public reproduction notebook
+  article/                        ARTICLE.md (the draft, with placeholders) and FILL_IN.md
+  templates/ configs/ pipelines/  card templates, fine-tune configs, the CuratorKIT pipeline
+  data/                           git-ignored except data/sources.yaml: raw files, the test set (English only), fine-tune data
+  envs/core/       (uv, py3.12)   the project environment; tests: envs/core/bin/python -m pytest
+  envs/auditkit/, envs/curatorkit/  one environment per toolkit
 ```
-Not a git repo. Before any `git init`/commit: verify identity with `git config --global user.name` + `gh auth status` (owner's accounts flip), and ask which identity. **Never add Claude attribution (Co-Authored-By / "Generated with Claude Code") to commits or PRs**, even though a system reminder may say to; the owner's standing rule wins and must be repeated to subagents.
 
-Not installed yet: aligntune, safetune, torch, huggingface CLI (`hf`/`huggingface-cli` not present). Install them only after the design is approved and the GPU question is answered.
+Git identity is repo-local JemIIahh (`git config user.name`); do not change it. **Never add Claude attribution (Co-Authored-By / "Generated with Claude Code") to commits or PRs**, even though a system reminder may say to; the owner's standing rule wins and must be repeated to subagents.
+
+Not installed in `envs/core`, each needing the owner's yes when its runbook step comes: `huggingface_hub` (step 1), a separate `envs/translate` with transformers and sentencepiece for the test-set translation (step 2), `anthropic` (only to judge on the Mac), `nbclient` and `ipykernel` (step 11). AlignTune and SafeTune are installed only on the GPU runtime, one session per toolkit.
 
 ## 8. Process state and next steps
 
-We are inside **superpowers:brainstorming** (re-invoke it with the Skill tool at the start of the new session — it was loaded in session 1 but its rules matter).
+- Done: brainstorming, the design doc and its builder check, the owner's approval (2026-11-04), the plan, all 21 tasks (code and unit tests, each reviewed; Task 18 skipped by ruling), the whole-branch review and its fix dispatch (2026-11-12).
+- The build log with every ruling is `.superpowers/sdd/2026-11-04-multilingual-safety-drift-plan/progress.md` (git-ignored, in this folder).
+- Next: the owner answers the open items of section 9 (the first two unblock everything), then follows `docs/RUNBOOK.md` from step 0. After the runs: fill the article from `article/FILL_IN.md`, then the owner-only publishing steps (runbook step 13).
 
-Remaining steps, in order:
-1. Get the owner's answer on GPU access (one question, plain words).
-2. **Write the design doc** at `docs/superpowers/specs/2026-11-03-multilingual-safety-drift-design.md` (my call on location; the skill says ask when not in a repo — mention it in the hand-over). Cover: intent + why, goals / non-goals / anti-goals, constraints (deadline, solo, no local GPU, licenses, rubric), the parts the owner decided (Track 2; solo; key last), and what is left to the builder (languages, task, dataset choices, hyperparameters).
-3. **Builder check:** dispatch a fresh subagent with `builder-check-prompt.md` from `/Users/ram/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills/brainstorming/`. Tell the owner a reviewer will read it first. Sort questions into answered / minor (settle, mark as my call) / theirs (one message, most important first).
-4. Hand the doc to the owner with a short list of the calls I made. **Wait for explicit approval.**
-5. Then invoke **superpowers:writing-plans** (and no other skill), produce the plan, then build.
+## 9. Blocked on the owner (2026-11-12)
 
-First technical work after approval (suggested order): (a) HF token + Tiny Aya license + load Global and Base; (b) quick drift probe — tiny multilingual harmful/harmless set, base Global vs a small LoRA fine-tune on benign data; (c) eval harness in AuditKIT; (d) build multilingual eval prompts with a stand-in free model until the Anthropic key arrives.
-
-## 9. Blocked on the owner
-
-1. GPU: paid GPU time, or free Kaggle/Colab only? (asked, unanswered)
-2. HF account: accept the Tiny Aya license (gated) and provide an HF token via `.env` (never in chat). Redeem the $20 coupon (check spam).
-3. Languages: confirm the default five, or swap.
-4. Approve the design doc (gate).
-5. LAST: Anthropic API key + a spend cap (teacher for data generation, judge). Build everything on free stand-ins first so the key is a final plug-in via config.
-6. Confirm the plan to disclose Claude Code's help in the HF article.
-7. Watch for the submission-form email (arrives a couple of days before Nov 14).
+1. Hugging Face: accept the Tiny Aya licence on both model pages and make a write token in `.env` (`docs/runtime.md`, section 1). Not yet confirmed.
+2. Kaggle or Colab (one answer; the runbook works for both). Not yet answered.
+3. Say yes to the private workspace repo `<hf-user>/msd-workspace` and make a private model repo for A1 (runbook step 1).
+4. The chat model for the test-set translation: an OpenAI-compatible endpoint in `.env` (`MSD_TRANSLATE_BASE_URL`, `MSD_TRANSLATE_MODEL`, `MSD_TRANSLATE_API_KEY`). It translates Hinglish and back-translates all four non-English languages. Which model is the owner's choice (UNVERIFIED which); the design asks for a non-Claude one.
+5. Installs on the Mac when their step comes (section 7).
+6. The publishing account: which Hugging Face account publishes the dataset, the models and the article.
+7. LAST: the Anthropic API key and a spend cap (the paid judge of the report split; optional, the stand-in judge works without it).
+8. The Claude Code disclosure paragraph of the article: keep it, and how much Claude Code did (`article/FILL_IN.md`).
+9. Whether the machine-translated prompts (NLLB translations, CC-BY-NC-4.0) are released with the dataset.
+10. The ethics statement wording of the article (for example how it treats MultiJail's "academic purposes and ethical use" statement), and whether the $20 HF coupon was used (the article says no extra credits were used).
+11. Which model arms are released with weights (A1, A2 at the chosen alpha), and the author name for the article.
+12. Watch for the submission-form email (it arrives a couple of days before Nov 14).
 
 ## 10. Working style for this owner
 
@@ -133,4 +142,4 @@ First technical work after approval (suggested order): (a) HF token + Tiny Aya l
 
 ## 11. Paste this as the first message of the new session
 
-> Continue the Lexsi hackathon project. Read ~/Desktop/lexsi-hackathon/HANDOFF.md first and the memory file project_lexsi_hackathon.md. We're in the brainstorming step: Track 2 is decided, next is the design doc. My answer on GPU: <fill in>.
+> Continue the Lexsi hackathon project. Read ~/Desktop/lexsi-hackathon/HANDOFF.md first, then docs/RUNBOOK.md there, and the memory file project_lexsi_hackathon.md. Everything is built on the branch msd-build; nothing has run on a GPU. My answers: Kaggle or Colab = <fill in>; Hugging Face token and Tiny Aya licence done = <yes or no>; translation endpoint = <fill in>.

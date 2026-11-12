@@ -60,22 +60,25 @@ need, and both Kaggle and Colab pull from it and push to it with `HF_TOKEN`:
 wheels/msd-<version>-py3-none-any.whl   the code in src/msd (keep exactly one wheel here)
 scripts/                                copy of this repo's scripts/ (the stage scripts)
 pipelines/                              copy of this repo's pipelines/ (CuratorKIT YAML the scripts read)
-data/                                   test set, fine-tune data (only what a stage needs)
-results/<stage>/                        per-item JSONL, logs, written by the notebooks
+configs/                                copy of this repo's configs/ (the fine-tune YAML files)
+data/                                   the frozen test set and the fine-tune data (data/testset/, data/ft/*.jsonl)
+results/                                the ONE results root: every stage reads and writes it (docs/RUNBOOK.md)
 ```
 
 **Known gap, stated plainly:** the wheel contains only the `msd` package from `src/`. It does NOT
 contain `scripts/` or `pipelines/`. So the workspace repo must also carry `scripts/` and
 `pipelines/` (and `data/` when a stage needs it), and they must be uploaded again whenever they
-change; a stale copy there means the runtime runs old code. A sync helper does not exist yet (a
-later task adds it).
+change; a stale copy there means the runtime runs old code. There is no sync helper: `docs/RUNBOOK.md`, step 1,
+has the upload command.
 
 Two thin notebooks live in `kaggle/` (they work on Colab too, nothing is Kaggle-only):
-`00_env_check.ipynb` (install the wheel, print the environment JSON and save it as `env_check.json`) and `10_run_stage.ipynb` (set
-`STAGE`, pull `scripts/`, `pipelines/` and `data/`, run `python scripts/<STAGE>.py`, push
-`results/<STAGE>/`). Later tasks add the stage
-scripts; the notebooks do not change. They take the token from `HF_TOKEN` in the environment, a
-Kaggle secret, or a Colab secret, and never print it.
+`00_env_check.ipynb` (install the wheel, print the environment JSON and save it as `env_check.json`) and `10_run_stage.ipynb`
+(check that the workspace repo is private, pull `scripts/`, `pipelines/`, `configs/`, `data/` and `results/`,
+optionally download A1 into `A1/`, run `python scripts/<STAGE>.py` or an ordered list of `STEPS` in one session, and
+upload the whole `results/` folder after each step that changed it, never weights). Every stage script exists; the
+order of the real run is in `docs/RUNBOOK.md`. They take the token from `HF_TOKEN` in the environment, a Kaggle
+secret, or a Colab secret, and never print it; an `ANTHROPIC_API_KEY` secret is loaded the same way when present
+(optional, for an `anthropic:` judge only).
 
 **Kaggle launch from here** (needs the Kaggle account, a token, and your yes):
 `kaggle kernels push -p <folder>` uploads a notebook and runs it ("Pushes new code/notebook and
@@ -178,6 +181,7 @@ a.create_repo(r, repo_type='dataset', private=True); \
 a.upload_file(path_or_fileobj='dist/msd-0.1.0-py3-none-any.whl', path_in_repo='wheels/msd-0.1.0-py3-none-any.whl', repo_id=r, repo_type='dataset'); \
 [a.upload_folder(folder_path=d, path_in_repo=d, repo_id=r, repo_type='dataset', ignore_patterns=['__pycache__', '*.pyc']) for d in ('scripts', 'pipelines')]"
 # Repeat the upload_folder part whenever scripts/ or pipelines/ change (see the known gap in section 2).
+# docs/RUNBOOK.md, step 1, has the same command with configs/ and a privacy check added; step 2 uploads data/.
 # (huggingface_hub is not installed in envs/core; the exact call signatures are from memory: UNVERIFIED.)
 
 # 2. Kaggle: put the WORKSPACE_REPO name into a copy of kaggle/00_env_check.ipynb, add kernel-metadata.json
@@ -302,10 +306,10 @@ a confound. The check runs at step 0 of training (a callback on `on_train_begin`
    `assistant_only_loss` did not reach TRL). A large count: the loss covers more than the answer. Fix the cause;
    `--allow-unchecked-labels` never waives this.
 
-The notebook then uploads `results/finetune/` to the private workspace repo, **without weights**: its upload skips
-`*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `work/**` and any `merged/` folder, so the summary and logs travel but the
-adapter and the 6.7 GB merged model do not (they go only through `--push-to`, above). A failed run exits non-zero
-and stops the notebook before the upload.
+The notebook then uploads the whole `results/` folder (with `results/finetune/` in it) to the private workspace repo,
+**without weights**: its upload skips `*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `work/**`, any `merged/` folder and
+hidden `.partial` folders, so the summary and logs travel but the adapter and the 6.7 GB merged model do not (they go
+only through `--push-to`, above). A failed run exits non-zero and stops the notebook before the upload.
 
 **Where things are written.** AlignTune trains into a persistent work folder, `work/finetune/<config stem>[-smoke]/`
 (checkpoints every `save_steps`, the adapter files at the end). It is kept on ANY failure, including Ctrl-C, and the
@@ -367,14 +371,16 @@ then the report split once:
 
 ```
 STAGE = "run_eval"
-STAGE_ARGS = "--arm A0 --split dev --model CohereLabs/tiny-aya-global --out results/run_eval --judge <judge> --stages generate,judge,task"
-STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --out results/run_eval --judge <judge> --stages generate,judge,task"
+STAGE_ARGS = "--arm A0 --split dev --model CohereLabs/tiny-aya-global --judge <judge> --stages generate,judge,task"
+STAGE_ARGS = "--arm A1 --split dev --model results/finetune/ft_lora/merged --judge <judge> --stages generate,judge,task"
 # then the same two with --split report
 ```
 
 (`--model results/finetune/ft_lora/merged` works only in the same live session that made it: merged weights are never
 uploaded to the workspace repo and a later notebook run starts from a fresh working folder, so in a later run pass the
-`--push-to` repo id (`<hf-user>/<private-model-repo>`) as `--model`.) Read `results/run_eval/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
+`--push-to` repo id (`<hf-user>/<private-model-repo>`) as `--model`. `run_eval.py` writes into the one results root
+`results/` by default: do not pass `--out`, so the gate, the report and the export find the files. `docs/RUNBOOK.md`,
+step 4, splits generation and judging into separate steps.) Read `results/dev/<arm>/none/<lang>.eval.json`: its `tasks` block has `n`, `correct` and
 `accuracy` (one file per language). Compare with the always-D floor in `docs/toolkit-notes.md` (31% on dev, 27 to 28% on the
 heldout split). What A1 must show is that it answers the bare letter more often than A0 does (the point of the
 task); how much is a result, not a gate here.

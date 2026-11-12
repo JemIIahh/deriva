@@ -410,12 +410,18 @@ On a runtime that has the three models, enough RAM (about 20 GB for bf16) and `p
 
 ```
 export HF_TOKEN=...      # in the shell; there is no token flag
-python scripts/run_resta.py --drifted A1 --base CohereLabs/tiny-aya-base --aligned CohereLabs/tiny-aya-global --alpha 0 --out A2_alpha_0.00
-# Step 6: the tensors of A2_alpha_0.00 must equal A1's bit for bit, and greedy outputs must match on 5 prompts.
+python scripts/run_resta.py --drifted A1 --base CohereLabs/tiny-aya-base --aligned CohereLabs/tiny-aya-global --alpha 0 --out results/resta/A2_alpha_0.0
+python scripts/run_eval.py --arm A2 --alpha 0 --split dev --model results/resta/A2_alpha_0.0 --stages generate,task
+# Step 6: the tensors of A2_alpha_0.0 must equal A1's bit for bit, and greedy outputs must match on 5 prompts.
 # Only then: --alpha 0.1, 0.25, 0.5 with a benign-answer check, then the rest of config.ALPHAS as needed
 # ("The alpha grid" above; each run reloads the three models).
 python -c "from pathlib import Path; from msd.blend import blend_state_dicts; blend_state_dicts(Path('A1'), Path('A0'), 0.5, Path('A2n_0.50'))"
 ```
+
+The `--out` of `run_resta.py` is the model folder that the `--model` of `run_eval.py` then reads; the results of
+the evaluation go to the one results root `results/`. The whole session, with the judge steps, the report split and
+where the notebook keeps the files, is `docs/RUNBOOK.md`, step 6 (a blend of A1 in fp16 with A0 from the Hub may need
+`a0_dtype="cast_to_a1"`, see there).
 
 The naive blend needs no SafeTune and no GPU: `msd.blend` reads shard headers first (names, shapes, dtypes),
 then streams one tensor at a time, so it fits a laptop.

@@ -21,3 +21,6 @@ work/
 
 # the reproduction notebook writes its recomputed files here when run from the repository root
 reproduced/
+
+# huggingface_hub's snapshot_download(local_dir=".") keeps its download metadata here (docs/RUNBOOK.md, step 9)
+.cache/
