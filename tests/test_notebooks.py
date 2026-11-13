@@ -247,6 +247,9 @@ def test_the_settings_default_to_one_env_check_with_no_steps_no_install_and_no_m
     assert settings["EXTRA_PIP"] == "" and settings["A1_REPO"] == ""
 
 
+UPLOAD_SECRET = "dummy-upload-secret-value"
+
+
 class _Info:
     def __init__(self, private):
         self.private = private
@@ -256,7 +259,7 @@ class FakeHub:
     """Stands in for huggingface_hub: records every call, answers repo_info with a privacy flag."""
 
     def __init__(self, private=True):
-        self.private, self.log = private, []
+        self.private, self.log, self.fail_uploads = private, [], 0
         hub = self
 
         class Api:
@@ -270,6 +273,10 @@ class FakeHub:
 
             def upload_folder(self, **kwargs):
                 hub.log.append(("upload_folder", kwargs))
+                if hub.fail_uploads:  # a Hub 5xx or a timeout, with request details in its text
+                    hub.fail_uploads -= 1
+                    raise ConnectionError(f"503 Server Error for url: https://huggingface.co/api/datasets/"
+                                          f"{kwargs.get('repo_id')}/commit/main (Authorization: Bearer {UPLOAD_SECRET})")
 
             def create_repo(self, *args, **kwargs):
                 raise AssertionError("the notebook must never create a repo")
@@ -528,7 +535,8 @@ def test_a_failing_step_runs_nothing_after_it(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.chdir(tmp_path)
     namespace = {"STAGE": "x", "STAGE_ARGS": "", "STEPS": [("run_resta", ""), ("run_eval", ""), ("make_report", "")],
-                 "EXTRA_PIP": "", "results_state": dict, "upload_results": lambda before: seen.append("upload")}
+                 "EXTRA_PIP": "", "results_state": dict, "synced": {},
+                 "upload_results": lambda before: seen.append("upload")}
     with pytest.raises(RuntimeError, match="exit code 5"):
         exec(compile(_cell_with("scripts/{script}.py"), "10_run_stage.ipynb", "exec"), namespace)
     assert seen == ["scripts/run_resta.py", "upload", "scripts/run_eval.py"]  # make_report never started
@@ -561,6 +569,70 @@ def test_the_default_env_check_runs_once_and_uploads_nothing_even_with_pulled_re
     assert [c[1] for c in calls] == ["scripts/env_check.py"]
     assert hub.log == []  # no upload and not even a repo_info
     assert "nothing to upload" in capsys.readouterr().out
+
+
+def _chain(hub, monkeypatch, tmp_path, steps):
+    """The upload cell, then a function that runs the run cell (as the owner does); a step writes results/gate.json
+    while writes["on"] is set. Returns (namespace, run_cell, writes)."""
+    import subprocess
+
+    writes = {"on": True}
+
+    def run(cmd, **kwargs):
+        hub.log.append(("subprocess", list(cmd), kwargs))
+        if writes["on"]:
+            (tmp_path / "results").mkdir(exist_ok=True)
+            (tmp_path / "results" / "gate.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    namespace = _exec(_cell_with("upload_folder"), _base_namespace(hub, STEPS=steps))
+    return namespace, lambda: _exec(_cell_with("scripts/{script}.py"), namespace), writes
+
+
+def test_a_failed_upload_names_only_the_error_type_and_is_tried_again_by_the_next_run(hub, tmp_path, monkeypatch, capsys):
+    namespace, run_cell, writes = _chain(hub, monkeypatch, tmp_path, [("run_gate", "")])
+    hub.fail_uploads = 1
+    with pytest.raises(RuntimeError) as caught:
+        run_cell()  # the step worked, then the Hub failed
+    message = str(caught.value)
+    assert "ConnectionError" in message
+    assert UPLOAD_SECRET not in message and "503" not in message and "huggingface.co" not in message
+    assert "still in results/" in message and "nothing was marked uploaded" in message
+    assert "upload_results({})" in message and "run the last cell again" in message
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__  # one plain line, no chained traceback
+    _exec(_cell_with("upload_folder"), namespace)  # Run all runs the upload cell again: that must not reset it
+    writes["on"] = False  # the step resumes, finds its work done and writes nothing
+    run_cell()
+    assert len(hub.calls("upload_folder")) == 2  # it was tried again, and this time it worked
+    assert "uploaded results/" in capsys.readouterr().out
+
+
+def test_after_a_good_upload_a_run_that_changes_nothing_uploads_nothing_but_a_manual_upload_still_does(
+        hub, tmp_path, monkeypatch, capsys):
+    namespace, run_cell, writes = _chain(hub, monkeypatch, tmp_path, [("run_gate", "")])
+    hub.fail_uploads = 1
+    with pytest.raises(RuntimeError):
+        run_cell()
+    writes["on"] = False
+    run_cell()  # the retry that works
+    hub.log.clear()
+    capsys.readouterr()
+    run_cell()  # nothing changed since the good upload
+    assert hub.calls("upload_folder") == [] and hub.calls("repo_info") == []
+    assert "nothing to upload" in capsys.readouterr().out
+    namespace["upload_results"]({})  # a manual upload sends the whole folder whatever was sent before
+    assert [entry[0] for entry in hub.log if entry[0] != "subprocess"] == ["repo_info", "upload_folder"]
+
+
+def test_the_default_env_check_after_a_pull_and_a_second_run_still_uploads_nothing(hub, tmp_path, monkeypatch):
+    (tmp_path / "results" / "dev").mkdir(parents=True)
+    (tmp_path / "results" / "dev" / "pulled.json").write_text("{}", encoding="utf-8")  # pulled before the upload cell
+    namespace, run_cell, writes = _chain(hub, monkeypatch, tmp_path, [])
+    writes["on"] = False  # env_check writes nothing under results/
+    run_cell()
+    _exec(_cell_with("upload_folder"), namespace)
+    run_cell()
+    assert [entry[0] for entry in hub.log] == ["subprocess", "subprocess"]  # no repo_info and no upload_folder
 
 
 # EXTRA_PIP: a toolkit installed on the runtime, once, before the first step

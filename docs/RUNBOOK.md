@@ -37,8 +37,11 @@ this folder that needs the owner to agree first.
    step says so. Then Run all.
 4. What the notebook does: it stops unless the workspace repo is private; installs the wheel; pulls `scripts/`,
    `pipelines/`, `configs/`, `data/` and `results/`; downloads A1 into the folder `A1/` when `A1_REPO` is set; runs
-   the steps; after each step that changed `results/`, it uploads the whole `results/` folder (never weights,
-   `work/`, crash leftovers or `.env`).
+   the steps; after each step, when `results/` differs from what was pulled or last uploaded, it uploads the whole
+   `results/` folder (never weights, `work/`, crash leftovers or `.env`).
+   When an upload fails (a Hub error or a timeout), the notebook stops and names only the type of the error. The
+   results are still on the runtime. Once the network is back, run the last cell again (not Run all): it uploads what
+   was not sent. Or run `upload_results({})` in a new cell.
 5. When a step fails, the notebook stops with "step N (script) stopped with exit code X". The steps after it do not
    run. Nothing the failed step wrote is uploaded. Read the script's own message above that line. To keep what it
    wrote anyway (for example half-finished completions to resume from), run `upload_results({})` in a new cell.
@@ -134,12 +137,15 @@ Commands:
 5. Record it: add a row to `docs/FREEZE_LOG.md` (the procedure is there) and commit that file.
 6. Check the fine-tune data against the full test set (the overlap check now covers all five languages):
    `envs/core/bin/python scripts/finetune.py --config configs/ft_lora.yaml --dry-run`
-7. Upload the frozen test set and the fine-tune data to the workspace repo (call signatures UNVERIFIED):
+7. Upload the frozen test set and the fine-tune data to the workspace repo (call signatures UNVERIFIED). Run
+   `envs/core/bin/python scripts/verify_freeze.py` again just before it: it must still print `OK`. A file that is not
+   in `MANIFEST.json` (for example a `.DS_Store` that Finder made) makes the runtime refuse every report step, so the
+   upload leaves `.DS_Store` out:
 
    ```
    envs/core/bin/python -c "from huggingface_hub import HfApi; a=HfApi(); r='<hf-user>/msd-workspace'; \
    assert a.repo_info(r, repo_type='dataset').private is True, 'the workspace repo must be private'; \
-   a.upload_folder(folder_path='data/testset', path_in_repo='data/testset', repo_id=r, repo_type='dataset'); \
+   a.upload_folder(folder_path='data/testset', path_in_repo='data/testset', repo_id=r, repo_type='dataset', ignore_patterns=['.DS_Store', '**/.DS_Store']); \
    a.upload_folder(folder_path='data/ft', path_in_repo='data/ft', repo_id=r, repo_type='dataset', allow_patterns=['train.jsonl', 'heldout.jsonl', 'taskdev.jsonl'])"
    ```
 
@@ -289,9 +295,12 @@ STEPS = [("run_resta", "--drifted A1 --base CohereLabs/tiny-aya-base --aligned C
   for the table and the alpha curve. An alpha that was not run is simply not a candidate.
 - **If it fails:** `run_resta.py` exit 1 with "SafeTune" in the message: the package did not install or import
   (fallback: `docs/runtime.md`, section 4). Killed with no message, or "out of memory": not enough RAM (UNVERIFIED
-  which runtime has enough). Exit 2: `--out` is not empty (a pulled `results/resta/A2_alpha_<a>/` from an earlier
-  session counts): use a new `--out`, for example `results/resta/A2_alpha_0.1-b`, and the same folder in the
-  `--model` of that session. A failed `run_eval.py` step: as in step 4.
+  which runtime has enough). Exit 2: `--out` is not empty. In the SAME session, A2 is still on disk: take the
+  finished `run_resta` entry out of `STEPS` and run the rest again. In a later session (a pulled
+  `results/resta/A2_alpha_<a>/` from an earlier session counts as not empty): use a new `--out`, for example
+  `results/resta/A2_alpha_0.1-b`, and the same folder in every `--model` of that session. The model path is part of
+  the recorded setup, so every cell of that alpha that the first session already wrote needs `--force-new-meta` on
+  its `run_eval.py` generate step; the meta then records both settings. A failed `run_eval.py` step: as in step 4.
 - **Keeping A2 at the chosen alpha.** No step uploads A2. If the owner wants to keep or later release A2 at the alpha
   chosen in step 9, re-run ReSta at that alpha in a new session (the DARE seed is fixed, so it should give the same
   weights; bit for bit is UNVERIFIED) with `STAGE = "run_resta"` and `--out work/A2_release`, then, in a new cell,

@@ -75,7 +75,8 @@ Two thin notebooks live in `kaggle/` (they work on Colab too, nothing is Kaggle-
 `00_env_check.ipynb` (install the wheel, print the environment JSON and save it as `env_check.json`) and `10_run_stage.ipynb`
 (check that the workspace repo is private, pull `scripts/`, `pipelines/`, `configs/`, `data/` and `results/`,
 optionally download A1 into `A1/`, run `python scripts/<STAGE>.py` or an ordered list of `STEPS` in one session, and
-upload the whole `results/` folder after each step that changed it, never weights). Every stage script exists; the
+upload the whole `results/` folder after each step when it differs from what was pulled or last uploaded, so a
+failed upload is sent again by the next run of the last cell; never weights). Every stage script exists; the
 order of the real run is in `docs/RUNBOOK.md`. They take the token from `HF_TOKEN` in the environment, a Kaggle
 secret, or a Colab secret, and never print it; an `ANTHROPIC_API_KEY` secret is loaded the same way when present
 (optional, for an `anthropic:` judge only).
