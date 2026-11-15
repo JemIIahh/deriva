@@ -4,15 +4,16 @@
     python scripts/check_article.py article/ARTICLE.md data/sources.yaml            # the check before submitting
     python scripts/check_article.py article/ARTICLE.md data/sources.yaml --draft    # the check while it is a draft
 
-The article has nine required sections. This script checks what a script can check; it does not judge whether the
-article is good, and it does not read the results. The rules, in the order they are reported:
+The article follows the write-up template of the organizers' Submit page. This script checks what a script can check; it
+does not judge whether the article is good, and it does not read the results. The rules, in the order they are reported:
 
-  headings           exactly these nine level-2 headings, in this order, none missing, none twice, none extra
-                     (use level 3 for subsections). Headings inside code blocks are ignored.
+  headings           the level-2 headings are the top-level items of the template, word for word and in its order:
+                     every required item once, an optional item at most once, nothing else (use level 3 for
+                     subsections). Headings inside code blocks are ignored. The title is the level-1 heading.
   heading-levels     no heading level is skipped (a level 4 under a level 2 is an error).
   comments           every HTML comment that is opened is closed; one that is not hides the rest of the page.
   source-licenses    every entry of the source list that is not `excluded` is named, with its licence, on one line of
-                     the "Models used and their licenses" or the "Datasets and benchmarks used and their licenses" section. An entry with
+                     the "Models and licenses" or the "Datasets, benchmarks and licenses" section. An entry with
                      `redistribute: false` must also say "evaluation only" on that line. A row for an entry whose name
                      starts with another entry's name ("X (fine-tune subset)" and "X") counts only for the longer one.
   licenses-and-tools the licences and tools the study depends on are written out (Tiny Aya's licence, gated access
@@ -27,11 +28,12 @@ article is good, and it does not read the results. The rules, in the order they 
   claims             DRAFT MODE ONLY. No sentence or heading states the study's result as fact outside a
                      <<RESULT: ...>> placeholder, because nothing has been measured yet (the final article may state
                      results). Everywhere: sentences of the shapes in CLAIM_PATTERNS. In the front matter and in the
-                     experiments and results sections, also any sentence that puts a language or a model version next to
-                     a word of comparison or a verb of result (SCOPED_CLAIM_PATTERNS), any percentage, number of points,
-                     decimal or number word with a unit, and any cell of a results table that is not a placeholder or
-                     "Not applicable"; method settings belong in Sections 1 to 6. Alt text, link text and the words
-                     inside bold, italic, code and block quotes are read as plain text.
+                     sections that hold results (RESULT_SECTIONS: Abstract, Results, With more credits, Discussion /
+                     what we learned), also any sentence that puts a language or a model version next to a word of
+                     comparison or a verb of result (SCOPED_CLAIM_PATTERNS), any percentage, number of points, decimal
+                     or number word with a unit, and any cell of a table that is not a placeholder or "Not applicable";
+                     method settings belong in the other sections, such as Method / experiments. Alt text, link text
+                     and the words inside bold, italic, code and block quotes are read as plain text.
   placeholders       <<RESULT: name>>, <<LINK: name>> and <<OWNER: name>> are the only markers. With --draft they pass
                      and are listed; without it each one fails. A malformed marker always fails.
   unfinished-markers TODO, TBD, XXX and {{...}} fail in both modes.
@@ -48,9 +50,10 @@ the disclosure inside a comment does not count. Placeholders and TODO-style mark
 Exit codes: 0 every rule passed; 1 at least one rule failed (each is printed as "FAIL [rule] line N: what is wrong");
 2 a usage problem (a file cannot be read, the source list is malformed or not valid YAML).
 
-The headings are the nine sections of the organizers' submission checklist, word for word as slide 29 of
-reference/kickoff-slides-text.txt gives them (a test compares them with that file). If the organizers change a title,
-change REQUIRED_HEADINGS and the article's headings together.
+The headings are the top-level items of the write-up template on the Submit page of hackathon.lexsi.ai (Submit tab,
+read 2026-11-15), word for word, with the page's mark of required (*) or optional (^). They replace the nine section
+titles of kickoff slide 29, which the first draft followed. If the organizers change the template, change
+TEMPLATE_HEADINGS, the test that lists them, and the article's headings together.
 """
 
 from __future__ import annotations
@@ -67,20 +70,36 @@ sys.path.insert(0, str(ROOT / "src"))
 import yaml  # noqa: E402
 from msd.sources import load_sources  # noqa: E402
 
-# The nine section titles of the organizers' submission checklist (reference/kickoff-slides-text.txt, slide 29), word for word.
-REQUIRED_HEADINGS: tuple[str, ...] = (
-    "Problem statement and approach, in brief",
-    "Hackathon repos used: which ones, for what, and which features",
-    "Models used and their licenses",
-    "Datasets and benchmarks used and their licenses",
-    "Model artifacts (weights, adapters, …) public, as an HF collection",
-    "Data artifacts (datasets, logs, benchmarks, …) public, as an HF collection",
-    "Experiments run, findings and what else was tested",
-    "With more credits: your approach, before and after results",
-    "Teammates tagged",
+# The top-level items of the write-up template on the Submit page of hackathon.lexsi.ai (Submit tab, read 2026-11-15),
+# word for word and in the page's order, each with True when the page marks it required (*) and False when optional (^).
+# The template's first item, "Title + one-line claim", is the level-1 title of the article, not a level-2 heading.
+TEMPLATE_HEADINGS_MARKED: tuple[tuple[str, bool], ...] = (
+    ("Abstract", True),
+    ("Problem statement and approach", True),
+    ("Hackathon repos (kits) used", True),
+    ("Models and licenses", True),
+    ("Datasets, benchmarks and licenses", True),
+    ("Metrics, and why these", True),
+    ("Method / experiments", True),
+    ("Results", True),
+    ("Cost / ROI", False),
+    ("Limitations", True),
+    ("With more credits", True),
+    ("Artifacts", True),
+    ("Documentation and reproduction", True),
+    ("Discussion / what we learned", False),
+    ("Teammates tagged", True),
+    ("References", False),
+    ("LLM usage statement", False),
+    ("Changelog", False),
+    ("Appendix", False),
 )
-REPOS, MODELS, DATASETS = REQUIRED_HEADINGS[1], REQUIRED_HEADINGS[2], REQUIRED_HEADINGS[3]
-MODEL_ARTIFACTS, DATA_ARTIFACTS, TEAMMATES = REQUIRED_HEADINGS[4], REQUIRED_HEADINGS[5], REQUIRED_HEADINGS[8]
+TEMPLATE_HEADINGS: tuple[str, ...] = tuple(title for title, _ in TEMPLATE_HEADINGS_MARKED)
+REQUIRED_HEADINGS: tuple[str, ...] = tuple(title for title, required in TEMPLATE_HEADINGS_MARKED if required)
+OPTIONAL_HEADINGS: tuple[str, ...] = tuple(title for title, required in TEMPLATE_HEADINGS_MARKED if not required)
+ABSTRACT, REPOS, MODELS, DATASETS = "Abstract", "Hackathon repos (kits) used", "Models and licenses", "Datasets, benchmarks and licenses"
+RESULTS, MORE_CREDITS, ARTIFACTS = "Results", "With more credits", "Artifacts"
+DISCUSSION, LLM_USAGE = "Discussion / what we learned", "LLM usage statement"
 
 MARKER_KINDS: tuple[str, ...] = ("RESULT", "LINK", "OWNER")
 MIN_PROSE_WORDS = 12  # a section with fewer words of its own (links and placeholders do not count) is "links only"
@@ -227,10 +246,11 @@ CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-# In the front matter (under the title, before the first section) and in the two sections that hold results, a sentence
-# that names a language or a model version has no business using a word of comparison or a verb of result: those places
-# hold questions, pointers and placeholders, and the method is in Sections 1 to 6. The patterns below are stricter than
-# CLAIM_PATTERNS for that reason, and they run only there. They still cannot know every way to say a result.
+# In the front matter (under the title, before the first section) and in the sections that hold results
+# (RESULT_SECTIONS), a sentence that names a language or a model version has no business using a word of comparison or a
+# verb of result: those places hold questions, pointers and placeholders, and the method is in the other sections. The
+# patterns below are stricter than CLAIM_PATTERNS for that reason, and they run only there. They still cannot know every
+# way to say a result.
 _NAME = (
     r"(?:english|hindi|hinglish|arabic|swahili|original|drifted|repaired|naive blend|resta|the repair"
     r"|(?-i:BASE|A0|A1|A2n|A2|A3))"
@@ -267,8 +287,9 @@ SCOPED_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-# A percentage or a number of points in the experiments and the results sections has to be a result, and a result may
-# only stand inside a placeholder. Method settings (limits, thresholds, margins) belong in the earlier sections.
+# A percentage or a number of points in a section that holds results has to be a result, and a result may only stand
+# inside a placeholder. Method settings (limits, thresholds, margins) belong in the other sections, such as
+# Method / experiments.
 _FIGURE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*%|\s+percent\b|[\s-]*(?:percentage[\s-]*)?(?:points?|pts?|pct)\b|\s*pp\b)", re.I)
 _NUMBER_WORD = (
     r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
@@ -288,8 +309,11 @@ _FIGURE_SHAPES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b\d+(?:[.,]\d+)?\s*[x\u00d7](?![\w])", re.I),
     re.compile(rf"\b(?:\d+|{_NUMBER_WORD})\s+in\s+(?:\d+|{_NUMBER_WORD})\b", re.I),
 )
-FIGURE_SECTIONS: tuple[str, ...] = (REQUIRED_HEADINGS[6], REQUIRED_HEADINGS[7])
-RESULT_TABLES = REQUIRED_HEADINGS[7]  # every data cell of a table here is a placeholder or "Not applicable"
+# The sections of the template that hold results: the summary of them (Abstract), the results themselves, the forecast
+# with more credits and the discussion of what they mean. In a draft, the scoped claim patterns run there and in the
+# front matter, and the figure rule and the table rule (every data cell of a table is a placeholder or "Not applicable")
+# run there. Method / experiments is not one of them: it holds the settings, which are numbers but not results.
+RESULT_SECTIONS: tuple[str, ...] = (ABSTRACT, RESULTS, MORE_CREDITS, DISCUSSION)
 
 
 def _first_figure(text: str) -> str | None:
@@ -329,7 +353,7 @@ REQUIRED_MENTIONS: tuple[Mention, ...] = (
     Mention("that the AlignTune package bundles unsloth, which has AGPL parts", (REPOS, MODELS), (r"unsloth", r"agpl")),
     Mention("that the AlignTune package bundles mergekit, which is LGPL", (REPOS, MODELS), (r"mergekit", r"lgpl")),
     Mention("that only the TRL backend of AlignTune is used", (REPOS, MODELS), (r"\btrl\b", r"backend")),
-    Mention("NLLB and its CC-BY-NC licence, for the machine translations", (REPOS, MODELS, DATASETS, DATA_ARTIFACTS), (r"nllb", _lic("CC-BY-NC"))),
+    Mention("NLLB and its CC-BY-NC licence, for the machine translations", (REPOS, MODELS, DATASETS, ARTIFACTS), (r"nllb", _lic("CC-BY-NC"))),
     Mention("the MultiJail ethics statement", (DATASETS,), (r"multijail", r"ethics statement")),
     Mention("SafeTune, the repair toolkit, and what it is used for", (REPOS,), (r"safetune",)),
     Mention("AuditKIT, and whether it was used", (REPOS,), (r"auditkit",)),
@@ -522,33 +546,35 @@ def _plural(n: int, word: str) -> str:
 def check_headings(doc: Doc, report: Report) -> None:
     level_two = [h for h in doc.headings if h.level == 2]
     texts = [h.text for h in level_two]
-    for number, required in enumerate(REQUIRED_HEADINGS, 1):
-        lines = [h.line for h in level_two if h.text == required]
-        if not lines:
+    for title in TEMPLATE_HEADINGS:
+        lines = [h.line for h in level_two if h.text == title]
+        if not lines and title in REQUIRED_HEADINGS:
             report.add(
                 "headings",
-                f"Section {number} '{required}' is missing. It must be a level-2 heading (##) with exactly these words.",
+                f"The required section '{title}' is missing. It must be a level-2 heading (##) with exactly these words.",
             )
         elif len(lines) > 1:
             where = " and ".join(str(n) for n in lines) if len(lines) == 2 else ", ".join(str(n) for n in lines)
             times = "twice" if len(lines) == 2 else f"{len(lines)} times"
-            report.add("headings", f"The heading '{required}' appears {times} (lines {where}). Each section must appear once.", lines[1])
+            report.add("headings", f"The heading '{title}' appears {times} (lines {where}). Each section must appear once.", lines[1])
     for h in level_two:
-        if h.text not in REQUIRED_HEADINGS:
+        if h.text not in TEMPLATE_HEADINGS:
             report.add(
                 "headings",
-                f"Extra level-2 heading '{h.text}'. The article has exactly the nine required level-2 headings; "
-                "use level 3 (###) for anything else.",
+                f"Extra level-2 heading '{h.text}'. The level-2 headings are the items of the Submit page's template only "
+                "(each required one, and any optional one); use level 3 (###) for anything else.",
                 h.line,
             )
-    once = [r for r in REQUIRED_HEADINGS if texts.count(r) == 1]
+    once = [t for t in TEMPLATE_HEADINGS if texts.count(t) == 1]
     actual = [t for t in texts if t in once]
     if actual != once:
         k = next(i for i, (a, b) in enumerate(zip(actual, once)) if a != b)
+        order = "; ".join(
+            f"{i}. {t}" + ("" if t in REQUIRED_HEADINGS else " (optional)") for i, t in enumerate(TEMPLATE_HEADINGS, 1)
+        )
         report.add(
             "headings",
-            f"The headings are in the wrong order: '{actual[k]}' comes where '{once[k]}' must come. "
-            "The order is: " + "; ".join(f"{i}. {r}" for i, r in enumerate(REQUIRED_HEADINGS, 1)) + ".",
+            f"The headings are in the wrong order: '{actual[k]}' comes where '{once[k]}' must come. The order is: {order}.",
             next(h.line for h in level_two if h.text == actual[k]),
         )
 
@@ -639,7 +665,7 @@ def check_disclosure(doc: Doc, report: Report) -> None:
     report.add(
         "disclosure",
         "No paragraph says that Claude Code, an AI coding assistant, helped build the work. Add one plain paragraph "
-        "that names Claude Code and says it is an AI assistant (the 'Teammates tagged' section is the natural place).",
+        f"that names Claude Code and says it is an AI assistant (the '{LLM_USAGE}' section is the natural place).",
     )
 
 
@@ -658,7 +684,7 @@ def _prose_words(lines: list[tuple[int, str]]) -> int:
 
 
 def check_sections_have_prose(doc: Doc, report: Report) -> None:
-    for title in REQUIRED_HEADINGS:
+    for title in TEMPLATE_HEADINGS:  # an optional section that is absent has no span, so it is not checked
         for first, last in doc.sections(title):
             words = _prose_words(doc.text_lines(first, last))
             if words == 0:
@@ -703,7 +729,7 @@ def check_figures(doc: Doc, article: Path, fill_in: str | None, report: Report) 
         report.add(
             "figures",
             "The per-language heatmap is not shown. Add an image whose file name contains 'heatmap' "
-            "(for example ![Heatmap of ...](heatmap.png)) to the before and after results section.",
+            f"(for example ![Heatmap of ...](heatmap.png)) to the '{RESULTS}' section.",
         )
     for number, _, path in figures:
         if not _is_local(path):
@@ -738,10 +764,10 @@ def check_hype(doc: Doc, report: Report) -> None:
 
 
 def _strict_spans(doc: Doc) -> list[tuple[int, int]]:
-    """Line ranges where SCOPED_CLAIM_PATTERNS also run: the front matter and the two sections that hold results."""
+    """Line ranges where SCOPED_CLAIM_PATTERNS also run: the front matter and the sections that hold results."""
     first_section = next((h.line for h in doc.headings if h.level == 2), len(doc.lines) + 1)
     spans = [(1, first_section - 1)]
-    for title in FIGURE_SECTIONS:
+    for title in RESULT_SECTIONS:
         spans.extend(doc.sections(title))
     return spans
 
@@ -767,7 +793,7 @@ def check_claims(doc: Doc, report: Report) -> None:
                         line,
                     )
                     break
-    for title in FIGURE_SECTIONS:
+    for title in RESULT_SECTIONS:
         for first, last in doc.sections(title):
             section = [(number, _quote_free(text)) for number, text in doc.text_lines(first, last)]
             found = [(block.line, _URL.sub(" ", _plain(_strip_markers(block.text)))) for block in blocks(section)]
@@ -780,7 +806,8 @@ def check_claims(doc: Doc, report: Report) -> None:
                         "claims",
                         f"The figure '{figure}' stands outside a <<RESULT: ...>> placeholder in the section '{title}'. "
                         "In a draft, every percentage, every number of points and every decimal in that section must be a "
-                        "result inside a placeholder; put method settings (limits, thresholds, margins) in Sections 1 to 6.",
+                        "result inside a placeholder; put method settings (limits, thresholds, margins) in a section that "
+                        "does not hold results, such as 'Method / experiments'.",
                         number,
                     )
     check_result_tables(doc, report)
@@ -790,9 +817,10 @@ _SEPARATOR_ROW = re.compile(r"^\|?[\s:|-]*-[\s:|-]*\|?$")
 
 
 def check_result_tables(doc: Doc, report: Report) -> None:
-    """In the before and after section every data cell of a table (not its header, not its row label) is a placeholder
+    """In the sections that hold results every data cell of a table (not its header, not its row label) is a placeholder
     or 'Not applicable', so that no number or word that reads as a result stands in the table by hand."""
-    for first, last in doc.sections(RESULT_TABLES):
+    spans = [(title, span) for title in RESULT_SECTIONS for span in doc.sections(title)]
+    for title, (first, last) in spans:
         rows: list[tuple[int, str]] = []
         for number, text in doc.text_lines(first, last) + [(last + 2, "")]:  # the sentinel closes the last table
             stripped = _quote_free(text).strip()
@@ -810,8 +838,8 @@ def check_result_tables(doc: Doc, report: Report) -> None:
                     shown = _plain(cell) or "(empty)"
                     report.add(
                         "claims",
-                        f"The table cell '{shown}' is not a placeholder. In a draft, every data cell of a results table in the "
-                        f"section '{RESULT_TABLES}' must be a <<RESULT: ...>> placeholder or 'Not applicable'.",
+                        f"The table cell '{shown}' is not a placeholder. In a draft, every data cell of a table in the "
+                        f"section '{title}' must be a <<RESULT: ...>> placeholder or 'Not applicable'.",
                         row_number,
                     )
             rows = [(number, stripped)] if stripped.startswith("|") else []

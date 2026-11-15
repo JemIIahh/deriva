@@ -30,19 +30,40 @@ def _load_script():
 
 check_article = _load_script()
 
-# The nine titles of the organizers' submission checklist (reference/kickoff-slides-text.txt, slide 29), word for word.
-HEADINGS = [
-    "Problem statement and approach, in brief",
-    "Hackathon repos used: which ones, for what, and which features",
-    "Models used and their licenses",
-    "Datasets and benchmarks used and their licenses",
-    "Model artifacts (weights, adapters, …) public, as an HF collection",
-    "Data artifacts (datasets, logs, benchmarks, …) public, as an HF collection",
-    "Experiments run, findings and what else was tested",
-    "With more credits: your approach, before and after results",
-    "Teammates tagged",
+# The write-up template on the Submit page of hackathon.lexsi.ai (Submit tab, read 2026-11-15): its top-level items, word
+# for word and in its order, each with True when the page marks it required (*) and False when it marks it optional (^).
+# The template's first item, "Title + one-line claim", is the article's level-1 title, so it is not a level-2 heading here.
+# Typed out here on purpose, not read from the checker, so that a test compares the two.
+TEMPLATE = [
+    ("Abstract", True),
+    ("Problem statement and approach", True),
+    ("Hackathon repos (kits) used", True),
+    ("Models and licenses", True),
+    ("Datasets, benchmarks and licenses", True),
+    ("Metrics, and why these", True),
+    ("Method / experiments", True),
+    ("Results", True),
+    ("Cost / ROI", False),
+    ("Limitations", True),
+    ("With more credits", True),
+    ("Artifacts", True),
+    ("Documentation and reproduction", True),
+    ("Discussion / what we learned", False),
+    ("Teammates tagged", True),
+    ("References", False),
+    ("LLM usage statement", False),
+    ("Changelog", False),
+    ("Appendix", False),
 ]
-PROBLEM, REPOS, MODELS, DATASETS, MODEL_ARTIFACTS, DATA_ARTIFACTS, EXPERIMENTS, APPROACH, TEAMMATES = HEADINGS
+HEADINGS = [title for title, _ in TEMPLATE]
+REQUIRED = [title for title, required in TEMPLATE if required]
+OPTIONAL = [title for title, required in TEMPLATE if not required]
+(
+    ABSTRACT, PROBLEM, REPOS, MODELS, DATASETS, METRICS, METHOD, RESULTS, COST, LIMITATIONS, MORE_CREDITS, ARTIFACTS,
+    DOCUMENTATION, DISCUSSION, TEAMMATES, REFERENCES, LLM_USAGE, CHANGELOG, APPENDIX,
+) = HEADINGS
+# The sections that hold results: in a draft the scoped claim patterns, the figure rule and the table rule run there.
+RESULT_SECTIONS = [ABSTRACT, RESULTS, MORE_CREDITS, DISCUSSION]
 
 # --- a small, valid article ------------------------------------------------------------------------------------------
 # Each named piece below is one sentence or paragraph a rule looks for, so a test can drop exactly one.
@@ -92,20 +113,39 @@ PLAIN_DATA = (
     "The test set, the per-item labels and the tables are published in one public dataset collection, with a card "
     "that says what each file holds. The link is below.\n\n[Data collection](https://huggingface.co/collections/example/data)"
 )
-PLAIN_EXPERIMENTS = (
-    "One stronger fine-tuning recipe exists in case the first one does not move the model. Alpha was chosen on the "
-    "dev split only, and the report split was kept apart. Every limit of the judges is written down here."
+PLAIN_ABSTRACT = (
+    "This study asks whether a harmless fine-tune changes how a small multilingual model answers harmful requests, and "
+    "it tests one way to undo that without retraining."
 )
-PLAIN_APPROACH = (
+PLAIN_METRICS = "Attack success rate, where lower is better. Over-refusal, where lower is better. Task accuracy, where higher is better."
+PLAIN_METHOD = (
+    "LoRA rank 16 and a learning rate of 1e-4, for two epochs. The strength of the patch is chosen on the dev split "
+    "only, from 0.05, 0.1 and 0.25."
+)
+PLAIN_RESULTS = (
     "The figure below shows the attack success rate per language for the original model and for the repaired model."
     "\n\n![Heatmap of attack success rate per language, before and after the repair](heatmap.png)"
 )
+PLAIN_LIMITATIONS = "The judges are models, and their agreement is measured on a sample only. The study covers one model and one task."
+PLAIN_MORE_CREDITS = (
+    "With more compute, the study would run every strength of the grid and add a second translator. A forecast would "
+    "be labelled as a forecast, not as a result."
+)
+PLAIN_DISCUSSION = "The lessons of the build are written here as plain notes, and the implications wait for the measured numbers."
+OPTIONAL_BODIES = {
+    COST: "The study ran on free notebook GPUs, and the hours are written down once every run is over.",
+    REFERENCES: "The papers behind the methods and the data are listed here with their authors and their years.",
+    CHANGELOG: "The first draft followed the kickoff slides; this version follows the template of the Submit page.",
+    APPENDIX: "The judge's instructions and the extra tables are kept here, apart from the main text of the article.",
+}
 
 
-def make_article(*, drop=(), extra="", sections=None, heading_overrides=None) -> str:
-    """The nine sections with every named piece in it, minus the pieces named in `drop`."""
+def make_article(*, drop=(), extra="", sections=None, heading_overrides=None, omit=()) -> str:
+    """Every heading of the template with every named piece in it, minus the pieces named in `drop` and the sections
+    named in `omit`."""
     keep = {name: text for name, text in PIECES.items() if name not in drop}
     body = {
+        ABSTRACT: PLAIN_ABSTRACT,
         PROBLEM: keep.get("question", ""),
         REPOS: "\n\n".join(
             keep[name] for name in ("repos", "aligntune_mit", "curatorkit_lsal", "aligntune_depends", "unsloth", "mergekit", "trl")
@@ -118,16 +158,24 @@ def make_article(*, drop=(), extra="", sections=None, heading_overrides=None) ->
             + "\n".join(row for name, row in SOURCE_ROWS.items() if name not in drop)
             + ("\n\n" + keep["multijail"] if "multijail" in keep else "")
         ),
-        MODEL_ARTIFACTS: PLAIN_COLLECTION,
-        DATA_ARTIFACTS: PLAIN_DATA,
-        EXPERIMENTS: PLAIN_EXPERIMENTS,
-        APPROACH: PLAIN_APPROACH,
-        TEAMMATES: "None. " + keep.get("disclosure", "Nobody else worked on it, and nobody else helped in any way at all."),
+        METRICS: PLAIN_METRICS,
+        METHOD: PLAIN_METHOD,
+        RESULTS: PLAIN_RESULTS,
+        LIMITATIONS: PLAIN_LIMITATIONS,
+        MORE_CREDITS: PLAIN_MORE_CREDITS,
+        ARTIFACTS: PLAIN_COLLECTION + "\n\n" + PLAIN_DATA,
+        DOCUMENTATION: "The runbook lists every step in order, and the README says how to install each environment first.",
+        DISCUSSION: PLAIN_DISCUSSION,
+        TEAMMATES: "None. This is a solo project, so there is nobody else to tag in this section.",
+        LLM_USAGE: keep.get("disclosure", "Nobody else worked on it, and nobody else helped in any way at all."),
+        **OPTIONAL_BODIES,
     }
     body.update(sections or {})
-    names = [(heading_overrides or {}).get(h, h) for h in HEADINGS]
     parts = ["# A test article\n"]
-    for name, title in zip(HEADINGS, names):
+    for name in HEADINGS:
+        if name in omit:
+            continue
+        title = (heading_overrides or {}).get(name, name)
         parts.append(f"## {title}\n\n{body[name]}\n")
     return "\n".join(parts) + extra
 
@@ -196,35 +244,29 @@ def test_the_small_valid_article_passes_every_rule(tmp_path):
     assert report.ok
 
 
-# --- 1. the nine headings ----------------------------------------------------------------------------------------------
+# --- 1. the headings of the Submit page's template --------------------------------------------------------------------
 
 
-def test_nine_required_headings(tmp_path):
-    assert list(check_article.REQUIRED_HEADINGS) == HEADINGS
+def test_the_headings_are_the_items_of_the_submit_page_template_word_for_word(tmp_path):
+    # the template of the Submit page (hackathon.lexsi.ai, Submit tab, read 2026-11-15), typed out in TEMPLATE above
+    assert list(check_article.TEMPLATE_HEADINGS_MARKED) == TEMPLATE
+    assert list(check_article.TEMPLATE_HEADINGS) == HEADINGS
+    assert list(check_article.REQUIRED_HEADINGS) == REQUIRED
+    assert list(check_article.OPTIONAL_HEADINGS) == OPTIONAL
+    assert len(REQUIRED) == 13 and len(OPTIONAL) == 6
     assert run(tmp_path, make_article()).ok
 
 
-SLIDES = ROOT / "reference" / "kickoff-slides-text.txt"
+def test_every_section_the_rules_name_is_a_heading_of_the_template():
+    named = {check_article.ABSTRACT, check_article.REPOS, check_article.MODELS, check_article.DATASETS,
+             check_article.RESULTS, check_article.MORE_CREDITS, check_article.ARTIFACTS, check_article.DISCUSSION,
+             check_article.LLM_USAGE}
+    named |= {s for m in check_article.REQUIRED_MENTIONS for s in m.sections}
+    assert named <= set(HEADINGS), named - set(HEADINGS)
+    assert list(check_article.RESULT_SECTIONS) == RESULT_SECTIONS
 
 
-@pytest.mark.skipif(not SLIDES.is_file(), reason="the kickoff slide text is not in this checkout")
-def test_required_headings_are_the_organizers_checklist_word_for_word():
-    # slide 29 lists the nine sections; the titles are read from that file, never retyped
-    import re
-
-    lines = SLIDES.read_text(encoding="utf-8").splitlines()
-    start = next(n for n, line in enumerate(lines) if line.strip() == "===== SECTION 29 =====")
-    titles = []
-    for line in lines[start : start + 16]:
-        m = re.match(r"^\s*([1-9])\s+(\S.*?)\s*$", line)
-        if m and int(m.group(1)) == len(titles) + 1:
-            titles.append(m.group(2))
-    assert len(titles) == 9
-    assert list(check_article.REQUIRED_HEADINGS) == titles
-    assert HEADINGS == titles
-
-
-@pytest.mark.parametrize("missing", HEADINGS)
+@pytest.mark.parametrize("missing", REQUIRED)
 def test_a_missing_required_heading_is_named(tmp_path, missing):
     article = make_article().replace(f"## {missing}\n", f"### {missing}\n")
     report = run(tmp_path, article)
@@ -233,13 +275,43 @@ def test_a_missing_required_heading_is_named(tmp_path, missing):
     assert "missing" in messages(report)
 
 
+@pytest.mark.parametrize("left_out", OPTIONAL)
+def test_an_optional_heading_may_be_left_out(tmp_path, left_out):
+    report = run(tmp_path, make_article(omit=(left_out,)))
+    assert "headings" not in rules(report), messages(report)
+    if left_out != LLM_USAGE:  # the disclosure paragraph sits there in the small article
+        assert report.ok, messages(report)
+
+
+def test_an_article_with_only_the_required_headings_passes(tmp_path):
+    disclosure_moved = {TEAMMATES: "None. " + PIECES["disclosure"]}
+    assert run(tmp_path, make_article(omit=tuple(OPTIONAL), sections=disclosure_moved)).ok
+
+
 def test_headings_in_the_wrong_order_fail(tmp_path):
     article = make_article()
-    article = article.replace(f"## {MODEL_ARTIFACTS}", "## @@").replace(f"## {DATA_ARTIFACTS}", f"## {MODEL_ARTIFACTS}").replace("## @@", f"## {DATA_ARTIFACTS}")
+    article = article.replace(f"## {ARTIFACTS}\n", "## @@\n").replace(f"## {LIMITATIONS}\n", f"## {ARTIFACTS}\n").replace("## @@\n", f"## {LIMITATIONS}\n")
     report = run(tmp_path, article)
     assert "headings" in rules(report)
     assert "order" in messages(report)
-    assert DATA_ARTIFACTS in messages(report)
+    assert f"'{ARTIFACTS}' comes where '{LIMITATIONS}' must come" in messages(report)
+
+
+def test_an_optional_heading_out_of_its_place_fails(tmp_path):
+    # Cost / ROI belongs between Results and Limitations; put it after Limitations
+    article = make_article()
+    article = article.replace(f"## {COST}\n", "## @@\n").replace(f"## {LIMITATIONS}\n", f"## {COST}\n").replace("## @@\n", f"## {LIMITATIONS}\n")
+    report = run(tmp_path, article)
+    assert "headings" in rules(report)
+    assert "order" in messages(report)
+    assert "(optional)" in messages(report)
+
+
+def test_an_optional_heading_twice_fails(tmp_path):
+    article = make_article(extra=f"\n## {CHANGELOG}\n\nA second changelog, with enough words in it to pass the prose rule.\n")
+    report = run(tmp_path, article)
+    assert "headings" in rules(report)
+    assert f"'{CHANGELOG}'" in messages(report) and "twice" in messages(report)
 
 
 def test_a_duplicated_heading_fails_and_names_both_lines(tmp_path):
@@ -258,7 +330,7 @@ def test_an_extra_level_two_heading_fails(tmp_path):
 
 
 def test_level_three_subsections_are_allowed(tmp_path):
-    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n### What failed\n\nNothing has been run yet, so this part stays short and plain.\n"})
+    article = make_article(sections={METHOD: PLAIN_METHOD + "\n\n### What failed\n\nNothing has been run yet, so this part stays short and plain.\n"})
     assert run(tmp_path, article).ok
 
 
@@ -278,7 +350,7 @@ def test_heading_text_must_match_exactly(tmp_path):
 
 
 def test_a_skipped_heading_level_fails(tmp_path):
-    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n#### Too deep\n\nThis heading skips level three, which breaks the outline of the page.\n"})
+    article = make_article(sections={METHOD: PLAIN_METHOD + "\n\n#### Too deep\n\nThis heading skips level three, which breaks the outline of the page.\n"})
     report = run(tmp_path, article)
     assert "heading-levels" in rules(report)
     assert "Too deep" in messages(report)
@@ -357,9 +429,15 @@ def test_disclosure_paragraph_present(tmp_path):
 
 
 def test_disclosure_must_say_it_is_an_ai_assistant(tmp_path):
-    article = make_article(sections={TEAMMATES: "None. The work was done with Claude Code and a lot of coffee, mostly at night."})
+    article = make_article(sections={LLM_USAGE: "The work was done with Claude Code and a lot of coffee, mostly at night."})
     report = run(tmp_path, article)
     assert "disclosure" in rules(report)
+    assert f"'{LLM_USAGE}'" in messages(report)  # the message points to the natural place for it
+
+
+def test_the_disclosure_may_sit_in_any_section(tmp_path):
+    article = make_article(sections={TEAMMATES: "None. " + PIECES["disclosure"], LLM_USAGE: "The judge models are the only other language models, and they are named with the other models."})
+    assert run(tmp_path, article).ok
 
 
 # --- 5. licences and tools --------------------------------------------------------------------------------------------------
@@ -408,33 +486,34 @@ def test_a_mention_in_the_wrong_section_does_not_count(tmp_path):
 
 
 def test_a_section_of_only_links_fails(tmp_path):
-    article = make_article(sections={MODEL_ARTIFACTS: "https://huggingface.co/collections/example/models\n\n[the data](https://huggingface.co/collections/example/data)"})
+    article = make_article(sections={ARTIFACTS: "https://huggingface.co/collections/example/models\n\n[the data](https://huggingface.co/collections/example/data)"})
     report = run(tmp_path, article)
     assert "empty-or-links-only" in rules(report)
-    assert f"'{MODEL_ARTIFACTS}'" in messages(report)
+    assert f"'{ARTIFACTS}'" in messages(report)
     assert "links" in messages(report)
 
 
-def test_an_empty_section_fails(tmp_path):
-    report = run(tmp_path, make_article(sections={DATA_ARTIFACTS: ""}))
+@pytest.mark.parametrize("section", [LIMITATIONS, CHANGELOG])  # a required and an optional one
+def test_an_empty_section_fails(tmp_path, section):
+    report = run(tmp_path, make_article(sections={section: ""}))
     assert "empty-or-links-only" in rules(report)
-    assert f"'{DATA_ARTIFACTS}'" in messages(report)
+    assert f"'{section}'" in messages(report)
 
 
 def test_a_figure_without_alt_text_fails(tmp_path):
-    article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
+    article = make_article(sections={RESULTS: PLAIN_RESULTS.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
     report = run(tmp_path, article)
     assert "figures" in rules(report)
     assert "alt text" in messages(report)
 
 
 def test_a_figure_with_one_word_of_alt_text_fails(tmp_path):
-    article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![heatmap]")})
+    article = make_article(sections={RESULTS: PLAIN_RESULTS.replace("![Heatmap of attack success rate per language, before and after the repair]", "![heatmap]")})
     assert "figures" in rules(run(tmp_path, article))
 
 
 def test_the_per_language_heatmap_must_be_referenced(tmp_path):
-    article = make_article(sections={APPROACH: PLAIN_APPROACH.split("\n\n")[0]})
+    article = make_article(sections={RESULTS: PLAIN_RESULTS.split("\n\n")[0]})
     report = run(tmp_path, article)
     assert "figures" in rules(report)
     assert "heatmap" in messages(report)
@@ -442,7 +521,7 @@ def test_the_per_language_heatmap_must_be_referenced(tmp_path):
 
 def test_the_heatmap_may_sit_in_a_subfolder_or_at_a_url(tmp_path):
     for path in ("figures/heatmap.png", "https://example.org/files/heatmap.png"):
-        article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("(heatmap.png)", f"({path})")})
+        article = make_article(sections={RESULTS: PLAIN_RESULTS.replace("(heatmap.png)", f"({path})")})
         folder = tmp_path / path.replace("/", "_").replace(":", "_")
         folder.mkdir()
         article_path, sources_path = write_case(folder, article)
@@ -465,12 +544,32 @@ FILL_IN_OK = "# Fill in\n\nheatmap.png is still to be added.\n"
 
 
 def draft_article(extra_sentence):
-    return make_article(sections={APPROACH: PLAIN_APPROACH + "\n\n" + extra_sentence})
+    return make_article(sections={RESULTS: PLAIN_RESULTS + "\n\n" + extra_sentence})
 
 
 def in_problem_section(sentence):
-    # section 1 has no figure rule, so only the claims patterns can catch the sentence here
+    # the problem section holds no results, so only the claims patterns can catch the sentence here
     return make_article(sections={PROBLEM: PIECES["question"] + "\n\n" + sentence})
+
+
+def in_method(sentence):
+    """Method / experiments holds the settings: numbers, but not results. Only the claims patterns run here."""
+    return make_article(sections={METHOD: PLAIN_METHOD + "\n\n" + sentence})
+
+
+BASES = {
+    ABSTRACT: PLAIN_ABSTRACT,
+    RESULTS: PLAIN_RESULTS,
+    MORE_CREDITS: PLAIN_MORE_CREDITS,
+    DISCUSSION: PLAIN_DISCUSSION,
+    METHOD: PLAIN_METHOD,
+    LIMITATIONS: PLAIN_LIMITATIONS,
+}
+
+
+def in_section(name, text):
+    """The small article with `text` added at the end of the section `name`."""
+    return make_article(sections={name: BASES[name] + "\n\n" + text})
 
 
 def test_draft_mode_lists_placeholders_and_passes(tmp_path):
@@ -625,71 +724,69 @@ def test_a_rephrased_result_inside_a_result_placeholder_passes(tmp_path, sentenc
 
 
 @pytest.mark.parametrize("sentence", REPHRASED_CLAIMS)
-def test_a_rephrased_result_sentence_is_also_caught_in_the_experiments_section(tmp_path, sentence):
-    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + sentence})
-    assert "claims" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), sentence
+def test_a_rephrased_result_sentence_is_also_caught_in_the_method_section(tmp_path, sentence):
+    # Method / experiments is not a results section, but the claims patterns run everywhere
+    assert "claims" in rules(run(tmp_path, in_method(sentence), draft=True, fill_in=FILL_IN_OK)), sentence
 
 
 def test_a_heading_that_states_a_result_fails(tmp_path):
     heading = "### Fine-tuning made the model less safe in Swahili"
-    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + heading + "\n\nThe text under the heading is plain and says nothing about a result."})
+    article = in_method(heading + "\n\nThe text under the heading is plain and says nothing about a result.")
     report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
     assert "claims" in rules(report)
     assert "Fine-tuning made the model less safe in Swahili" in messages(report)
 
 
 def test_a_heading_that_is_a_question_or_plain_method_is_fine(tmp_path):
-    article = make_article(
-        sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n### Does fine-tuning make the model less safe?\n\nWe ask it of five languages in turn, with the same prompts.\n\n### The safeguards\n\nThey are listed here in plain words."}
+    article = in_section(
+        MORE_CREDITS,
+        "### Does fine-tuning make the model less safe?\n\nWe ask it of five languages in turn, with the same prompts.\n\n### The safeguards\n\nThey are listed here in plain words.",
     )
     assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
 
 
 @pytest.mark.parametrize("text", ["The rate is 31% in Arabic.", "It is 12 points higher in Hindi.", "The gap is 5 percentage points.", "A 10-point rule applies here.", "It is 3 percent."])
-@pytest.mark.parametrize("section", ["EXPERIMENTS", "APPROACH"])
-def test_a_figure_outside_a_placeholder_in_sections_7_and_8_fails_in_draft_mode(tmp_path, text, section):
-    name = {"EXPERIMENTS": EXPERIMENTS, "APPROACH": APPROACH}[section]
-    base = {"EXPERIMENTS": PLAIN_EXPERIMENTS, "APPROACH": PLAIN_APPROACH}[section]
-    report = run(tmp_path, make_article(sections={name: base + "\n\n" + text}), draft=True, fill_in=FILL_IN_OK)
+@pytest.mark.parametrize("section", RESULT_SECTIONS)
+def test_a_figure_outside_a_placeholder_in_a_results_section_fails_in_draft_mode(tmp_path, text, section):
+    report = run(tmp_path, in_section(section, text), draft=True, fill_in=FILL_IN_OK)
     assert "claims" in rules(report), text
     assert "placeholder" in messages(report)
-    assert name in messages(report)
+    assert section in messages(report)
 
 
 def test_a_figure_inside_a_placeholder_in_those_sections_passes(tmp_path):
-    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\nThe rate is <<RESULT: rate in Arabic, 31%>> in Arabic."})
+    article = in_section(MORE_CREDITS, "The rate is <<RESULT: rate in Arabic, 31%>> in Arabic.")
     assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK + "rate in Arabic, 31%\n"))
 
 
-def test_method_figures_are_fine_in_the_earlier_sections_and_in_final_mode(tmp_path):
+def test_method_figures_are_fine_in_the_method_sections_and_in_final_mode(tmp_path):
     text = "The sanity gate allows at most 20% empty replies and a fall of at most 10 points in task accuracy."
     early = make_article(sections={MODELS: PIECES["tiny_licence"] + "\n\n" + PIECES["gated"] + "\n\n" + PIECES["aup"] + "\n\n" + PIECES["nllb"] + "\n\n" + text})
     assert "claims" not in rules(run(tmp_path, early, draft=True, fill_in=FILL_IN_OK))
-    late = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + text})
+    assert "claims" not in rules(run(tmp_path, in_method(text), draft=True, fill_in=FILL_IN_OK))
+    late = in_section(MORE_CREDITS, text)
+    assert "claims" in rules(run(tmp_path, late, draft=True, fill_in=FILL_IN_OK))
     assert run(tmp_path, late, draft=False).ok  # the final article may state figures
 
 
 def test_numbers_that_are_not_percentages_or_points_are_not_figures(tmp_path):
     text = "A second judge labels 60 replies per language, and at least 30 pairs must be comparable."
-    article = make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + text})
-    assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
+    assert "claims" not in rules(run(tmp_path, in_section(MORE_CREDITS, text), draft=True, fill_in=FILL_IN_OK))
 
 
 # --- 8c. fix round 2: alt text and Markdown marks must not hide a result ------------------------------------------------------
 
 
-@pytest.mark.parametrize("section", ["EXPERIMENTS", "APPROACH"])
+@pytest.mark.parametrize("section", [MORE_CREDITS, RESULTS])
 def test_a_result_in_the_alt_text_of_a_figure_fails_in_draft_mode(tmp_path, section):
-    name = {"EXPERIMENTS": EXPERIMENTS, "APPROACH": APPROACH}[section]
-    base = {"EXPERIMENTS": PLAIN_EXPERIMENTS, "APPROACH": PLAIN_APPROACH}[section]
     image = "![Heatmap: Swahili at 66% attack success after the repair, the highest of the five languages](heatmap.png)"
-    report = run(tmp_path, make_article(sections={name: base + "\n\n" + image}), draft=True, fill_in=FILL_IN_OK)
+    report = run(tmp_path, in_section(section, image), draft=True, fill_in=FILL_IN_OK)
     assert "claims" in rules(report), section
     assert "66%" in messages(report)
 
 
 def test_alt_text_is_still_required_and_a_plain_description_still_passes(tmp_path):
-    article = make_article(sections={APPROACH: PLAIN_APPROACH.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
+    article = make_article(sections={RESULTS: PLAIN_RESULTS.replace("![Heatmap of attack success rate per language, before and after the repair]", "![]")})
     assert "figures" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
     assert run(tmp_path, make_article(), draft=True, fill_in=FILL_IN_OK).ok
 
@@ -739,11 +836,7 @@ def test_plain_text_with_links_and_marks_is_still_not_a_claim(tmp_path):
         assert "claims" not in rules(report), (sentence, messages(report))
 
 
-# --- 8d. fix round 2: Sections 7 and 8 and the front matter may not say how a language or a model did ---------------------------
-
-
-def in_experiments(sentence):
-    return make_article(sections={EXPERIMENTS: PLAIN_EXPERIMENTS + "\n\n" + sentence})
+# --- 8d. fix round 2: the results sections and the front matter may not say how a language or a model did ------------------
 
 
 def in_front_matter(sentence):
@@ -751,12 +844,13 @@ def in_front_matter(sentence):
     return make_article().replace("# A test article\n", "# A test article\n\n" + sentence + "\n", 1)
 
 
-def in_data_limits(sentence):
-    """Section 6 holds method text, where a language name next to a comparison is allowed."""
-    return make_article(sections={DATA_ARTIFACTS: PLAIN_DATA + "\n\n" + sentence})
+def in_limitations(sentence):
+    """Limitations holds method text (the limits of the data), where a language name next to a comparison is allowed."""
+    return in_section(LIMITATIONS, sentence)
 
 
-SCOPED = {"front matter": in_front_matter, "section 7": in_experiments, "section 8": draft_article}
+# the front matter and every section that holds results; draft_article adds to Results
+SCOPED = {"front matter": in_front_matter, **{name: (lambda text, name=name: in_section(name, text)) for name in RESULT_SECTIONS}}
 
 REVIEW_SENTENCES = [
     "Swahili is the most affected language.",
@@ -809,7 +903,7 @@ MORE_SCOPED_RESULTS = [
 
 @pytest.mark.parametrize("where", list(SCOPED))
 @pytest.mark.parametrize("sentence", REVIEW_SENTENCES + MORE_SCOPED_RESULTS)
-def test_a_result_about_a_language_or_a_model_fails_in_sections_7_and_8_and_the_front_matter(tmp_path, where, sentence):
+def test_a_result_about_a_language_or_a_model_fails_in_the_results_sections_and_the_front_matter(tmp_path, where, sentence):
     report = run(tmp_path, SCOPED[where](sentence), draft=True, fill_in=FILL_IN_OK)
     assert "claims" in rules(report), (where, sentence)
     assert "has not been measured" in messages(report)
@@ -824,10 +918,19 @@ def test_the_same_result_inside_a_placeholder_passes_there(tmp_path, where, sent
 
 
 def test_the_new_patterns_are_scoped_to_the_results_sections_and_the_front_matter(tmp_path):
-    # method text in Section 6 may put a language next to a comparison
-    for sentence in ("Hindi has more fine-tuning rows than Swahili does.", "Hinglish has no fine-tuning rows and Arabic has the fewest checks."):
-        report = run(tmp_path, in_data_limits(sentence), draft=True, fill_in=FILL_IN_OK)
-        assert "claims" not in rules(report), (sentence, messages(report))
+    # method text may put a language or a model next to a comparison: the limits of the data, the rules of the method
+    method_text = (
+        "Hindi has more fine-tuning rows than Swahili does.",
+        "Hinglish has no fine-tuning rows and Arabic has the fewest checks.",
+        "Among the strengths that pass, the one with the lowest mean dev attack success over the non-English languages is chosen.",
+        "A setting fails if its task accuracy is more than 10 points below the fine-tuned model's.",
+    )
+    for sentence in method_text:
+        for article in (in_limitations(sentence), in_method(sentence)):
+            report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
+            assert "claims" not in rules(report), (sentence, messages(report))
+        # the same sentence in a results section is held to the stricter rules
+        assert "claims" in rules(run(tmp_path, in_section(RESULTS, sentence), draft=True, fill_in=FILL_IN_OK)), sentence
 
 
 PLAIN_SCOPED_TEXT = [
@@ -853,7 +956,7 @@ def test_plain_text_that_names_a_language_or_a_model_is_not_a_claim(tmp_path, wh
 
 def test_a_scoped_result_stays_a_claim_through_markdown_marks(tmp_path):
     for sentence in ("Swahili is the **most** affected language.", "The repair _improved_ [Hindi](h.md) and Arabic.", "> Safety\n> degraded in Swahili."):
-        assert "claims" in rules(run(tmp_path, in_experiments(sentence), draft=True, fill_in=FILL_IN_OK)), sentence
+        assert "claims" in rules(run(tmp_path, in_section(MORE_CREDITS, sentence), draft=True, fill_in=FILL_IN_OK)), sentence
 
 
 
@@ -864,11 +967,11 @@ def test_the_script_says_plainly_that_the_claims_guard_is_a_backstop_and_cannot_
     assert "A person must read the draft" in doc
 
 
-# --- 8e. fix round 2: decimals, number words, table cells and code in Sections 7 and 8 -------------------------------------------
+# --- 8e. fix round 2: decimals, number words, table cells and code in the results sections -------------------------------------
 
 
-def in_approach(text):
-    return make_article(sections={APPROACH: PLAIN_APPROACH + "\n\n" + text})
+def in_results(text):
+    return in_section(RESULTS, text)
 
 
 FIGURE_SHAPES = [
@@ -892,19 +995,19 @@ FIGURE_SHAPES = [
 
 
 @pytest.mark.parametrize("sentence", FIGURE_SHAPES)
-@pytest.mark.parametrize("where", ["section 7", "section 8"])
-def test_a_decimal_or_a_number_word_with_a_unit_fails_in_sections_7_and_8(tmp_path, where, sentence):
-    article = {"section 7": in_experiments, "section 8": in_approach}[where](sentence)
-    report = run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)
+@pytest.mark.parametrize("where", RESULT_SECTIONS)
+def test_a_decimal_or_a_number_word_with_a_unit_fails_in_the_results_sections(tmp_path, where, sentence):
+    report = run(tmp_path, in_section(where, sentence), draft=True, fill_in=FILL_IN_OK)
     assert "claims" in rules(report), (where, sentence)
     assert "placeholder" in messages(report)
 
 
 @pytest.mark.parametrize("sentence", FIGURE_SHAPES)
 def test_the_same_figure_shapes_pass_in_the_method_sections_and_inside_a_placeholder(tmp_path, sentence):
-    assert "claims" not in rules(run(tmp_path, in_problem_section(sentence), draft=True, fill_in=FILL_IN_OK)), sentence
+    for article in (in_problem_section(sentence), in_method(sentence)):
+        assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), sentence
     name = sentence.rstrip(".")
-    article = in_approach(f"<<RESULT: {name}>>.")
+    article = in_results(f"<<RESULT: {name}>>.")
     assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK + name + "\n")), sentence
 
 
@@ -918,7 +1021,7 @@ def test_plain_numbers_and_names_with_digits_are_not_figures(tmp_path):
         "Cohen's kappa runs from minus one to one.",
     ]
     for sentence in safe:
-        for article in (in_experiments(sentence), in_approach(sentence)):
+        for article in (in_section(MORE_CREDITS, sentence), in_results(sentence)):
             assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), sentence
 
 
@@ -926,7 +1029,7 @@ RESULT_TABLE_HEAD = "| Language | Original | Drifted |\n|---|---|---|\n"
 
 
 def with_table(rows):
-    return in_approach(RESULT_TABLE_HEAD + rows)
+    return in_results(RESULT_TABLE_HEAD + rows)
 
 
 @pytest.mark.parametrize(
@@ -940,7 +1043,7 @@ def with_table(rows):
         "| English | see the figure | <<RESULT: rate>> |",
     ],
 )
-def test_a_data_cell_in_a_section_8_table_must_be_a_placeholder_or_not_applicable(tmp_path, row):
+def test_a_data_cell_in_a_results_table_must_be_a_placeholder_or_not_applicable(tmp_path, row):
     report = run(tmp_path, with_table(row), draft=True, fill_in=FILL_IN_OK + "rate\n")
     assert "claims" in rules(report), row
     assert "not a placeholder" in messages(report)
@@ -956,24 +1059,28 @@ def test_placeholders_and_not_applicable_cells_pass_and_headers_and_labels_are_n
     assert "claims" not in rules(report), messages(report)
 
 
-def test_the_table_cell_rule_covers_every_table_in_section_8_and_only_there(tmp_path):
+def test_the_table_cell_rule_covers_every_table_in_the_results_sections_and_only_there(tmp_path):
     two_tables = RESULT_TABLE_HEAD + "| English | <<RESULT: rate>> | <<RESULT: rate>> |\n\nThe second table follows.\n\n" + RESULT_TABLE_HEAD + "| Hindi | yes | <<RESULT: rate>> |"
-    assert "claims" in rules(run(tmp_path, in_approach(two_tables), draft=True, fill_in=FILL_IN_OK + "rate\n"))
-    in_section_7 = in_experiments(RESULT_TABLE_HEAD + "| English | yes | no |")
-    assert "claims" not in rules(run(tmp_path, in_section_7, draft=True, fill_in=FILL_IN_OK))
-    in_section_6 = in_data_limits(RESULT_TABLE_HEAD + "| English | yes | no |")
-    assert "claims" not in rules(run(tmp_path, in_section_6, draft=True, fill_in=FILL_IN_OK))
+    assert "claims" in rules(run(tmp_path, in_results(two_tables), draft=True, fill_in=FILL_IN_OK + "rate\n"))
+    by_hand = RESULT_TABLE_HEAD + "| English | yes | no |"
+    for name in RESULT_SECTIONS:
+        report = run(tmp_path, in_section(name, by_hand), draft=True, fill_in=FILL_IN_OK)
+        assert "claims" in rules(report), name
+        assert f"in the section '{name}'" in messages(report)
+    for article in (in_method(by_hand), in_limitations(by_hand)):
+        assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
 
 
 @pytest.mark.parametrize("code", ["Swahili: 66%", "alpha = 0.5", "drift = twelve points"])
-@pytest.mark.parametrize("where", ["section 7", "section 8"])
-def test_a_figure_inside_a_code_block_in_sections_7_and_8_fails_too(tmp_path, where, code):
-    article = {"section 7": in_experiments, "section 8": in_approach}[where](f"```\n{code}\n```")
+@pytest.mark.parametrize("where", [MORE_CREDITS, RESULTS])
+def test_a_figure_inside_a_code_block_in_the_results_sections_fails_too(tmp_path, where, code):
+    article = in_section(where, f"```\n{code}\n```")
     assert "claims" in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK)), (where, code)
 
 
 def test_a_code_block_in_the_method_sections_may_hold_settings(tmp_path):
-    assert "claims" not in rules(run(tmp_path, in_problem_section("```\nalpha = 0.5\nlearning_rate = 1e-4\n```"), draft=True, fill_in=FILL_IN_OK))
+    for article in (in_problem_section("```\nalpha = 0.5\nlearning_rate = 1e-4\n```"), in_method("```\nalpha = 0.5\nlearning_rate = 1e-4\n```")):
+        assert "claims" not in rules(run(tmp_path, article, draft=True, fill_in=FILL_IN_OK))
 
 
 # --- 9. FILL_IN.md and the figure file -----------------------------------------------------------------------------------------------
@@ -1083,7 +1190,7 @@ def test_a_whole_section_hidden_in_a_comment_is_missing(tmp_path):
 
 
 def test_a_disclosure_that_sits_in_a_comment_does_not_count(tmp_path):
-    article = make_article(sections={TEAMMATES: "None. " + comment(PIECES["disclosure"])})
+    article = make_article(sections={LLM_USAGE: "The judges are language models too. " + comment(PIECES["disclosure"])})
     assert "disclosure" in rules(run(tmp_path, article))
 
 
