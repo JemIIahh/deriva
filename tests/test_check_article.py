@@ -1314,10 +1314,8 @@ def real_text():
 
 
 def test_the_real_article_asks_the_owner_about_the_gate_simulation_and_says_where_the_figures_come_from():
-    report = check_article.check(REAL_ARTICLE, REAL_SOURCES, draft=True)
-    names = [p.name for p in report.placeholders if p.kind == "OWNER"]
-    assert any("gate simulation was re-run" in n for n in names), names
     text = real_text()
+    assert "They were not re-run, so they are project notes only." in text
     assert "As noted in the project log (not public)" in text
     assert "comes from the project notes only" in text
     for gone in ("As recorded", "never decides the outcome"):
@@ -1327,7 +1325,7 @@ def test_the_real_article_asks_the_owner_about_the_gate_simulation_and_says_wher
 def test_the_real_article_names_the_models_it_releases_only_through_the_upload_marker():
     text = real_text()
     assert "The released models" not in text
-    assert "Which arms those are: <<OWNER: which model arms were uploaded with weights>>" in text
+    assert "None has been uploaded so far, because no model has been trained." in text
     assert "The repaired model (A2), only if a repair strength qualified" in text
     assert "DARE" in text and "thinned" in text and "on by default" in text
 

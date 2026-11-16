@@ -196,7 +196,7 @@ def test_the_home_path_scan_reaches_notes_docs_templates_configs_and_root_files_
     for name in ("HANDOFF.md", "docs/runtime.md", "docs/toolkit-notes.md", "templates/model_card.md", "configs/ft_lora.yaml",
                  "pipelines/ft_data.yaml", ".env.example", "pyproject.toml", ".gitignore"):
         assert ROOT / name in files, name
-    assert set(git_files(HOME_DIRS)) <= files  # the first scope is still covered
+    assert {p for p in git_files(HOME_DIRS) if p.suffix.lower() not in BINARY_SUFFIXES} <= files  # the first scope is still covered
     assert not any(p.relative_to(ROOT).parts[0] == "reference" for p in files)
 
 

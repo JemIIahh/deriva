@@ -1,6 +1,6 @@
-# Multilingual safety drift
+# Deriva: multilingual safety drift
 
-This project measures, language by language (English, Hindi, Hinglish, Arabic and Swahili), whether fine-tuning the
+This project (public name Deriva; the code package is `msd`) is built to measure, language by language (English, Hindi, Hinglish, Arabic and Swahili), whether fine-tuning the
 small multilingual model Tiny Aya Global on a harmless task changes how often it complies with harmful requests and
 refuses harmless ones. It then tries to repair any change without retraining, with SafeTune's ReSta weight patch, and
 reports every number with its interval.

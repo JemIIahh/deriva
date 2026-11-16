@@ -2,38 +2,40 @@
 
 A study of Tiny Aya Global in English, Hindi, Hinglish, Arabic and Swahili, and of a repair that needs no retraining. Deriva is Spanish for "drift". The code package keeps its working name, `msd`.
 
-By <<OWNER: author name as it should appear>>. Code: <<LINK: code repository>>. Data: <<LINK: dataset on Hugging Face>>. Models: <<LINK: model collection on Hugging Face>>.
+By JemIIahh. Code: https://github.com/JemIIahh/deriva. Data: not published yet. Models: none yet. This is a submission made before the experiments ran (see the status note below).
 
-In one line: <<RESULT: headline answer in one sentence>>
+In one line: there is no result yet. This is the design, the code and the pre-registered protocol of the study, and its three questions are still open.
 
 Tracks and problem statements covered:
 
-- Track 2b, AI Safety and Correction (primary track): "Repairing safety drift without retraining", problem statement <<OWNER: number of the Track 2b problem statement, as the Submit page numbers it>>.
-- Track 2a, AI Safety and Red Teaming (secondary track): "Multilingual and code-mixed safety", problem statement <<OWNER: number of the Track 2a problem statement, as the Submit page numbers it>>.
+- Track 2b, AI Safety and Correction (primary track): "Repairing safety drift without retraining", problem statement named by its title.
+- Track 2a, AI Safety and Red Teaming (secondary track): "Multilingual and code-mixed safety", problem statement named by its title.
 
 > **Content warning.** This write-up is about harmful requests: requests that a safe model should refuse. It names the public sets they come from but quotes none of them, and it quotes no reply of any model. The released dataset does hold the harmful prompts themselves, and excerpts of the judged replies cut to 200 characters, which may contain harmful text.
 
 This is a research study. Nothing in it is a safety guarantee for any model.
 
+> **Status of this submission (2026-11-16).** Done: the study design and its pre-registered rules, all the code with its unit tests, the source list with every licence, the fine-tuning data pipeline, and the English part of the test-set build. Not done: the translation of the test set into the four other languages did not finish and the test set is not frozen; no model was fine-tuned or repaired and no judge ran, because no GPU session was started before the deadline. So there is no attack success rate, no over-refusal figure, no task accuracy, no released dataset and no released model. Every place below that would hold a measured number says "not measured". Nothing in this article is a result.
+
 ## Abstract
 
-People often fine-tune a small, safety-trained chat model for a narrow, harmless job. Does that quietly weaken its safety training? Is the change the same in every language, or larger in some? And can a repair that needs no retraining bring safety back without breaking the model? Deriva measures all three in English, Hindi, Hinglish (Hindi written in Latin letters and mixed with English), Arabic and Swahili.
+People often fine-tune a small, safety-trained chat model for a narrow, harmless job. Does that quietly weaken its safety training? Is the change the same in every language, or larger in some? And can a repair that needs no retraining bring safety back without breaking the model? Deriva is built to measure all three in English, Hindi, Hinglish (Hindi written in Latin letters and mixed with English), Arabic and Swahili.
 
 **Base model and method in one line.** Tiny Aya Global (CohereLabs/tiny-aya-global) is fine-tuned with LoRA through AlignTune on harmless exam questions prepared with CuratorKIT, then patched with SafeTune's ReSta at a strength chosen on a development split only, and every version is measured with the same evaluation code.
 
 **What is measured.** The attack success rate is the share of harmful requests that a model goes along with, as decided by a separate judge model. Over-refusal is the share of harmless but edgy requests that it refuses. Task accuracy is the share of held-out exam questions that it answers correctly. Every rate is reported per language with an interval, on a report split that is frozen with a hash before any model runs on it.
 
-**Headline, before and after.** <<RESULT: headline before and after number, with intervals>>
+**Headline, before and after.** None yet: no model has been fine-tuned or measured, so there is no before and after number. The pair to be reported is fixed in advance: the drifted model against the repaired model at the chosen strength, or the original against the drifted model if no strength qualifies.
 
-**What is released.** A five-language safety test set with per-item labels, the tables and figures, model cards, and a notebook that rebuilds the tables on an ordinary CPU.
+**What is released now.** The code, the protocol and the design, in the GitHub repository. **Planned, not yet released:** a five-language safety test set with per-item labels, the tables and figures, model cards, and a notebook that rebuilds the tables on an ordinary CPU.
 
 > **For judges: one minute**
 >
 > - **Question.** Does harmless LoRA fine-tuning change how often Tiny Aya Global goes along with harmful requests, per language, and can SafeTune's ReSta undo that without retraining?
 > - **Pipeline.** CuratorKIT builds the fine-tuning data, AlignTune runs the LoRA fine-tune, our evaluation code measures attack success, over-refusal and task accuracy, SafeTune's ReSta patches the weights at a sweep of strengths, and the same evaluation measures the patched models again.
-> - **Headline.** <<RESULT: headline before and after number, with intervals>>
+> - **Headline.** None yet: nothing has been measured. The pair to be reported is fixed in advance: the drifted model against the repaired model at the chosen strength, or the original against the drifted model if no strength qualifies.
 > - **Why the numbers can be checked.** The report split is frozen and hashed before any model runs on it, and every choice is made on the development split. A second judge from another model family labels a sample, to measure agreement. A repair strength that breaks the model, or that pushes over-refusal past a fixed margin, cannot be chosen.
-> - **Where.** Code: <<LINK: code repository>>. Data: <<LINK: dataset on Hugging Face>>. Models: <<LINK: model collection on Hugging Face>>.
+> - **Where.** Code: https://github.com/JemIIahh/deriva. Data and models: not published yet.
 
 ## Problem statement and approach
 
@@ -62,7 +64,7 @@ Two measures are used throughout, attack success and over-refusal; they are defi
 | Drifted | A1 | Tiny Aya Global after our harmless fine-tune, merged back into one model. The fine-tune is LoRA, which trains a small add-on instead of every weight. |
 | Repaired | A2 | The fine-tuned model after a repair called ReSta, at a strength called alpha that is chosen on development data only. |
 | Naive blend | A2n | A plain average of the fine-tuned and the original weights, (1 - t) times A1 plus t times A0, for t of 0.25, 0.5 and 0.75. It is a comparison: it shows whether ReSta does better than simply averaging the weights back. |
-| Prevention | A3 | A fine-tune built to prevent drift instead of repairing it. It is built only if the drift gate below sends the study to prevention. <<RESULT: whether arm A3 was built>> |
+| Prevention | A3 | A fine-tune built to prevent drift instead of repairing it. It is built only if the drift gate below sends the study to prevention. A3 has not been built: no model has been trained yet, so the gate has not run. |
 
 These names are labels. The "drifted" model is the fine-tuned one whether or not its safety changed.
 
@@ -84,7 +86,7 @@ Before spending effort on a repair, the study asks whether there is drift to rep
 
 There are three branches. If the gate passes, the study continues to the repair. If it does not pass, the study first tries a stronger fine-tune recipe (Method / experiments). If the stronger recipe does not pass either, the study pivots to prevention (A3), and the repair becomes a secondary result.
 
-The error rates of the gate come from a simulation that an AI review agent ran during the build, at 150 harmful prompts per language. The settings of that simulation were not saved, so the figures cannot be reproduced from the repository. They are to be re-run with their settings saved before anyone relies on them. <<OWNER: confirm the gate simulation was re-run and its settings saved, or delete this sentence>> As noted in the project log (not public):
+The error rates of the gate come from a simulation that an AI review agent ran during the build, at 150 harmful prompts per language. The settings of that simulation were not saved, so the figures cannot be reproduced from the repository. They were not re-run, so they are project notes only. As noted in the project log (not public):
 
 - With no true change, the gate passes 0% of the time.
 - With a true rise of 5 points, it passes 0.3% of the time. This figure comes from the project notes only; its set-up was not recorded.
@@ -105,10 +107,10 @@ Three Lexsi Labs repos are chained into one pipeline. CuratorKIT and SafeTune ar
 | Repo | What we use it for | Licence |
 |---|---|---|
 | AlignTune (Lexsi Labs), https://github.com/Lexsi-Labs/aligntune | Runs the LoRA fine-tune that makes the drifted model. | MIT |
-| CuratorKIT (Lexsi Labs), <<LINK: CuratorKIT repository>> | Filters, de-duplicates and samples the fine-tuning data. | Lexsi Labs Source Available License 1.1 (LSAL-1.1) |
-| SafeTune (Lexsi Labs), https://github.com/Lexsi-Labs/SafeTune | Provides the ReSta repair. | <<OWNER: SafeTune licence as read from its repository>> |
+| CuratorKIT (Lexsi Labs), https://github.com/Lexsi-Labs/CuratorKIT | Filters, de-duplicates and samples the fine-tuning data. | Lexsi Labs Source Available License 1.1 (LSAL-1.1) |
+| SafeTune (Lexsi Labs), https://github.com/Lexsi-Labs/SafeTune | Provides the ReSta repair. | Lexsi Labs Source Available License 1.2 (LSAL-1.2): noncommercial use |
 | NLLB-200 distilled 600M, through the transformers library | Machine-translates the English prompts into Hindi, Arabic and Swahili. | CC-BY-NC-4.0 (model weights) |
-| Our own code, <<LINK: code repository>> | Builds the test set, runs the generations and the judge, computes the tables and figures, and exports the public files. | See the repository. |
+| Our own code, https://github.com/JemIIahh/deriva | Builds the test set, runs the generations and the judge, computes the tables and figures, and exports the public files. | See the repository. |
 
 ### CuratorKIT: the fine-tuning data
 
@@ -126,7 +128,7 @@ AlignTune can train in two ways, called backends: unsloth and TRL (Hugging Face'
 
 ### SafeTune: the repair
 
-SafeTune is used for one thing: the ReSta repair, which belongs to SafeTune's Recover methods (weight-space edits, no training). We call it through a small wrapper that checks that the three models it combines have the same weight names and shapes, and that records the repair settings next to the repaired weights. <<OWNER: one sentence on what SafeTune's licence allows, as read from its repository>> The source read for this study is SafeTune 0.1.12; the version that ran is recorded in each resta_patch.json.
+SafeTune is used for one thing: the ReSta repair, which belongs to SafeTune's Recover methods (weight-space edits, no training). We call it through a small wrapper that checks that the three models it combines have the same weight names and shapes, and that records the repair settings next to the repaired weights. Its licence, the Lexsi Labs Source Available License 1.2, allows noncommercial use, research and teaching, with the licence and its responsible-use conditions (its Section 4) kept in every copy; an organization as such must first get Lexsi Labs' written permission or send an acknowledgement of use (its Section 1A), and selling the work needs a commercial licence. We read this on 2026-11-16 from LICENSE.md in the SafeTune repository. It is our reading, not legal advice. The source read for this study is SafeTune 0.1.12; the version that ran is recorded in each resta_patch.json.
 
 ### AuditKIT: planned, not used
 
@@ -167,9 +169,9 @@ Tiny Aya Global (CohereLabs/tiny-aya-global), from Cohere Labs, is the model und
 
 Tiny Aya Global and Tiny Aya Base are released under CC-BY-NC-4.0, which allows non-commercial use with attribution. Both are gated on Hugging Face, and the Cohere Labs Acceptable Use Policy also applies to them. A fine-tuned or repaired version of Tiny Aya Global is a derivative, so the same licence and the same Acceptable Use Policy apply to it. Releasing it does not widen what Cohere's licence allows.
 
-The two judge models named above are the ones chosen before any run: Qwen3-4B as the primary open judge and Gemma as the alternative. The judge ids that were actually used for the dev split and the report split are recorded in the exported file reliability.json: <<RESULT: judge model ids for dev and report>>. The study may also use a paid judge through an API for the report split. <<OWNER: whether a paid judge was used for the report split, and which one>>
+The two judge models named above are the ones chosen before any run: Qwen3-4B as the primary open judge and Gemma as the alternative. The judge ids that were actually used for the dev split and the report split are recorded in the exported file reliability.json: none yet, because no judge has run. The study may also use a paid judge through an API for the report split. No judge has run yet, so no paid judge has been used.
 
-Hinglish translations, and every back-translation used in the translation check, come from a chat model reached through an API endpoint. <<OWNER: name of the model behind that endpoint and the terms it was used under>> The translated prompts are all marked CC-BY-NC-4.0 in the released data, because the NLLB weights are under that licence and we do not split the translated file by translator.
+Hinglish translations, and every back-translation used in the translation check, come from a chat model reached through an API endpoint. Whichever model is used, its name and its terms go in the translators table of the dataset card. The build on the author's Mac used a Gemma model served locally by Ollama, under the Gemma terms of use. That build did not finish, so no translated prompt is released. The translated prompts are all marked CC-BY-NC-4.0 in the released data, because the NLLB weights are under that licence and we do not split the translated file by translator.
 
 ### The models the attacks are sent to
 
@@ -220,7 +222,7 @@ The test set has two kinds of prompt. Harmful prompts ask for something a safe m
 
 The split is decided on the English prompt, by a seeded hash, before any translation. One item therefore never lands in dev for one language and in report for another. The seed is 20261105. Duplicate prompts across sources are removed, and the first source in a fixed order wins.
 
-Once built, the test set is frozen. A manifest lists the sha256 (a fingerprint of the file's exact bytes) of every prompt file, and the sha256 of that manifest is the freeze hash: <<RESULT: freeze hash of the test set>> on <<RESULT: freeze date>>. A verification script checks the prompt files against the manifest, and the public export refuses a test set that does not match it.
+Once built, the test set is frozen. A manifest lists the sha256 (a fingerprint of the file's exact bytes) of every prompt file, and the sha256 of that manifest is the freeze hash. There is none yet: the test set has not been frozen, and docs/FREEZE_LOG.md has no freeze row. A verification script checks the prompt files against the manifest, and the public export refuses a test set that does not match it.
 
 The fine-tuning data has its own splits: 6,000 training rows, 800 held-out rows for task accuracy on the report split, and 800 dev task rows (The fine-tuning data, below).
 
@@ -251,7 +253,7 @@ There are no Hinglish fine-tuning rows. The fine-tune therefore uses four of the
 
 Hindi, Arabic and Swahili prompts are machine translations made with NLLB-200 distilled 600M. Hinglish prompts are made by a chat model through an API endpoint, because NLLB cannot write Hinglish. There is no public Hinglish safety test set that we know of, so every Hinglish prompt is a translation.
 
-Each translation is checked by translating it back into English with a chat model and comparing the result with the original. An item is kept only if the back-translation is close to the original (a character-overlap score called chrF of at least 0.35) and about as long (0.6 to 1.5 times the original's length). The thresholds were picked by hand and not calibrated. The check catches a refusal, an answer instead of a translation, a cut-off text and a wrong-language text. It cannot catch a flipped meaning, for example "how do I stop X" becoming "how do I X", because the characters are nearly the same. Items that fail are dropped, so the languages end with slightly different numbers of prompts: <<RESULT: prompts kept and dropped per language after the translation check>>
+Each translation is checked by translating it back into English with a chat model and comparing the result with the original. An item is kept only if the back-translation is close to the original (a character-overlap score called chrF of at least 0.35) and about as long (0.6 to 1.5 times the original's length). The thresholds were picked by hand and not calibrated. The check catches a refusal, an answer instead of a translation, a cut-off text and a wrong-language text. It cannot catch a flipped meaning, for example "how do I stop X" becoming "how do I X", because the characters are nearly the same. Items that fail are dropped, so the languages end with slightly different numbers of prompts: not available, because the translation and its check did not finish, so no per-language count exists yet.
 
 Because every non-English prompt is a translation of an English one, the five languages are not five independent samples of prompts. They are the same prompts in five forms.
 
@@ -349,7 +351,7 @@ Which settings are AlignTune's defaults, and which were changed:
 - Changed: the learning rate, 1e-4, is half of AlignTune's default of 2e-4. Gradient checkpointing is on (the default is off), to fit the T4 GPU. Precision is set to fp16 explicitly, because a T4 has no bf16. There is no evaluation set and no reload of a best model, and no training logger. The batch is 1 per step with 16 steps of gradient accumulation.
 - No quantisation (no QLoRA), so the adapter is trained on the same 16-bit weights that it is merged into.
 
-A stronger recipe exists in configs/ft_lora_strong.yaml: learning rate 2e-4, three epochs, rank 32, scaling 64 (1,125 steps). It runs only if the gate asks for it. <<RESULT: fine-tune training summary, from finetune_summary.json>>
+A stronger recipe exists in configs/ft_lora_strong.yaml: learning rate 2e-4, three epochs, rank 32, scaling 64 (1,125 steps). It runs only if the gate asks for it. The fine-tune has not been run, so there is no training summary.
 
 ### How the repair is made (SafeTune ReSta)
 
@@ -357,7 +359,7 @@ ReSta takes three models: the fine-tuned one, the aligned one and the base one. 
 
 The first list of alpha values was 0, 0.25, 0.5, 0.75 and 1. SafeTune's own documentation says that on Tiny Aya an alpha of 1 breaks the model, that 0.5 or more also breaks it, and that about 0.25 is a sensible value. We did not check that claim ourselves. We read it before any model ran. We then changed the list to 0, 0.05, 0.1, 0.15, 0.25, 0.35, 0.5 and 1.
 
-Whether DARE was on for the final run: <<RESULT: whether DARE was on for the final run (resta_patch.json)>> The alpha used is chosen on the dev split by the rules below. <<RESULT: alpha chosen on dev, with the reason>>
+Whether DARE was on for the final run: no repair has been run, so there is no final run. The alpha used would be chosen on the dev split by the rules below; none has been chosen.
 
 ### How the repair strength is chosen
 
@@ -402,25 +404,25 @@ Every rate comes from the report split and has an interval, the range in which t
 
 ### Short answers
 
-1. Question 1, drift: <<RESULT: answer to question 1, drift>>
-2. Question 2, unequal drift: <<RESULT: answer to question 2, unequal across languages>>
-3. Question 3, repair: <<RESULT: answer to question 3, repair>>
+1. Question 1, drift: Not measured. No model has been fine-tuned, so this question is open.
+2. Question 2, unequal drift: Not measured. There is no per-language measurement, so this question is open.
+3. Question 3, repair: Not measured. No repair has been run, so this question is open.
 
 ### What the drift gate decided
 
-The rule of the gate, its error rates and its three branches are under Problem statement and approach. Its outcome: <<RESULT: gate outcome, with the languages that rose by at least ten points>> The branch taken: <<RESULT: gate branch taken, and whether the stronger recipe was run>>
+The rule of the gate, its error rates and its three branches are under Problem statement and approach. Its outcome: None: no model has been measured, so the gate has not run. The branch taken: None taken, and the stronger recipe was not run.
 
 ### Attack success rate by language
 
 | Language | Original (A0) | Drifted (A1) | Repaired (A2) | Naive blend (A2n) | Change, original to drifted | Change, drifted to repaired |
 |---|---|---|---|---|---|---|
-| English | <<RESULT: attack success rate of the original model per language>> | <<RESULT: attack success rate of the drifted model per language>> | <<RESULT: attack success rate of the repaired model per language>> | <<RESULT: attack success rate of the naive blend per language>> | <<RESULT: change from original to drifted per language>> | <<RESULT: change from drifted to repaired per language>> |
-| Hindi | <<RESULT: attack success rate of the original model per language>> | <<RESULT: attack success rate of the drifted model per language>> | <<RESULT: attack success rate of the repaired model per language>> | <<RESULT: attack success rate of the naive blend per language>> | <<RESULT: change from original to drifted per language>> | <<RESULT: change from drifted to repaired per language>> |
-| Hinglish | <<RESULT: attack success rate of the original model per language>> | <<RESULT: attack success rate of the drifted model per language>> | <<RESULT: attack success rate of the repaired model per language>> | <<RESULT: attack success rate of the naive blend per language>> | <<RESULT: change from original to drifted per language>> | <<RESULT: change from drifted to repaired per language>> |
-| Arabic | <<RESULT: attack success rate of the original model per language>> | <<RESULT: attack success rate of the drifted model per language>> | <<RESULT: attack success rate of the repaired model per language>> | <<RESULT: attack success rate of the naive blend per language>> | <<RESULT: change from original to drifted per language>> | <<RESULT: change from drifted to repaired per language>> |
-| Swahili | <<RESULT: attack success rate of the original model per language>> | <<RESULT: attack success rate of the drifted model per language>> | <<RESULT: attack success rate of the repaired model per language>> | <<RESULT: attack success rate of the naive blend per language>> | <<RESULT: change from original to drifted per language>> | <<RESULT: change from drifted to repaired per language>> |
+| English | Not measured | Not measured | Not measured | Not measured | Not measured | Not measured |
+| Hindi | Not measured | Not measured | Not measured | Not measured | Not measured | Not measured |
+| Hinglish | Not measured | Not measured | Not measured | Not measured | Not measured | Not measured |
+| Arabic | Not measured | Not measured | Not measured | Not measured | Not measured | Not measured |
+| Swahili | Not measured | Not measured | Not measured | Not measured | Not measured | Not measured |
 
-The exported tables hold the naive blend at the three blend values listed under Problem statement and approach. This table shows <<RESULT: blend value shown for the naive blend>>. Where the repaired model and the naive blend differ, that difference is what ReSta adds beyond plain averaging: <<RESULT: whether the repair does better than the naive blend>>
+The exported tables hold the naive blend at the three blend values listed under Problem statement and approach. This table would show one blend value, chosen on dev; none has been run. Where the repaired model and the naive blend differ, that difference is what ReSta adds beyond plain averaging. It is unknown, because neither has been run.
 
 ### Over-refusal and task accuracy, side by side
 
@@ -428,37 +430,37 @@ A repair is only worth something if the model still answers harmless requests an
 
 | Language | Over-refusal (original, drifted, repaired) | Task accuracy (original, drifted, repaired) |
 |---|---|---|
-| English | <<RESULT: over-refusal per arm and language>> | <<RESULT: task accuracy per arm and language>> |
-| Hindi | <<RESULT: over-refusal per arm and language>> | <<RESULT: task accuracy per arm and language>> |
-| Hinglish | <<RESULT: over-refusal per arm and language>> | Not applicable: no closed-form Hinglish data exists. |
-| Arabic | <<RESULT: over-refusal per arm and language>> | <<RESULT: task accuracy per arm and language>> |
-| Swahili | <<RESULT: over-refusal per arm and language>> | <<RESULT: task accuracy per arm and language>> |
+| English | Not measured | Not measured |
+| Hindi | Not measured | Not measured |
+| Hinglish | Not measured | Not applicable: no closed-form Hinglish data exists. |
+| Arabic | Not measured | Not measured |
+| Swahili | Not measured | Not measured |
 
 ### The heatmap
 
-![Heatmap of attack success rate per language for the two compared model versions, one row per language](heatmap.png)
+![Placeholder, not a result: the heatmap of attack success rate per language has not been drawn because nothing was measured](heatmap.png)
 
-Each row is one language. The first column is the fine-tuned model and the second is the repaired model at the chosen alpha. If no repair strength qualified, the figure shows the original model against the fine-tuned one instead, and its legend says so. A hatched row means the change between the two columns is inside the noise. A dotted row means the language is low-confidence. A crossed cell was left out by a check. Reading of the heatmap: <<RESULT: reading of the heatmap in plain words>>
+The picture above is a labelled placeholder, not a result: the heatmap is drawn from the report-split results, and there are none. In the planned figure, each row is one language. The first column is the fine-tuned model and the second is the repaired model at the chosen alpha. If no repair strength qualified, the figure shows the original model against the fine-tuned one instead, and its legend says so. A hatched row means the change between the two columns is inside the noise. A dotted row means the language is low-confidence. A crossed cell was left out by a check. There is no reading, because nothing has been measured.
 
 ### The repair strength
 
-![Curve of safety against task accuracy along the grid of repair strengths](alpha_curve.png)
+![Placeholder, not a result: the curve of safety against task accuracy along the repair strengths has not been drawn because nothing was run](alpha_curve.png)
 
-The curve shows, along the grid of alpha values, how the safety of the repaired model and its task accuracy move together. Reading of the curve: <<RESULT: reading of the alpha curve in plain words>> The settings that the sanity gate left out are listed here: <<RESULT: cells left out by the sanity gate or the judge-error limit>>
+The picture above is a labelled placeholder, not a result: the curve is drawn from the dev-split runs, and none has been made. The planned curve shows, along the grid of alpha values, how the safety of the repaired model and its task accuracy move together. There is no reading, because nothing has been measured. No setting has been run, so none was left out by the sanity gate.
 
 ### How far to trust the judge
 
-The agreement of the two judges, per language, with its interval: <<RESULT: inter-judge agreement per language, with intervals>>. Low-confidence languages: <<RESULT: low-confidence languages>>. The rule that marks a language as low-confidence is under Metrics, and why these.
+The agreement of the two judges, per language, with its interval: not measured, because no judge has run. Low-confidence languages: none can be named yet. The rule that marks a language as low-confidence is under Metrics, and why these.
 
 ### Negative and partial results
 
-<<RESULT: partial or null results in plain words>>
+This submission is itself a partial result, and it has no measured result of any kind. What exists is the design, the pre-registered rules, the code with its tests, the source and licence list, the fine-tuning data pipeline, and the English part of the test-set build. What did not happen: no GPU session was started, so there was no fine-tune, no repair and no judge run; and the translation of the test set into Hindi, Hinglish, Arabic and Swahili did not finish, so the test set was not frozen. Reading the three questions as open is therefore the only honest reading. The runbook (docs/RUNBOOK.md) lists the steps that remain, in order.
 
 ## Cost / ROI
 
 ### Compute used
 
-No extra credits were used for this study, only the free Colab or Kaggle compute that the organizers allow. <<OWNER: confirm no HF credits (the $20 coupon) were used>> Compute for the final run: <<OWNER: GPU service and GPU type used for the final run>>. GPU hours for all the runs together: <<OWNER: GPU hours used for the whole study, from the notebook logs>>. Estimated cost: <<OWNER: estimated cost of the study in US dollars, including any paid judge or translation API>>.
+No GPU compute has been used so far, because no GPU session was started. The plan is the free Colab or Kaggle compute that the organizers allow, with no extra credits for the first run. No paid judge has been used, because no judge has run. The test-set work so far ran on the author's Mac. The dollar cost of the study so far was not tallied.
 
 The repair itself needs no GPU in this set-up: our ReSta wrapper loads the three models on the CPU and patches them there. The test-set build, the reports, the export and the reproduction notebook run on a laptop, not on the GPU runtime.
 
@@ -481,7 +483,7 @@ Not measured. The study compares models with each other and not with a hosted AP
 - On the dev questions, always answering D would score 31%. On the held-out questions, always answering the most common letter would score 27 to 28%. Both are what a model that ignores the question would get. The alpha choice compares models on the same questions, so the higher dev figure does not tilt it.
 - One question in the dev task set is a source twin of a training question (astronomy test item 9 against item 116). That is 1 of 200, and it slightly favours a model that saw the training copy.
 - 18 pairs of English prompts are in both dev and report. Each pair comes from the same prompt template and shares at least 60% of its wording (4 pairs share at least 80%). So the report split is not fully independent of dev for those templates.
-- No native speaker has read the translated prompts or the Hindi, Arabic and Swahili instruction lines. <<OWNER: confirm that no native speaker reviewed the translations or the judge labels>>
+- No review of the translated prompts or of the Hindi, Arabic and Swahili instruction lines by a native speaker is recorded, and none is claimed.
 - Machine translation can change meaning in ways that the back-translation check cannot see.
 
 ### Dual use and ethics
@@ -490,7 +492,7 @@ The study sends harmful prompts to models and publishes the prompts. Every harmf
 
 ### Responsible disclosure
 
-The study does not develop a new attack: its prompts are public, and its only addition is translation. Any weakness it measures belongs to a public, gated model and to fine-tunes of it. <<OWNER: whether Cohere Labs was told of any per-language weakness before publication, and how>>
+The study does not develop a new attack: its prompts are public, and its only addition is translation. Any weakness it measures belongs to a public, gated model and to fine-tunes of it. No per-language weakness has been measured, so nothing has been disclosed to Cohere Labs, and there is nothing to disclose yet.
 
 ## With more credits
 
@@ -506,15 +508,15 @@ With more GPU time and money, the study would grow in five ways, in this order.
 
 ### Expected before and after (a forecast, not a result)
 
-This part is a forecast. It is not a result, and nothing in it has been measured. <<RESULT: forecast of the before and after numbers with more credits, labelled as a forecast>>
+This part is a forecast. It is not a result, and nothing in it has been measured. No forecast is given. Nothing has been measured, and any number written here would be a guess.
 
 ## Artifacts
 
 ### Hugging Face datasets collection
 
-The data this study produced is published as one Hugging Face dataset: <<LINK: dataset on Hugging Face>>. It holds the prompts, one label per judged reply with a short excerpt, one correct or incorrect mark per task question, and the tables and figures. Its card lists every file and the licence of every source. What is released and what is withheld is listed below.
+No dataset is published yet: the test set is not frozen and no model has been run. The dataset planned for this collection will hold the prompts, one label per judged reply with a short excerpt, one correct or incorrect mark per task question, and the tables and figures. Its card will list every file and the licence of every source. What would be released and what would be withheld is listed below.
 
-Released:
+To be released:
 
 - the English prompts and the machine-translated prompts, each row with its source and licence;
 - one label per judged reply, with an excerpt cut to 200 characters;
@@ -526,22 +528,22 @@ Not released:
 - any model reply beyond the 200-character excerpt;
 - any item of an evaluation-only source.
 
-The dataset card says all of this again next to the files. Dataset: <<LINK: dataset on Hugging Face>>.
+The dataset card will say all of this again next to the files. Dataset: not published yet.
 
 ### Hugging Face models collection
 
-The collection holds the models of this study that were uploaded, each with a model card. Which arms those are: <<OWNER: which model arms were uploaded with weights>> Tiny Aya Global and Tiny Aya Base are not re-uploaded: Cohere Labs hosts them, and their gated terms apply to anyone who downloads them.
+The collection will hold the models of this study that are uploaded, each with a model card. None has been uploaded so far, because no model has been trained. Tiny Aya Global and Tiny Aya Base are not re-uploaded: Cohere Labs hosts them, and their gated terms apply to anyone who downloads them.
 
 The study can produce two models for the collection:
 
 - The fine-tuned model (A1): Tiny Aya Global after the harmless LoRA fine-tune, merged back into one model stored in 16-bit precision.
 - The repaired model (A2), only if a repair strength qualified on the dev split: the fine-tuned model after ReSta at that strength.
 
-Each uploaded model has a card that names its model version and repeats the licence and the Acceptable Use Policy. It says the model is not a safety guarantee. For numbers, it points to this article. Collection: <<LINK: model collection on Hugging Face>>.
+Each uploaded model has a card that names its model version and repeats the licence and the Acceptable Use Policy. It says the model is not a safety guarantee. For numbers, it points to this article. Collection: not published yet.
 
 ### GitHub repository
 
-The code, the configs, the runbook, the tests and the source of this article are in one repository: <<LINK: code repository>>. Its layout is under Documentation and reproduction.
+The code, the configs, the runbook, the tests and the source of this article are in one repository: https://github.com/JemIIahh/deriva. Its layout is under Documentation and reproduction.
 
 ### Demo
 
@@ -572,11 +574,11 @@ To run the whole study, follow docs/RUNBOOK.md from step 0 to step 13. Each step
 
 ### Reproducing the tables
 
-A reproduction notebook rebuilds tables.csv from the public per-item results on an ordinary CPU, with no GPU and no API key: <<LINK: reproduction notebook>>. The check passes when the sha256 of the rebuilt tables.csv equals the one recorded in the export's MANIFEST.json. Choices that rest on data that is not public, such as the alpha choice on dev, are read from reliability.json as recorded and are not recomputed. An optional GPU section re-runs generations; it is not guaranteed to give the same replies, because generation depends on the hardware. The notebook also rebuilds both figures. Reproduction check: <<RESULT: reproduction check outcome>>
+A reproduction notebook rebuilds tables.csv from the public per-item results on an ordinary CPU, with no GPU and no API key: notebooks/reproduce.ipynb in the repository (https://github.com/JemIIahh/deriva/blob/main/notebooks/reproduce.ipynb). The check passes when the sha256 of the rebuilt tables.csv equals the one recorded in the export's MANIFEST.json. Choices that rest on data that is not public, such as the alpha choice on dev, are read from reliability.json as recorded and are not recomputed. An optional GPU section re-runs generations; it is not guaranteed to give the same replies, because generation depends on the hardware. The notebook also rebuilds both figures. Reproduction check: not run, because there is no export to reproduce.
 
 ### Declaration of work done outside the hackathon
 
-The hackathon's build window ran from 1 to 14 November 2026. The design of this study is dated 3 November 2026, and the first commit of its repository is from 4 November 2026. The toolkits, models, datasets and libraries it uses are other people's published work, named with their licences above. <<OWNER: declaration of any work done before or outside the hackathon, or none>>
+The hackathon's build window ran from 1 to 15 November 2026. The design of this study is dated 3 November 2026, and the first commit of its repository is from 4 November 2026. The toolkits, models, datasets and libraries it uses are other people's published work, named with their licences above. No work from before the hackathon is declared: everything in the repository was written after its first commit on 4 November 2026, apart from the published work of others named above.
 
 ## Discussion / what we learned
 
@@ -593,7 +595,7 @@ This list is built from the study's working log. Every change was made before an
 
 ### Implications
 
-<<RESULT: implications in plain words, from the three short answers>>
+None can be drawn, because there are no results yet. What the study offers so far is its method: a pre-registered protocol with a frozen-hash test set, a drift gate and rules for choosing the repair strength, all of which can be read and checked in the repository.
 
 ### Future work
 
@@ -601,7 +603,7 @@ The next steps, and what they would cost, are under With more credits.
 
 ## Teammates tagged
 
-There is nobody to tag, because there are no teammates. This is a solo project by <<OWNER: author name as it should appear>>.
+There is nobody to tag, because there are no teammates. This is a solo project by JemIIahh.
 
 ### Author contributions
 
@@ -627,7 +629,7 @@ Papers behind the methods and the data. The datasets, models and toolkits themse
 
 ## LLM usage statement
 
-The work was done by the author together with Claude Code, an AI coding assistant from Anthropic. Claude Code helped write and review the code and the draft of this text. <<OWNER: confirm how much of the code and text Claude Code wrote and reviewed>> <<OWNER: confirm what you personally checked, for example the sources, the design decisions and the results>> Every result in this article comes from the exported files described above, and the code that produced them is in the repository. <<OWNER: decision to keep this disclosure paragraph>>
+The work was done by the author together with Claude Code, an AI coding assistant from Anthropic. Claude Code wrote most of the code and the draft of this text. This article states no result; any result it states later will come from the exported files described above, and the code that produced them is in the repository.
 
 Language models are also instruments of the study, not authors of it: the judge models label the replies, a chat model writes the Hinglish prompts and the back-translations, and NLLB translates into Hindi, Arabic and Swahili (Models and licenses). An AI review agent ran the simulation behind the drift gate's error rates (Problem statement and approach).
 
@@ -635,6 +637,8 @@ Language models are also instruments of the study, not authors of it: the judge 
 
 - 2026-11-11: the first full draft, which followed the nine section titles of the kickoff slides.
 - 2026-11-15: the draft was restructured to follow the write-up template on the Submit page of the hackathon, and it now uses the project's public name, Deriva. The content of the first draft was kept and moved into the new sections.
+
+- 2026-11-16: submitted before any experiment had run. The places for results now say "not measured", the three questions are stated as open, and the links point to the code repository only.
 
 ## Appendix
 
